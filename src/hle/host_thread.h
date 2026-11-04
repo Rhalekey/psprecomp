@@ -20,7 +20,13 @@ static void host_thread_error(void) {
 #include <process.h>
 #include <mmsystem.h>
 
+/* MinGW-based Clang ignores __declspec(thread) with only a warning, which
+ * silently makes these variables shared between threads. */
+#ifdef _MSC_VER
 #define HOST_TLS __declspec(thread)
+#else
+#define HOST_TLS _Thread_local
+#endif
 typedef HANDLE host_thread;
 typedef SRWLOCK host_mutex;
 typedef CONDITION_VARIABLE host_cond;
