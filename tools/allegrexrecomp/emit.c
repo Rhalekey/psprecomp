@@ -524,8 +524,14 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         if (isnan(v))      fprintf(f, "%spsp_vimm(%u, NAN);\n", ind, in->vd);
         else if (isinf(v)) fprintf(f, "%spsp_vimm(%u, %sINFINITY);\n",
                                    ind, in->vd, v < 0 ? "-" : "");
-        else               fprintf(f, "%spsp_vimm(%u, %.9gf);\n",
-                                   ind, in->vd, (double)v);
+        else {
+            /* `%.9g` drops the point from a whole number, and `45088f` is not
+             * a valid C token, so add one when printf left it out. */
+            char lit[32];
+            snprintf(lit, sizeof lit, "%.9g", (double)v);
+            fprintf(f, "%spsp_vimm(%u, %s%sf);\n", ind, in->vd, lit,
+                    strpbrk(lit, ".e") ? "" : ".0");
+        }
         return;
     }
 
