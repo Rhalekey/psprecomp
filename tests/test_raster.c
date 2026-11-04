@@ -228,6 +228,57 @@ static void test_transformed_quad(void) {
     CHECK(pixel(300, 64) == 0, "top edge is at y=68: 0x%08X", pixel(300, 64));
 }
 
+/* Skinned quads: two u8 weights, 8888 colour, float position, so 20 bytes each. */
+#define VTYPE_SKINNED ((1u << 9) | (1u << 14) | (7u << 2) | (3u << 7))
+
+static void skinned_vertex(int idx, float x, float y, uint8_t w0, uint8_t w1) {
+    const uint32_t a = VERTS + (uint32_t)idx * 20;
+    psp_write8(a, w0);
+    psp_write8(a + 1, w1);
+    psp_write32(a + 4, 0xFFFFFFFFu);
+    psp_write_f32(a + 8, x);
+    psp_write_f32(a + 12, y);
+    psp_write_f32(a + 16, 0);
+}
+
+static void draw_skinned_quad(uint8_t w0, uint8_t w1) {
+    psp_ge_reset();
+    clear_fb();
+    g_pc = 0;
+    cmd(0x10, (VERTS >> 8) & 0xFF0000);
+    cmd(0x9C, FB & 0xFFFFFF);
+    cmd(0x9D, ((FB >> 8) & 0xFF0000) | 480);
+    cmd(0x12, VTYPE_SKINNED);
+    cmd(0x01, VERTS & 0xFFFFFF);
+    fcmd(0x42, 240.0f);  fcmd(0x43, -136.0f);
+    fcmd(0x45, 2048.0f); fcmd(0x46, 2048.0f);
+    cmd(0x4C, (2048 - 240) << 4);
+    cmd(0x4D, (2048 - 136) << 4);
+    /* Bone 0 moves right by 0.25, bone 1 left by 0.25. */
+    const float bones[24] = { 1, 0, 0,  0, 1, 0,  0, 0, 1,   0.25f, 0, 0,
+                              1, 0, 0,  0, 1, 0,  0, 0, 1,  -0.25f, 0, 0 };
+    cmd(0x2A, 0);
+    for (int k = 0; k < 24; k++) fcmd(0x2B, bones[k]);
+    skinned_vertex(0, -0.5f,  0.5f, w0, w1);
+    skinned_vertex(1,  0.5f,  0.5f, w0, w1);
+    skinned_vertex(2, -0.5f, -0.5f, w0, w1);
+    skinned_vertex(3,  0.5f, -0.5f, w0, w1);
+    cmd(0x04, (4u << 16) | 4);
+    end_list();
+}
+
+static void test_skinning(void) {
+    /* Unskinned, this square covers x 120-360. */
+    draw_skinned_quad(0x80, 0);
+    CHECK(pixel(185, 75) != 0, "a skinned vertex is drawn");
+    CHECK(pixel(175, 136) == 0, "weight 1.0 on bone 0 moves the left edge right: 0x%08X", pixel(175, 136));
+    CHECK(pixel(415, 136) != 0, "and the right edge with it");
+
+    draw_skinned_quad(0x40, 0x40);
+    CHECK(pixel(125, 136) != 0, "equal weights on opposite bones cancel out");
+    CHECK(pixel(365, 136) == 0, "and leave the right edge in place: 0x%08X", pixel(365, 136));
+}
+
 static void test_triangle_strip(void) {
     psp_ge_reset();
     clear_fb();
@@ -682,6 +733,7 @@ int main(void) {
     test_winding();
     test_clipping();
     test_transformed_quad();
+    test_skinning();
     test_triangle_strip();
     test_framebuffer_is_vram_relative();
     test_textured_sprite();

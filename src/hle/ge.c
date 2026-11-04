@@ -72,6 +72,8 @@
 #define GE_ZBW          0x9F
 #define GE_ZTST         0xDE
 #define GE_ZMSK         0xE7
+#define GE_BOFS         0x2A
+#define GE_BONE         0x2B
 #define GE_WMS          0x3A
 #define GE_WORLD        0x3B
 #define GE_VMS          0x3C
@@ -222,6 +224,8 @@ static struct {
 } g_lt;
 static uint32_t g_zbp, g_zbw;
 
+#define GE_BONES 8
+
 /* The transform pipeline. Matrices are uploaded one float per command, column
  * by column: world and view are 4x3 (the last column is the translation),
  * projection is 4x4. The viewport maps clip space into the GE's 4096-wide
@@ -229,6 +233,8 @@ static uint32_t g_zbp, g_zbw;
 static struct {
     float world[12], view[12], proj[16];
     int   wi, vi, pi;
+    float bone[GE_BONES * 12];          /* 4x3, uploaded like the world matrix */
+    int   bi;
     float xscale, yscale, xpos, ypos;
     float offx, offy;                   /* pixels */
     float uscale, vscale, uoff, voff;
@@ -248,6 +254,8 @@ static void xf_reset(void) {
     g_xf.world[0] = g_xf.world[4] = g_xf.world[8] = 1;
     g_xf.view[0] = g_xf.view[4] = g_xf.view[8] = 1;
     g_xf.proj[0] = g_xf.proj[5] = g_xf.proj[10] = g_xf.proj[15] = 1;
+    for (int b = 0; b < GE_BONES; b++)
+        g_xf.bone[b * 12 + 0] = g_xf.bone[b * 12 + 4] = g_xf.bone[b * 12 + 8] = 1;
     g_xf.uscale = g_xf.vscale = 1;
 }
 
@@ -463,9 +471,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
  *    screen space and texture coordinates are texels, and transformed mode,
  *    where positions go through world, view and projection and the viewport,
  *    and texture coordinates are normalised and scaled by UV scale/offset.
- *    Transformed vertices are lit (four lights, per vertex) and get a depth.
- *    Skinning, morphing, the texture matrix and near-plane clipping are not
- *    done.
+ *    Transformed vertices are skinned, lit (four lights, per vertex) and get a
+ *    depth. Morphing, the texture matrix and near-plane clipping are not done.
  *  - Position, normal and texture coordinates as 8- or 16-bit or float;
  *    colour as 8888, the 16-bit formats, or none; 8- or 16-bit indices.
  *  - Textures, CLUTs, the texture function, alpha test, depth test, blending,
@@ -483,6 +490,8 @@ uint64_t psp_ge_vertex_count(void)  { return g_ge.vertices; }
 #define VT_POS(v)     (((v) >> 7) & 3)
 #define VT_WEIGHT(v)  (((v) >> 9) & 3)
 #define VT_INDEX(v)   (((v) >> 11) & 3)
+#define VT_WEIGHTS(v) ((int)(((v) >> 14) & 7) + 1)
+#define VT_MORPHS(v)  ((int)(((v) >> 18) & 7) + 1)
 #define VT_THROUGH(v) (((v) >> 23) & 1)
 
 
@@ -504,7 +513,11 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
     int n = norm_sz[VT_NORMAL(vtype)] * 3;
     int p = pos_sz[VT_POS(vtype)] * 3;
 
-    if (VT_WEIGHT(vtype)) return 0;          /* skinning: not handled */
+    if (VT_MORPHS(vtype) > 1) return 0;      /* morphing: not handled */
+
+    /* Weights come first, so they always start at offset 0. */
+    int ws = pos_sz[VT_WEIGHT(vtype)];
+    if (ws) { off = ws * VT_WEIGHTS(vtype); align = ws; }
 
     int ts = tex_sz[VT_TEX(vtype)];
     if (ts) { off = (off + ts - 1) & ~(ts - 1); *tex_off = off; off += t; if (ts > align) align = ts; }
@@ -532,6 +545,26 @@ static void read3(uint32_t a, int fmt, int raw, float v[3]) {
         case 2:  v[i] = (float)(int16_t)psp_read16(a + (uint32_t)i * 2);
                  if (!raw) v[i] /= 32768.0f; break;
         default: v[i] = psp_read_f32(a + (uint32_t)i * 4); break;
+        }
+    }
+}
+
+/* Replace a position and normal with their weighted sum over the bone matrices.
+ * Weights are unsigned fixed point where 1.0 is 0x80 or 0x8000, and a normal takes
+ * no translation. Each vertex's weights sit at its very start. */
+static void skin_vertex(uint32_t addr, uint32_t vtype, float pos[3], float n[3]) {
+    const float p0[3] = { pos[0], pos[1], pos[2] }, n0[3] = { n[0], n[1], n[2] };
+    const int fmt = (int)VT_WEIGHT(vtype), count = VT_WEIGHTS(vtype);
+    for (int r = 0; r < 3; r++) pos[r] = n[r] = 0;
+    for (int b = 0; b < count; b++) {
+        float w;
+        if (fmt == 1)      w = (float)psp_read8(addr + (uint32_t)b) / 128.0f;
+        else if (fmt == 2) w = (float)psp_read16(addr + (uint32_t)b * 2) / 32768.0f;
+        else               w = psp_read_f32(addr + (uint32_t)b * 4);
+        const float *B = &g_xf.bone[b * 12];
+        for (int r = 0; r < 3; r++) {
+            pos[r] += w * (B[r] * p0[0] + B[3 + r] * p0[1] + B[6 + r] * p0[2] + B[9 + r]);
+            n[r]   += w * (B[r] * n0[0] + B[3 + r] * n0[1] + B[6 + r] * n0[2]);
         }
     }
 }
@@ -579,11 +612,10 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
         out->z = VT_POS(vtype) == 2 ? (float)psp_read16(addr + (uint32_t)pos_off + 4) : pos[2];
         return 1;
     }
-    if (g_lt.enable) {
-        float n[3] = { 0, 0, 1 };
-        if (nrm_off >= 0) read3(addr + (uint32_t)nrm_off, (int)VT_NORMAL(vtype), 0, n);
-        out->rgba = light_vertex(pos, n, out->rgba);
-    }
+    float n[3] = { 0, 0, 1 };
+    if (nrm_off >= 0) read3(addr + (uint32_t)nrm_off, (int)VT_NORMAL(vtype), 0, n);
+    if (VT_WEIGHT(vtype)) skin_vertex(addr, vtype, pos, n);
+    if (g_lt.enable) out->rgba = light_vertex(pos, n, out->rgba);
     float sx, sy, sz;
     if (!transform(pos, &sx, &sy, &sz)) { out->behind = 1; g_xf.behind++; return 1; }
     out->x = (int)floorf(sx);
@@ -750,6 +782,8 @@ static void run_list(ge_queue *q) {
             psp_render_current()->set_target(fb_vram(), g_ge.fbw, (int)g_psm);
             break;
 
+        case GE_BOFS:  g_xf.bi = (int)(arg & 0x7F); break;
+        case GE_BONE:  if (g_xf.bi < GE_BONES * 12) g_xf.bone[g_xf.bi++] = f24(arg); break;
         case GE_WMS:   g_xf.wi = (int)(arg & 0xF); break;
         case GE_WORLD: if (g_xf.wi < 12) g_xf.world[g_xf.wi++] = f24(arg); break;
         case GE_VMS:   g_xf.vi = (int)(arg & 0xF); break;
