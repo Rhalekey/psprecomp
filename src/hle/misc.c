@@ -181,11 +181,34 @@ static void hle_ChRelease(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Nothing consumes the samples; the block count is what tells you audio is
- * flowing. */
-static void hle_Output(void) {
+static psp_audio_sink_fn g_audio_sink;
+static uint32_t g_audio_lead_us;
+
+void psp_audio_set_lead(uint32_t us) { g_audio_lead_us = us; }
+
+void psp_audio_set_sink(psp_audio_sink_fn sink) { g_audio_sink = sink; }
+
+#define AUDIO_FORMAT_MONO 0x10u
+
+/* Pass a block to the host. The block count is what tells you audio is flowing
+ * whether or not anything is listening. */
+static void submit_block(int slot, uint32_t buf, uint32_t frames, int stereo, uint32_t vl, uint32_t vr) {
     g_audio_blocks++;
-    psp_ret(psp_arg(0) < AUDIO_CHANNELS ? g_audio[psp_arg(0)].samples : 0);
+    if (!g_audio_sink || !buf || !frames) return;
+    const int16_t *pcm = (const int16_t *)psp_mem_ptr(buf, frames * (stereo ? 4u : 2u));
+    if (pcm) g_audio_sink(slot, pcm, frames, stereo, vl, vr);
+}
+
+static void submit_channel(uint32_t ch, uint32_t vl, uint32_t vr, uint32_t buf) {
+    if (ch < AUDIO_CHANNELS)
+        submit_block((int)ch, buf, g_audio[ch].samples, g_audio[ch].format != AUDIO_FORMAT_MONO, vl, vr);
+}
+
+/* (channel, left, right, buf) */
+static void hle_OutputPanned(void) {
+    const uint32_t ch = psp_arg(0);
+    submit_channel(ch, psp_arg(1), psp_arg(2), psp_arg(3));
+    psp_ret(ch < AUDIO_CHANNELS ? g_audio[ch].samples : 0);
 }
 
 /* The blocking forms hold the caller while the hardware drains a buffer, and
@@ -211,20 +234,19 @@ static uint64_t host_now_us(void) {
 static uint64_t g_audio_due_us[AUDIO_CHANNELS + 2];
 #endif
 
-static void hle_OutputBlocking(void) {
-    uint32_t ch = psp_arg(0);
+static void output_blocking(uint32_t ch, uint32_t vl, uint32_t vr, uint32_t buf) {
     uint32_t samples = ch < AUDIO_CHANNELS ? g_audio[ch].samples : 0;
     static int traced;
     if (getenv("PSPRECOMP_TRACE_SAS") && traced++ < 4)
         fprintf(stderr, "audio: OutputBlocking ch %u samples %u buf 0x%08X\n", ch, samples, psp_arg(2));
-    hle_Output();
+    submit_channel(ch, vl, vr, buf);
     const uint64_t play_us = (uint64_t)samples * 1000000u / 44100u;
 #if PSPRECOMP_REAL_THREADS
     if (ch < AUDIO_CHANNELS) {
         uint64_t now = host_now_us();
         if (g_audio_due_us[ch] < now) g_audio_due_us[ch] = now;   /* underrun */
         g_audio_due_us[ch] += play_us;
-        while (host_now_us() + play_us < g_audio_due_us[ch]) psp_threadman_yield();
+        while (host_now_us() + play_us + g_audio_lead_us < g_audio_due_us[ch]) psp_threadman_yield();
     }
 #else
     psp_threadman_delay(play_us);
@@ -232,19 +254,33 @@ static void hle_OutputBlocking(void) {
     psp_ret(samples);
 }
 
+/* (channel, volume, buf) */
+static void hle_OutputBlocking(void) { output_blocking(psp_arg(0), psp_arg(1), psp_arg(1), psp_arg(2)); }
+/* (channel, left, right, buf) */
+static void hle_OutputPannedBlocking(void) { output_blocking(psp_arg(0), psp_arg(1), psp_arg(2), psp_arg(3)); }
+
+/* (channel, format) */
+static void hle_ChangeChannelConfig(void) {
+    const uint32_t ch = psp_arg(0);
+    if (ch >= AUDIO_CHANNELS) { psp_ret(0x80260003); return; }
+    g_audio[ch].format = psp_arg(1);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
 /* sceAudioOutput2 and sceVaudio each drive one stream, and their blocking calls
  * pace the thread feeding them just as sceAudioOutputBlocking does. */
 static uint32_t g_output2_samples, g_vaudio_samples;
 
 static void pace_stream(int slot, uint32_t samples) {
-    g_audio_blocks++;
+    /* (volume, buf) */
+    submit_block(AUDIO_CHANNELS + slot, psp_arg(1), samples, 1, psp_arg(0), psp_arg(0));
     const uint64_t play_us = (uint64_t)samples * 1000000u / 44100u;
 #if PSPRECOMP_REAL_THREADS
     const int i = AUDIO_CHANNELS + slot;
     uint64_t now = host_now_us();
     if (g_audio_due_us[i] < now) g_audio_due_us[i] = now;
     g_audio_due_us[i] += play_us;
-    while (host_now_us() + play_us < g_audio_due_us[i]) psp_threadman_yield();
+    while (host_now_us() + play_us + g_audio_lead_us < g_audio_due_us[i]) psp_threadman_yield();
 #else
     psp_threadman_delay(play_us);
 #endif
@@ -429,10 +465,10 @@ void psp_misc_register(void) {
     psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
     psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);
     psp_hle_register(0x136CAF51, "sceAudio", "sceAudioOutputBlocking",       hle_OutputBlocking);
-    psp_hle_register(0x13F592BC, "sceAudio", "sceAudioOutputPannedBlocking", hle_OutputBlocking);
-    psp_hle_register(0xE2D56B2D, "sceAudio", "sceAudioOutputPanned",         hle_Output);
+    psp_hle_register(0x13F592BC, "sceAudio", "sceAudioOutputPannedBlocking", hle_OutputPannedBlocking);
+    psp_hle_register(0xE2D56B2D, "sceAudio", "sceAudioOutputPanned",         hle_OutputPanned);
     psp_hle_register(0xB011922F, "sceAudio", "sceAudioGetChannelRestLength", hle_GetChannelRestLength);
     psp_hle_register(0xCB2E439E, "sceAudio", "sceAudioSetChannelDataLen",    hle_SetChannelDataLen);
-    psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ok);
+    psp_hle_register(0x95FD0C2D, "sceAudio", "sceAudioChangeChannelConfig",  hle_ChangeChannelConfig);
     psp_hle_register(0xB7E1D8E7, "sceAudio", "sceAudioChangeChannelVolume",  hle_ok);
 }

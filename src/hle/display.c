@@ -31,6 +31,7 @@ static uint32_t g_fb_width;      /* in pixels, the stride -- usually 512 */
 static uint32_t g_fb_format;
 static uint32_t g_mode, g_mode_w, g_mode_h;
 static uint64_t g_vblank_count;
+static uint64_t g_flips;     /* frames the game actually presented */
 
 void psp_display_reset(void) {
     g_fb_addr = 0;
@@ -45,6 +46,7 @@ void psp_display_reset(void) {
 void psp_display_init(void) { psp_display_reset(); }
 
 uint64_t psp_display_vblanks(void) { return g_vblank_count; }
+uint64_t psp_display_flips(void) { return g_flips; }
 uint32_t psp_display_framebuffer(void) { return g_fb_addr; }
 
 /* Write the current framebuffer as a binary PPM. Returns 0 on success, -1 if
@@ -94,6 +96,7 @@ static void hle_SetMode(void) {
 
 static void hle_SetFrameBuf(void) {
     /* (topaddr, bufferwidth, pixelformat, sync) */
+    if (psp_arg(0) && psp_arg(0) != g_fb_addr) g_flips++;
     g_fb_addr   = psp_arg(0);
     g_fb_width  = psp_arg(1);
     g_fb_format = psp_arg(2);
@@ -122,15 +125,18 @@ static uint64_t display_now_us(void) {
     return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
 }
 
+/* Every thread waiting for a vblank wakes at the same one, so the next one is
+ * worked out from a fixed origin. Handing out turns instead would give each of two
+ * waiters every other refresh, halving the frame rate of both. */
 static void pace_vblank(uint32_t frame_us) {
-    static uint64_t next;
+    static uint64_t origin;
     uint64_t now = display_now_us();
-    if (now > next + frame_us) next = now;        /* fell behind: do not catch up */
-    while (now < next) {
+    if (!origin) origin = now;
+    const uint64_t target = origin + ((now - origin) / frame_us + 1) * frame_us;
+    while (now < target) {
         psp_threadman_yield();
         now = display_now_us();
     }
-    next += frame_us;
 }
 
 static void hle_WaitVblank(void) {

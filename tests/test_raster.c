@@ -76,6 +76,7 @@ static void end_list(void) {
     cmd(0x0F, 0);                    /* FINISH */
     cmd(0x0C, 0);                    /* END */
     call(0xAB49E76A, LIST, 0, 0, 0); /* sceGeListEnQueue */
+    call(0xB287BD61, 0, 0, 0, 0);    /* sceGeDrawSync */
 }
 
 /* One 16-bit-position, 8888-colour vertex. Colour precedes position. */
@@ -746,6 +747,14 @@ int main(void) {
     test_vertex_flow();
     test_lighting();
     test_backend_selection();
+
+    /* The same results when the GE runs on its own thread. */
+    psp_ge_set_async(1);
+    test_sprite();
+    test_transformed_quad();
+    test_skinning();
+    test_depth();
+    psp_ge_set_async(0);
 
     psp_mem_free();
     printf(failures ? "raster: %d failure(s)\n" : "raster: all tests passed\n", failures);

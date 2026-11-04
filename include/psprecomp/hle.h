@@ -144,6 +144,9 @@ void psp_display_reset(void);
 /* Hold vblank waits to this many per second, changeable at any time. 0, the
  * default, does not hold them at all. */
 void psp_display_set_refresh_rate(double hz);
+/* Times the game has switched to a new front buffer: its real frame rate, which
+ * a thread waiting for vblanks on its own says nothing about. */
+uint64_t psp_display_flips(void);
 int      psp_display_capture(const char *path);
 /* The front buffer as 480x272 pixels of 0xAABBGGRR; -1 before the game has
  * set a framebuffer. */
@@ -158,6 +161,12 @@ void psp_ge_dump_stats(FILE *out);
 uint64_t psp_ge_command_count(void);
 uint64_t psp_ge_vertex_count(void);
 uint64_t psp_ge_pixels(void);
+/* Run display lists on a host thread of their own, as hardware runs them beside
+ * the CPU. Needs real threads; without them, or by default, they run inside the
+ * enqueue. Turn it on before any list is queued. */
+void     psp_ge_set_async(int on);
+/* Host time spent running display lists: the cost of software rendering. */
+uint64_t psp_ge_busy_us(void);
 /* Run the callbacks finished lists have raised. Called at every wait. */
 void     psp_ge_deliver(void);
 uint64_t psp_ge_callbacks_delivered(void);
@@ -188,6 +197,15 @@ void psp_misc_reset(void);
 int  psp_exit_requested(void);
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
 uint64_t psp_audio_blocks(void);
+/* Receives every block of PCM the game outputs, on whichever thread sent it. The
+ * samples are only valid during the call; volumes are 0x8000 at full. */
+typedef void (*psp_audio_sink_fn)(int slot, const int16_t *samples, uint32_t frames,
+                                  int stereo, uint32_t vl, uint32_t vr);
+void psp_audio_set_sink(psp_audio_sink_fn sink);
+/* How far ahead of real time a blocking output may run before it holds the caller.
+ * Hardware has a queue of its own, and a sound card fed through the host's needs
+ * more slack than one buffer: any delay in the feeding thread is then a gap. */
+void psp_audio_set_lead(uint32_t us);
 
 void psp_threadman_init(void);
 void psp_threadman_register(void);

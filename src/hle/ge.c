@@ -27,11 +27,13 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/dispatch.h"
 #include "psprecomp/render.h"
+#include "ge_thread.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* Display-list opcodes. Only the ones the walk needs to be correct about are
  * named; everything else is counted rather than guessed at, because a
@@ -134,6 +136,7 @@ typedef struct {
     int      used;
     int      done;
     uint32_t cbid;      /* sceGeSetCallback's id, as passed to the enqueue */
+    int      queued;    /* waiting for the GE thread */
 } ge_queue;
 
 static ge_queue g_queue[MAX_QUEUES];
@@ -144,9 +147,10 @@ static ge_queue g_queue[MAX_QUEUES];
  * run a callback set with sceGeSetCallback. A game can depend on that entirely,
  * polling a flag its finish callback sets without ever calling a sync function.
  *
- * Lists run to completion inside the enqueue, so raising the callback there would
- * run it before the game has seen the list's id. It is queued instead and
- * delivered at the next wait, as a real interrupt would arrive after the call. */
+ * A callback must run on a guest thread, and may be raised before the game has
+ * even seen the list's id. It is queued and delivered at the next wait, as a real
+ * interrupt would arrive after the call. The GE thread raises and a guest thread
+ * delivers, so the queue is locked. */
 #define MAX_GE_CALLBACKS 16
 #define MAX_GE_PENDING   64
 
@@ -170,19 +174,30 @@ static void ge_raise(const ge_queue *q, int is_signal, uint32_t value) {
     const ge_callback *c = &g_ge_cb[q->cbid];
     const uint32_t fn = is_signal ? c->signal_fn : c->finish_fn;
     if (!fn) return;
-    if (g_ge_npending == MAX_GE_PENDING) { g_ge_dropped++; return; }
-    ge_pending *p = &g_ge_pending[g_ge_npending++];
-    p->fn = fn;
-    p->a0 = value;
-    p->a1 = is_signal ? c->signal_arg : c->finish_arg;
+    ge_lock();
+    if (g_ge_npending == MAX_GE_PENDING) {
+        g_ge_dropped++;
+    } else {
+        ge_pending *p = &g_ge_pending[g_ge_npending++];
+        p->fn = fn;
+        p->a0 = value;
+        p->a1 = is_signal ? c->signal_arg : c->finish_arg;
+    }
+    ge_unlock();
 }
 
 void psp_ge_deliver(void) {
     /* A callback may wait, and every wait comes back through here. */
     if (g_ge_delivering || !g_ge_npending || psp_threadman_intr_disabled()) return;
     g_ge_delivering = 1;
-    for (int i = 0; i < g_ge_npending; i++) {
-        const ge_pending p = g_ge_pending[i];
+    ge_pending batch[MAX_GE_PENDING];
+    ge_lock();
+    const int count = g_ge_npending;
+    memcpy(batch, g_ge_pending, (size_t)count * sizeof batch[0]);
+    g_ge_npending = 0;
+    ge_unlock();
+    for (int i = 0; i < count; i++) {
+        const ge_pending p = batch[i];
         if (!psp_lookup(p.fn)) {
             fprintf(stderr, "psprecomp: GE callback 0x%08X is not a recompiled function\n", p.fn);
             continue;
@@ -196,7 +211,6 @@ void psp_ge_deliver(void) {
         psp_cpu = saved;
         g_ge_delivered++;
     }
-    g_ge_npending = 0;
     g_ge_delivering = 0;
 }
 static uint32_t g_next_id;
@@ -750,8 +764,10 @@ static void run_list(ge_queue *q) {
             /* A finished list gives its slot back. Keeping it used meant the
              * ninth enqueue failed, and WTF then dropped 3,870 of 3,885
              * frames while running at full speed. */
+            ge_lock();
             q->done = 1;
             q->used = 0;
+            ge_unlock();
             return;
 
         case GE_SIGNAL:
@@ -920,26 +936,91 @@ static ge_queue *find_queue(uint32_t id) {
     return NULL;
 }
 
+static uint64_t g_ge_busy_us;
+
+uint64_t psp_ge_busy_us(void) { return g_ge_busy_us; }
+
+static uint64_t ge_now_us(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+static void run_list_timed(ge_queue *q) {
+    const uint64_t start = ge_now_us();
+    run_list(q);
+    g_ge_busy_us += ge_now_us() - start;
+}
+
+/* ---- the GE's own thread ---------------------------------------------------
+ *
+ * Only one guest thread runs at a time, so a list drawn inside the enqueue stops
+ * the whole game while it draws. Hardware draws while the CPU carries on, and a
+ * game is written for that: it syncs before touching what a list uses. Doing the
+ * same puts software rendering on a core of its own. */
+static int g_ge_async, g_ge_thread_running, g_ge_inflight;
+
+static void ge_worker(void) {
+    ge_lock();
+    for (;;) {
+        ge_queue *q = NULL;
+        for (int i = 0; i < MAX_QUEUES; i++)
+            if (g_queue[i].queued && (!q || g_queue[i].id < q->id)) q = &g_queue[i];
+        if (!q) { ge_wait(); continue; }
+        q->queued = 0;
+        ge_unlock();
+        run_list_timed(q);
+        ge_lock();
+        g_ge_inflight--;
+        ge_wake();
+    }
+}
+
+void psp_ge_set_async(int on) {
+    if (on && !g_ge_thread_running) g_ge_thread_running = ge_thread_start(ge_worker);
+    g_ge_async = on && g_ge_thread_running;
+}
+
+static int ge_busy(void) {
+    ge_lock();
+    const int busy = g_ge_inflight > 0;
+    ge_unlock();
+    return busy;
+}
+
 static void enqueue(int head) {
     /* (list, stall, cbid, arg) */
+    const uint32_t list = psp_arg(0) & ~3u, stall = psp_arg(1) & ~3u, cbid = psp_arg(2);
     ge_queue *q = NULL;
-    for (int i = 0; i < MAX_QUEUES; i++) if (!g_queue[i].used) { q = &g_queue[i]; break; }
-    if (!q) { psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
-
-    memset(q, 0, sizeof *q);
-    q->id    = g_next_id++;
-    q->list  = psp_arg(0) & ~3u;
-    q->stall = psp_arg(1) & ~3u;
-    q->used  = 1;
-    q->cbid  = psp_arg(2);
     (void)head;
 
-    /* Hardware runs the list asynchronously. We run it here and finish before
-     * returning, which is indistinguishable from the game's point of view
-     * because every way it can observe progress -- ListSync, DrawSync -- then
-     * reports completion. */
-    run_list(q);
-    psp_ret(q->id);
+    for (;;) {
+        ge_lock();
+        for (int i = 0; i < MAX_QUEUES; i++) if (!g_queue[i].used) { q = &g_queue[i]; break; }
+        if (q || !g_ge_async) break;
+        ge_unlock();
+        psp_threadman_yield();        /* the GE is behind: wait for a free slot */
+    }
+    if (!q) { ge_unlock(); psp_ret(SCE_KERNEL_ERROR_NO_MEMORY); return; }
+
+    memset(q, 0, sizeof *q);
+    const uint32_t id = g_next_id++;
+    q->id    = id;
+    q->list  = list;
+    q->stall = stall;
+    q->used  = 1;
+    q->cbid  = cbid;
+
+    if (g_ge_async) {
+        q->queued = 1;
+        g_ge_inflight++;
+        ge_wake();
+        ge_unlock();
+    } else {
+        ge_unlock();
+        run_list_timed(q);
+    }
+    psp_ret(id);
 }
 
 static void hle_ListEnQueue(void)     { enqueue(0); }
@@ -955,18 +1036,35 @@ static void hle_ListUpdateStallAddr(void) {
                                                     : SCE_KERNEL_ERROR_UNKNOWN_UID);
         return;
     }
-    q->stall = psp_arg(1) & ~3u;
-    if (!q->done) run_list(q);          /* the new stall released more commands */
+    if (g_ge_async) {
+        ge_lock();
+        q->stall = psp_arg(1) & ~3u;
+        if (!q->done && !q->queued) {
+            q->queued = 1;
+            g_ge_inflight++;
+            ge_wake();
+        }
+        ge_unlock();
+    } else {
+        q->stall = psp_arg(1) & ~3u;
+        if (!q->done) run_list_timed(q);    /* the new stall released more commands */
+    }
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Lists are complete by the time they are enqueued, so every sync succeeds
- * immediately. */
-static void hle_ListSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
-static void hle_DrawSync(void) {
+/* Mode 0 waits for the GE to finish, mode 1 only asks. */
+#define GE_LIST_DRAWING 2u
+
+static void ge_sync(uint32_t mode) {
+    if (mode == 1 && ge_busy()) { psp_ret(GE_LIST_DRAWING); return; }
+    while (ge_busy()) psp_threadman_yield();
     psp_ge_deliver();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
+
+/* (id, mode): every list runs in order, so this waits for them all. */
+static void hle_ListSync(void) { ge_sync(psp_arg(1)); }
+static void hle_DrawSync(void) { ge_sync(psp_arg(0)); }
 
 static void hle_Break(void)    { psp_ret(SCE_KERNEL_ERROR_OK); }
 static void hle_Continue(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
