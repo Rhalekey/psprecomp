@@ -485,6 +485,16 @@ static int load_and_discover(const char *path, psp_blob *b, elf_info *e,
         an->base = e->text_addr;
         an->size = e->text_size;
     }
+    /* A statically linked module has no relocations, so its function pointers
+     * are found by scanning data for anything that looks like a code address.
+     * With the whole segment as the extent, every pointer to a global passes
+     * that test and .data gets recompiled as code. Its section headers already
+     * say where the code is, so use them. */
+    if (e->type != ET_PSP_PRX && e->text_from_section) {
+        an->code = b->data + e->text_offset;
+        an->base = e->text_addr;
+        an->size = e->text_size;
+    }
     an->scan_base = e->text_addr;
     an->scan_size = e->text_size;
     an->stub_addr = e->stub_addr;
