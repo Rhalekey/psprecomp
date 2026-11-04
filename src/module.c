@@ -39,9 +39,12 @@ int psp_module_load(const char *path, uint32_t span, psp_module *m) {
     }
     const uint8_t *ph = b + phoff;
     const uint32_t off = rd32(ph + 4), vaddr = rd32(ph + 8), paddr = rd32(ph + 12);
-    const uint32_t filesz = rd32(ph + 16);
+    const uint32_t filesz = rd32(ph + 16), memsz = rd32(ph + 20);
+    /* A module linked inside RAM is simply in RAM. Giving it a mapping of its
+     * own would split guest memory at the end of `span`. */
+    const int in_ram = vaddr >= PSP_RAM_BASE && vaddr < PSP_RAM_BASE + PSP_RAM_SIZE;
     if ((size_t)off + filesz > (size_t)n || filesz > span ||
-        psp_mem_map_module(vaddr, span) != 0 ||
+        (!in_ram && psp_mem_map_module(vaddr, span) != 0) ||
         psp_mem_write_block(vaddr, b + off, filesz) != 0) {
         free(b);
         fprintf(stderr, "psprecomp: cannot place %s at 0x%08X\n", path, vaddr);
@@ -50,6 +53,7 @@ int psp_module_load(const char *path, uint32_t span, psp_module *m) {
 
     m->base = vaddr;
     m->image_end = vaddr + filesz;
+    m->mem_end = vaddr + (memsz > filesz ? memsz : filesz);
     m->entry = rd32(b + 24);
     /* SceModuleInfo: u16 attr, u16 version, char name[28], then gp. */
     const uint32_t info = (paddr & 0x7FFFFFFFu) - off + vaddr;
@@ -82,7 +86,7 @@ int psp_module_load(const char *path, uint32_t span, psp_module *m) {
 
 uint32_t psp_module_start(const psp_module *m) {
     psp_cpu.r[PSP_REG_GP] = m->gp;
-    psp_cpu.r[PSP_REG_SP] = START_STACK;
+    psp_cpu.r[PSP_REG_SP] = m->stack_top ? m->stack_top : START_STACK;
     psp_cpu.r[PSP_REG_A0] = 0;
     psp_cpu.r[PSP_REG_A1] = 0;
     psp_cpu.r[26] = TCB_ADDR;                   /* $k0 */

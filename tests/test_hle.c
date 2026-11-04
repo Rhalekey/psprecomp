@@ -28,6 +28,22 @@ static int failures;
         }                                                      \
     } while (0)
 
+/* What the GE callbacks saw. */
+static int g_ge_finish_calls, g_ge_signal_calls;
+static uint32_t g_ge_cb_a0, g_ge_cb_a1;
+
+static void fake_ge_finish(void) {
+    g_ge_finish_calls++;
+    g_ge_cb_a0 = psp_cpu.r[PSP_REG_A0];
+    g_ge_cb_a1 = psp_cpu.r[PSP_REG_A1];
+    psp_cpu.r[PSP_REG_V0] = 0;
+}
+
+static void fake_ge_signal(void) {
+    g_ge_signal_calls++;
+    psp_cpu.r[PSP_REG_V0] = 0;
+}
+
 /* Invoke a registered firmware call with o32 arguments. */
 static uint32_t call(uint32_t nid, uint32_t a0, uint32_t a1, uint32_t a2,
                      uint32_t a3) {
@@ -532,6 +548,54 @@ static void test_ge_display_list(void) {
           "eDRAM is the VRAM window");
     CHECK(call(psp_nid("sceGeEdramGetSize"), 0, 0, 0, 0) == PSP_VRAM_SIZE,
           "eDRAM is 2 MB");
+
+    /* The clock is real time, far past year 1, and dates convert to Unix time. */
+    {
+        const uint32_t DATE = LIST + 0x300, OUT = LIST + 0x320;
+        call(psp_nid("sceRtcGetAccumulativeTime"), 0, 0, 0, 0);
+        CHECK(psp_cpu.r[PSP_REG_V1] != 0, "accumulative time has its high word");
+        psp_write16(DATE + 0, 1970);
+        psp_write16(DATE + 2, 1);
+        psp_write16(DATE + 4, 2);
+        psp_write16(DATE + 6, 0);
+        psp_write16(DATE + 8, 0);
+        psp_write16(DATE + 10, 1);
+        call(psp_nid("sceRtcGetTime64_t"), DATE, OUT, 0, 0);
+        CHECK(psp_read32(OUT) == 86401u, "1970-01-02 00:00:01 is 86401, got %u", psp_read32(OUT));
+    }
+
+    /* Callbacks arrive after the enqueue returns, and a SIGNAL's END does not
+     * end the list: what follows it still has to run. */
+    {
+        const uint32_t CB = LIST + 0x100, CB_LIST = LIST + 0x200;
+        const uint32_t FINISH_FN = 0x08A00000u, SIGNAL_FN = 0x08A00010u;
+        psp_register(FINISH_FN, fake_ge_finish);
+        psp_register(SIGNAL_FN, fake_ge_signal);
+        psp_write32(CB + 0, SIGNAL_FN);
+        psp_write32(CB + 4, 0);
+        psp_write32(CB + 8, FINISH_FN);
+        psp_write32(CB + 12, 0x1234u);
+        const uint32_t cbid = call(psp_nid("sceGeSetCallback"), CB, 0, 0, 0);
+        CHECK(cbid < 16, "a callback id is issued, got 0x%08X", cbid);
+
+        psp_write32(CB_LIST + 0, (0x0Eu << 24) | 7u);            /* SIGNAL */
+        psp_write32(CB_LIST + 4, (0x0Cu << 24));                 /* its END */
+        psp_write32(CB_LIST + 8, (0x00u << 24));                 /* NOP */
+        psp_write32(CB_LIST + 12, (0x0Fu << 24) | 0x42u);        /* FINISH */
+        psp_write32(CB_LIST + 16, (0x0Cu << 24));                /* END */
+
+        uint64_t cb_before = psp_ge_command_count();
+        call(psp_nid("sceGeListEnQueue"), CB_LIST, 0, cbid, 0);
+        CHECK(psp_ge_command_count() - cb_before == 3, "the list ran past its SIGNAL, %llu commands",
+              (unsigned long long)(psp_ge_command_count() - cb_before));
+        CHECK(g_ge_finish_calls == 0, "the finish callback waits for the enqueue to return");
+
+        call(psp_nid("sceGeDrawSync"), 0, 0, 0, 0);
+        CHECK(g_ge_signal_calls == 1, "the signal callback ran once, got %d", g_ge_signal_calls);
+        CHECK(g_ge_finish_calls == 1, "the finish callback ran once, got %d", g_ge_finish_calls);
+        CHECK(g_ge_cb_a0 == 0x42u && g_ge_cb_a1 == 0x1234u, "finish(0x%X, 0x%X)", g_ge_cb_a0, g_ge_cb_a1);
+        call(psp_nid("sceGeUnsetCallback"), cbid, 0, 0, 0);
+    }
 }
 
 /* A list that jumps to itself must terminate rather than hang the host -- this

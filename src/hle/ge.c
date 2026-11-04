@@ -25,6 +25,7 @@
  */
 
 #include "psprecomp/hle.h"
+#include "psprecomp/dispatch.h"
 #include "psprecomp/render.h"
 
 #include <math.h>
@@ -130,9 +131,72 @@ typedef struct {
     uint32_t origin;
     int      used;
     int      done;
+    uint32_t cbid;      /* sceGeSetCallback's id, as passed to the enqueue */
 } ge_queue;
 
 static ge_queue g_queue[MAX_QUEUES];
+
+/* ---- callbacks ------------------------------------------------------------
+ *
+ * The GE tells the CPU about a list through interrupts: FINISH and SIGNAL each
+ * run a callback set with sceGeSetCallback. A game can depend on that entirely,
+ * polling a flag its finish callback sets without ever calling a sync function.
+ *
+ * Lists run to completion inside the enqueue, so raising the callback there would
+ * run it before the game has seen the list's id. It is queued instead and
+ * delivered at the next wait, as a real interrupt would arrive after the call. */
+#define MAX_GE_CALLBACKS 16
+#define MAX_GE_PENDING   64
+
+typedef struct {
+    int used;
+    uint32_t signal_fn, signal_arg, finish_fn, finish_arg;
+} ge_callback;
+
+typedef struct { uint32_t fn, a0, a1; } ge_pending;
+
+static ge_callback g_ge_cb[MAX_GE_CALLBACKS];
+static ge_pending  g_ge_pending[MAX_GE_PENDING];
+static int         g_ge_npending;
+static int         g_ge_delivering;
+static uint64_t    g_ge_delivered, g_ge_dropped;
+
+uint64_t psp_ge_callbacks_delivered(void) { return g_ge_delivered; }
+
+static void ge_raise(const ge_queue *q, int is_signal, uint32_t value) {
+    if (q->cbid >= MAX_GE_CALLBACKS || !g_ge_cb[q->cbid].used) return;
+    const ge_callback *c = &g_ge_cb[q->cbid];
+    const uint32_t fn = is_signal ? c->signal_fn : c->finish_fn;
+    if (!fn) return;
+    if (g_ge_npending == MAX_GE_PENDING) { g_ge_dropped++; return; }
+    ge_pending *p = &g_ge_pending[g_ge_npending++];
+    p->fn = fn;
+    p->a0 = value;
+    p->a1 = is_signal ? c->signal_arg : c->finish_arg;
+}
+
+void psp_ge_deliver(void) {
+    /* A callback may wait, and every wait comes back through here. */
+    if (g_ge_delivering || !g_ge_npending || psp_threadman_intr_disabled()) return;
+    g_ge_delivering = 1;
+    for (int i = 0; i < g_ge_npending; i++) {
+        const ge_pending p = g_ge_pending[i];
+        if (!psp_lookup(p.fn)) {
+            fprintf(stderr, "psprecomp: GE callback 0x%08X is not a recompiled function\n", p.fn);
+            continue;
+        }
+        /* It interrupts whatever was running, which must not notice. */
+        psp_cpu_state saved = psp_cpu;
+        psp_cpu.r[PSP_REG_A0] = p.a0;
+        psp_cpu.r[PSP_REG_A1] = p.a1;
+        psp_cpu.r[PSP_REG_RA] = 0;
+        psp_call_from_host(p.fn);
+        psp_cpu = saved;
+        g_ge_delivered++;
+    }
+    g_ge_npending = 0;
+    g_ge_delivering = 0;
+}
 static uint32_t g_next_id;
 
 static uint64_t g_unsupported;     /* vertices in a format we do not read */
@@ -328,6 +392,10 @@ static struct {
 
 void psp_ge_reset(void) {
     memset(g_queue, 0, sizeof g_queue);
+    memset(g_ge_cb, 0, sizeof g_ge_cb);
+    g_ge_npending = 0;
+    g_ge_delivering = 0;
+    g_ge_delivered = g_ge_dropped = 0;
     memset(&g_ge, 0, sizeof g_ge);
     memset(&g_ds, 0, sizeof g_ds);
     memset(g_clut, 0, sizeof g_clut);
@@ -643,7 +711,10 @@ static void run_list(ge_queue *q) {
 
         case GE_END:
         case GE_FINISH:
-            if (cmd == GE_FINISH) g_ge.finishes++;
+            if (cmd == GE_FINISH) {
+                g_ge.finishes++;
+                ge_raise(q, 0, arg & 0xFFFF);
+            }
             /* A finished list gives its slot back. Keeping it used meant the
              * ninth enqueue failed, and WTF then dropped 3,870 of 3,885
              * frames while running at full speed. */
@@ -652,8 +723,11 @@ static void run_list(ge_queue *q) {
             return;
 
         case GE_SIGNAL:
-            /* Raises a callback on hardware. Callbacks are not delivered yet
-             * (no scheduler), so this is recorded and ignored. */
+            /* SIGNAL always comes paired with an END that carries more of its
+             * arguments. That END does not end the list, so it is consumed here.
+             * The behaviours that move the read pointer are not handled. */
+            ge_raise(q, 1, arg & 0xFFFF);
+            if ((psp_read32(q->list) >> 24) == GE_END) q->list += 4;
             break;
 
         case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
@@ -823,6 +897,7 @@ static void enqueue(int head) {
     q->list  = psp_arg(0) & ~3u;
     q->stall = psp_arg(1) & ~3u;
     q->used  = 1;
+    q->cbid  = psp_arg(2);
     (void)head;
 
     /* Hardware runs the list asynchronously. We run it here and finish before
@@ -854,13 +929,36 @@ static void hle_ListUpdateStallAddr(void) {
 /* Lists are complete by the time they are enqueued, so every sync succeeds
  * immediately. */
 static void hle_ListSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
-static void hle_DrawSync(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+static void hle_DrawSync(void) {
+    psp_ge_deliver();
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
 
 static void hle_Break(void)    { psp_ret(SCE_KERNEL_ERROR_OK); }
 static void hle_Continue(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 
-static void hle_SetCallback(void)   { psp_ret(0); }
-static void hle_UnsetCallback(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+/* (PspGeCallbackData *): signal_func, signal_arg, finish_func, finish_arg */
+static void hle_SetCallback(void) {
+    const uint32_t data = psp_arg(0);
+    for (uint32_t i = 0; i < MAX_GE_CALLBACKS; i++) {
+        ge_callback *c = &g_ge_cb[i];
+        if (c->used) continue;
+        c->used = 1;
+        c->signal_fn  = psp_read32(data);
+        c->signal_arg = psp_read32(data + 4);
+        c->finish_fn  = psp_read32(data + 8);
+        c->finish_arg = psp_read32(data + 12);
+        psp_ret(i);
+        return;
+    }
+    psp_ret(SCE_KERNEL_ERROR_NO_MEMORY);
+}
+
+static void hle_UnsetCallback(void) {
+    const uint32_t id = psp_arg(0);
+    if (id < MAX_GE_CALLBACKS) g_ge_cb[id].used = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
 
 /* eDRAM is the GPU-visible VRAM window: 2 MB at 0x04000000. */
 static void hle_EdramGetAddr(void) { psp_ret(PSP_VRAM_BASE); }

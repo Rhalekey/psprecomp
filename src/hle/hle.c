@@ -237,6 +237,8 @@ void psp_hle_init(void) {
     psp_io_register();
     psp_misc_init();
     psp_misc_register();
+    psp_sync_init();
+    psp_sync_register();
     psp_power_init();
     psp_power_register();
 }

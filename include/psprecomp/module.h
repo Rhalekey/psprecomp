@@ -12,6 +12,8 @@
 typedef struct {
     uint32_t base;          /* link address of the image */
     uint32_t image_end;     /* end of the file-backed part; .bss follows */
+    uint32_t mem_end;       /* end of .bss: nothing else may be placed below this */
+    uint32_t stack_top;     /* module_start's stack; 0 uses a fixed default */
     uint32_t entry;         /* module_start */
     uint32_t gp;            /* from the module info */
     uint32_t ctors;         /* constructor table, 0 if none was found */

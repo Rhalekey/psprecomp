@@ -54,6 +54,11 @@ void psp_sysmem_reset(void) {
 
 void psp_sysmem_init(void) { psp_sysmem_reset(); }
 
+void psp_sysmem_set_range(uint32_t lo, uint32_t hi) {
+    g_heap_lo = lo;
+    g_heap_hi = hi;
+}
+
 static mem_block *find_uid(uint32_t uid) {
     for (int i = 0; i < MAX_BLOCKS; i++)
         if (g_block[i].used && g_block[i].uid == uid) return &g_block[i];

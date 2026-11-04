@@ -490,6 +490,9 @@ static void check_terminated(void);
 
 static void park_for(int kind, uint64_t timeout_us) {
     check_terminated();
+    /* Before giving the CPU away: the thread about to wait may be waiting for
+     * exactly this. */
+    psp_ge_deliver();
     psp_thread *t = g_tls_me;
 
 #if PSPRECOMP_REAL_THREADS
@@ -602,6 +605,8 @@ static void boot_record(void) {
  * caller: it is the guest saying "let a frame pass", which on one core means
  * "let the others run". */
 void psp_threadman_yield(void) { park_for(W_DELAY, TICK_US); }
+
+uint32_t psp_threadman_current(void) { return g_tls_me ? g_tls_me->uid : 0xFFFFFFFFu; }
 
 void psp_threadman_frame_wait(void) {
     deliver_tick();
@@ -778,6 +783,19 @@ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
     }
 }
 
+/* The firmware keeps a block for each thread at the top of its stack and points
+ * $k0 at it. Game libc stores its per-thread reent at k0+4, and with $k0 left at
+ * zero that write lands at address 4. The thread's uid sits at k0+0xC0. */
+#define THREAD_BLOCK_SIZE 256u
+
+static void set_thread_stack(const psp_thread *t) {
+    const uint32_t block = (t->stack_base + t->stack_size - THREAD_BLOCK_SIZE) & ~15u;
+    for (uint32_t i = 0; i < THREAD_BLOCK_SIZE; i += 4) psp_write32(block + i, 0);
+    psp_write32(block + 0xC0u, t->uid);
+    psp_cpu.r[26] = block;                  /* $k0 */
+    psp_cpu.r[PSP_REG_SP] = block;
+}
+
 #if PSPRECOMP_REAL_THREADS
 static void *guest_thread_main(void *arg) {
     psp_thread *t = (psp_thread *)arg;
@@ -795,7 +813,7 @@ static void *guest_thread_main(void *arg) {
     psp_cpu.r[PSP_REG_A1] = t->argp;
     /* Stack pointer starts at the top of the allocation, 16-byte aligned, with
      * a little headroom so a callee storing below $sp cannot run off the end. */
-    psp_cpu.r[PSP_REG_SP] = (t->stack_base + t->stack_size - 64) & ~15u;
+    set_thread_stack(t);
     psp_cpu.r[PSP_REG_RA] = 0;
 
     t->state = TH_RUNNING;
@@ -923,7 +941,7 @@ static void hle_StartThread(void) {
     g_current = g_tls_me = t;
     psp_cpu.r[PSP_REG_A0] = psp_arg(1);
     psp_cpu.r[PSP_REG_A1] = psp_arg(2);
-    psp_cpu.r[PSP_REG_SP] = (t->stack_base + t->stack_size - 64) & ~15u;
+    set_thread_stack(t);
     psp_cpu.r[PSP_REG_RA] = 0;
     t->state = TH_RUNNING;
     t->exited = t->terminated = t->delete_after = 0;
@@ -968,8 +986,11 @@ static void hle_StartThread(void) {
     t->host_joinable = 1;
     t->host_live = 1;
 
-    /* The whole point: the caller goes on running. The new thread waits for
-     * the CPU, and gets it at the caller's next blocking call. */
+    /* The caller goes on running: the new thread waits for the CPU, and gets it
+     * at the caller's next blocking call. Unless it outranks the caller, which on
+     * hardware means it runs now. A caller may spin until it has, and nothing
+     * else would ever take the CPU away. Lower numbers are higher priority. */
+    if (g_current && t->priority < g_current->priority) park_for(W_DELAY, TICK_US);
     psp_ret(SCE_KERNEL_ERROR_OK);
 #endif
 }
@@ -1158,7 +1179,16 @@ static void hle_GetThreadStackFreeSize(void) {
 /* Kept ahead of the epoch the run started at, so a game that compares two
  * readings -- or against a value it stored at startup -- never sees time go
  * backwards, and so the value is in the same range a real clock would give. */
-static uint64_t now_us(void) { return g_epoch_us + g_vtime_us; }
+/* Under real threads the guest's clock is the real one. Virtual time only moves
+ * at parks, so a thread polling it without waiting would watch it stand still,
+ * and music keeps real time whatever the scheduler does. */
+static uint64_t now_us(void) {
+#if PSPRECOMP_REAL_THREADS
+    return host_now_us();
+#else
+    return g_epoch_us + g_vtime_us;
+#endif
+}
 
 static void hle_GetSystemTime(void) {
     uint32_t out = psp_arg(0);
@@ -1174,6 +1204,11 @@ static void hle_GetSystemTimeWide(void) {
     uint64_t us = now_us();
     psp_cpu.r[PSP_REG_V0] = (uint32_t)us;
     psp_cpu.r[PSP_REG_V1] = (uint32_t)(us >> 32);
+}
+
+static void hle_TerminateDeleteThread(void) {
+    hle_TerminateThread();
+    if (psp_cpu.r[PSP_REG_V0] == SCE_KERNEL_ERROR_OK) hle_DeleteThread();
 }
 
 /* ---- semaphores ---------------------------------------------------------- */
@@ -1665,6 +1700,8 @@ void psp_threadman_register(void) {
     psp_hle_register(0x52089CA1, "ThreadManForUser", "sceKernelGetThreadStackFreeSize",  hle_GetThreadStackFreeSize);
 
     psp_hle_register(0xDB738F35, "ThreadManForUser", "sceKernelGetSystemTime",           hle_GetSystemTime);
+    psp_hle_register(0x369ED59D, "ThreadManForUser", "sceKernelGetSystemTimeLow",        hle_GetSystemTimeWide);
+    psp_hle_register(0x383F7BCC, "ThreadManForUser", "sceKernelTerminateDeleteThread",   hle_TerminateDeleteThread);
     psp_hle_register(0x82BC5777, "ThreadManForUser", "sceKernelGetSystemTimeWide",       hle_GetSystemTimeWide);
 
     psp_hle_register(0xD6DA4BA1, "ThreadManForUser", "sceKernelCreateSema",              hle_CreateSema);
@@ -1678,6 +1715,7 @@ void psp_threadman_register(void) {
     psp_hle_register(0xEF9E4C70, "ThreadManForUser", "sceKernelDeleteEventFlag",         hle_DeleteEventFlag);
     psp_hle_register(0x1FB15A32, "ThreadManForUser", "sceKernelSetEventFlag",            hle_SetEventFlag);
     psp_hle_register(0x812346E4, "ThreadManForUser", "sceKernelClearEventFlag",          hle_ClearEventFlag);
+    psp_hle_register(0x328C546A, "ThreadManForUser", "sceKernelWaitEventFlagCB",         hle_WaitEventFlag);
     psp_hle_register(0x402FCF22, "ThreadManForUser", "sceKernelWaitEventFlag",           hle_WaitEventFlag);
     psp_hle_register(0x30FD48F0, "ThreadManForUser", "sceKernelPollEventFlag",           hle_PollEventFlag);
 

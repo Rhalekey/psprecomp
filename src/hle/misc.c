@@ -207,7 +207,8 @@ static uint64_t host_now_us(void) {
     timespec_get(&ts, TIME_UTC);
     return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
 }
-static uint64_t g_audio_due_us[AUDIO_CHANNELS];
+/* The two extra slots are sceAudioOutput2 and sceVaudio. */
+static uint64_t g_audio_due_us[AUDIO_CHANNELS + 2];
 #endif
 
 static void hle_OutputBlocking(void) {
@@ -229,6 +230,105 @@ static void hle_OutputBlocking(void) {
     psp_threadman_delay(play_us);
 #endif
     psp_ret(samples);
+}
+
+/* sceAudioOutput2 and sceVaudio each drive one stream, and their blocking calls
+ * pace the thread feeding them just as sceAudioOutputBlocking does. */
+static uint32_t g_output2_samples, g_vaudio_samples;
+
+static void pace_stream(int slot, uint32_t samples) {
+    g_audio_blocks++;
+    const uint64_t play_us = (uint64_t)samples * 1000000u / 44100u;
+#if PSPRECOMP_REAL_THREADS
+    const int i = AUDIO_CHANNELS + slot;
+    uint64_t now = host_now_us();
+    if (g_audio_due_us[i] < now) g_audio_due_us[i] = now;
+    g_audio_due_us[i] += play_us;
+    while (host_now_us() + play_us < g_audio_due_us[i]) psp_threadman_yield();
+#else
+    psp_threadman_delay(play_us);
+#endif
+    psp_ret(samples);
+}
+
+static void hle_Output2Reserve(void) { g_output2_samples = psp_arg(0); psp_ret(0); }
+static void hle_Output2Release(void) { g_output2_samples = 0; psp_ret(0); }
+static void hle_Output2Blocking(void) { pace_stream(0, g_output2_samples); }
+static void hle_VaudioReserve(void) { g_vaudio_samples = psp_arg(0); psp_ret(0); }
+static void hle_VaudioRelease(void) { g_vaudio_samples = 0; psp_ret(0); }
+static void hle_VaudioBlocking(void) { pace_stream(1, g_vaudio_samples); }
+
+/* ---- sceRtc -------------------------------------------------------------- *
+ * Real time. These are what a game polls in a loop while another thread does
+ * something, and nothing preempts a thread here, so every so often a poll gives
+ * the CPU away. Without that the thread it waits for never gets to run. */
+#define RTC_YIELD_EVERY 32u
+#define RTC_TICKS_TO_UNIX 62135596800000000ull   /* microseconds, year 1 to 1970 */
+
+static uint64_t unix_now_us(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+static void hle_RtcGetAccumulativeTime(void) {
+    static uint32_t polls;
+    if (++polls % RTC_YIELD_EVERY == 0) psp_threadman_yield();
+    const uint64_t ticks = unix_now_us() + RTC_TICKS_TO_UNIX;
+    psp_cpu.r[PSP_REG_V0] = (uint32_t)ticks;
+    psp_cpu.r[PSP_REG_V1] = (uint32_t)(ticks >> 32);
+}
+
+/* pspTime: u16 year, month, day, hour, minute, second, then u32 microsecond. */
+static void hle_RtcGetCurrentClockLocalTime(void) {
+    const uint32_t out = psp_arg(0);
+    const uint64_t now = unix_now_us();
+    const time_t secs = (time_t)(now / 1000000u);
+    const struct tm *tm = localtime(&secs);
+    if (!tm) { psp_ret(SCE_KERNEL_ERROR_ERROR); return; }
+    psp_write16(out + 0, (uint16_t)(tm->tm_year + 1900));
+    psp_write16(out + 2, (uint16_t)(tm->tm_mon + 1));
+    psp_write16(out + 4, (uint16_t)tm->tm_mday);
+    psp_write16(out + 6, (uint16_t)tm->tm_hour);
+    psp_write16(out + 8, (uint16_t)tm->tm_min);
+    psp_write16(out + 10, (uint16_t)tm->tm_sec);
+    psp_write32(out + 12, (uint32_t)(now % 1000000u));
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* Days since 1970-01-01 in the proleptic Gregorian calendar. */
+static int64_t days_from_civil(int64_t y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned)(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? (unsigned)-3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+/* (const pspTime *date, u64 *seconds since 1970) */
+static void hle_RtcGetTime64_t(void) {
+    const uint32_t date = psp_arg(0), out = psp_arg(1);
+    const int64_t days = days_from_civil(psp_read16(date), psp_read16(date + 2), psp_read16(date + 4));
+    const uint64_t secs = (uint64_t)(days * 86400 + psp_read16(date + 6) * 3600 +
+                                     psp_read16(date + 8) * 60 + psp_read16(date + 10));
+    psp_write32(out, (uint32_t)secs);
+    psp_write32(out + 4, (uint32_t)(secs >> 32));
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* ---- sceUmdUser ---------------------------------------------------------- *
+ * The disc is a host directory: always inserted, spun up and readable. */
+#define UMD_STAT_READY 0x32u   /* present | ready | readable */
+static void hle_UmdCheckMedium(void) { psp_ret(1); }
+static void hle_UmdGetDriveStat(void) { psp_ret(UMD_STAT_READY); }
+
+/* ---- sceKernelVolatileMem ------------------------------------------------ *
+ * The 4 MB the system keeps for itself at 0x08400000 and lends out on request. */
+static void hle_VolatileLock(void) {
+    if (psp_arg(1)) psp_write32(psp_arg(1), 0x08400000u);
+    if (psp_arg(2)) psp_write32(psp_arg(2), 0x00400000u);
+    psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 /* The sample count a channel outputs per call. It is set at reserve time and
@@ -259,6 +359,7 @@ void psp_misc_reset(void) {
     memset(g_audio_due_us, 0, sizeof g_audio_due_us);
 #endif
     g_audio_blocks = 0;
+    g_output2_samples = g_vaudio_samples = 0;
 }
 
 void psp_misc_init(void) { psp_misc_reset(); }
@@ -300,6 +401,30 @@ void psp_misc_register(void) {
     psp_hle_register(0x1F4011E6, "sceCtrl", "sceCtrlSetSamplingMode",     hle_CtrlSet);
     psp_hle_register(0x6A2774F3, "sceCtrl", "sceCtrlSetSamplingCycle",    hle_CtrlSet);
     psp_hle_register(0x1F803938, "sceCtrl", "sceCtrlReadBufferPositive",  hle_ReadBufferPositive);
+    psp_hle_register(0x3A622550, "sceCtrl", "sceCtrlPeekBufferPositive",  hle_ReadBufferPositive);
+
+    psp_hle_register(0x3EE30821, "UtilsForUser", "sceKernelDcacheWritebackRange", hle_CacheOp);
+    psp_hle_register(0x3E0271D3, "sceSuspendForUser", "sceKernelVolatileMemLock",   hle_VolatileLock);
+    psp_hle_register(0xA569E425, "sceSuspendForUser", "sceKernelVolatileMemUnlock", hle_ok);
+
+    psp_hle_register(0x011F03C1, "sceRtc", "sceRtcGetAccumulativeTime",      hle_RtcGetAccumulativeTime);
+    psp_hle_register(0xE7C27D1B, "sceRtc", "sceRtcGetCurrentClockLocalTime", hle_RtcGetCurrentClockLocalTime);
+    psp_hle_register(0xE1C93E47, "sceRtc", "sceRtcGetTime64_t",              hle_RtcGetTime64_t);
+
+    psp_hle_register(0xC6183D47, "sceUmdUser", "sceUmdActivate",               hle_ok);
+    psp_hle_register(0x46EBB729, "sceUmdUser", "sceUmdCheckMedium",            hle_UmdCheckMedium);
+    psp_hle_register(0x6B4A146C, "sceUmdUser", "sceUmdGetDriveStat",           hle_UmdGetDriveStat);
+    psp_hle_register(0x8EF08FCE, "sceUmdUser", "sceUmdWaitDriveStat",          hle_ok);
+    psp_hle_register(0x56202973, "sceUmdUser", "sceUmdWaitDriveStatWithTimer", hle_ok);
+    psp_hle_register(0x6AF9B50A, "sceUmdUser", "sceUmdCancelWaitDriveStat",    hle_ok);
+    psp_hle_register(0xAEE7404D, "sceUmdUser", "sceUmdRegisterUMDCallBack",    hle_ok);
+
+    psp_hle_register(0x01562BA3, "sceAudio", "sceAudioOutput2Reserve",        hle_Output2Reserve);
+    psp_hle_register(0x43196845, "sceAudio", "sceAudioOutput2Release",        hle_Output2Release);
+    psp_hle_register(0x2D53F36E, "sceAudio", "sceAudioOutput2OutputBlocking", hle_Output2Blocking);
+    psp_hle_register(0x03B6807D, "sceVaudio", "sceVaudioChReserve",      hle_VaudioReserve);
+    psp_hle_register(0x67585DFD, "sceVaudio", "sceVaudioChRelease",      hle_VaudioRelease);
+    psp_hle_register(0x8986295E, "sceVaudio", "sceVaudioOutputBlocking", hle_VaudioBlocking);
 
     psp_hle_register(0x5EC81C55, "sceAudio", "sceAudioChReserve",            hle_ChReserve);
     psp_hle_register(0x6FC46853, "sceAudio", "sceAudioChRelease",            hle_ChRelease);

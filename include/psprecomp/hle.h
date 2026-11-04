@@ -134,6 +134,9 @@ const char *psp_str(uint32_t addr, char *dst, size_t cap);
 void psp_sysmem_init(void);
 void psp_sysmem_register(void);
 void psp_sysmem_reset(void);
+/* The memory the allocator may hand out. A module's .bss can run past the
+ * default range, and a host that knows its layout should narrow it. */
+void psp_sysmem_set_range(uint32_t lo, uint32_t hi);
 
 void psp_display_init(void);
 void psp_display_register(void);
@@ -152,6 +155,9 @@ void psp_ge_dump_stats(FILE *out);
 uint64_t psp_ge_command_count(void);
 uint64_t psp_ge_vertex_count(void);
 uint64_t psp_ge_pixels(void);
+/* Run the callbacks finished lists have raised. Called at every wait. */
+void     psp_ge_deliver(void);
+uint64_t psp_ge_callbacks_delivered(void);
 
 void psp_sas_init(void);
 void psp_sas_register(void);
@@ -163,7 +169,12 @@ void psp_io_init(void);
 void psp_io_register(void);
 void psp_io_reset(void);
 void psp_io_set_root(const char *root);
+/* Where disc0:/ lives, when it is not <root>/disc. */
+void psp_io_set_disc_root(const char *path);
 uint64_t psp_io_bytes_read(void);
+
+void psp_sync_init(void);
+void psp_sync_register(void);
 
 void psp_misc_init(void);
 void psp_misc_register(void);
@@ -190,6 +201,8 @@ void psp_threadman_reset(void);
  * is the usual caller: one core means "let a frame pass" is "let the others
  * run". */
 void psp_threadman_yield(void);
+/* The running thread's uid, nonzero even on the boot thread. */
+uint32_t psp_threadman_current(void);
 /* Park for `us` of virtual time, as sceKernelDelayThread does. For HLE calls
  * that block on hardware for a known time, such as blocking audio output. */
 void psp_threadman_delay(uint64_t us);

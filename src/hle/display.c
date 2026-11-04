@@ -115,7 +115,11 @@ static void hle_WaitVblank(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+static void hle_GetVcount(void) { psp_ret((uint32_t)g_vblank_count); }
+
 void psp_display_register(void) {
+    psp_hle_register(0x984C27E7, "sceDisplay", "sceDisplayWaitVblankStart",   hle_WaitVblank);
+    psp_hle_register(0x9C6EAAD7, "sceDisplay", "sceDisplayGetVcount",         hle_GetVcount);
     psp_hle_register(0x0E20F177, "sceDisplay", "sceDisplaySetMode",           hle_SetMode);
     psp_hle_register(0x289D82FE, "sceDisplay", "sceDisplaySetFrameBuf",       hle_SetFrameBuf);
     psp_hle_register(0x36CDFADE, "sceDisplay", "sceDisplayWaitVblank",        hle_WaitVblank);

@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #ifdef _WIN32
 #  include <io.h>
@@ -32,7 +33,13 @@
 #define PSP_O_CREAT  0x0200
 #define PSP_O_TRUNC  0x0400
 
-typedef struct { FILE *f; int used; } io_file;
+typedef struct {
+    FILE *f;
+    int used;
+    /* The async calls run at once; this is what the next wait or poll reports. */
+    int async_pending;
+    uint64_t async_result;
+} io_file;
 
 typedef struct {
     int used;
@@ -49,6 +56,8 @@ typedef struct {
 static io_file g_file[MAX_FILES];
 static io_dir  g_dir[MAX_DIRS];
 static char    g_root[512];
+static char    g_disc_root[512];
+static char    g_cwd[512];
 static uint64_t g_bytes_read;
 
 void psp_io_set_root(const char *root) {
@@ -63,6 +72,7 @@ void psp_io_reset(void) {
     }
     memset(g_dir, 0, sizeof g_dir);
     g_bytes_read = 0;
+    g_cwd[0] = '\0';
     if (!g_root[0]) psp_io_set_root(".");
 }
 
@@ -70,21 +80,41 @@ void psp_io_init(void) { g_root[0] = '\0'; psp_io_reset(); }
 
 uint64_t psp_io_bytes_read(void) { return g_bytes_read; }
 
+void psp_io_set_disc_root(const char *path) {
+    snprintf(g_disc_root, sizeof g_disc_root, "%s", path ? path : "");
+}
+
 /* Rewrite a PSP path into a host path. The device prefix becomes a
  * subdirectory so a disc image and a memory-stick image can coexist under one
  * root without colliding. */
 static void map_path(const char *guest, char *out, size_t cap) {
+    char joined[1024];
     const char *p = guest;
     const char *sub = "disc";
+
+    /* A path with no device is relative to sceIoChdir's directory, or to that
+     * directory's device if it starts at the root. */
+    if (!strchr(guest, ':') && g_cwd[0]) {
+        if (guest[0] == '/' || guest[0] == '\\') {
+            const char *colon = strchr(g_cwd, ':');
+            int dev = colon ? (int)(colon - g_cwd) + 1 : 0;
+            snprintf(joined, sizeof joined, "%.*s%s", dev, g_cwd, guest);
+        } else {
+            snprintf(joined, sizeof joined, "%s/%s", g_cwd, guest);
+        }
+        p = joined;
+    }
 
     if      (!strncmp(p, "disc0:", 6)) { p += 6; sub = "disc"; }
     else if (!strncmp(p, "umd0:",  5)) { p += 5; sub = "disc"; }
     else if (!strncmp(p, "ms0:",   4)) { p += 4; sub = "ms";   }
+    else if (!strncmp(p, "fatms0:",7)) { p += 7; sub = "ms";   }
     else if (!strncmp(p, "flash0:",7)) { p += 7; sub = "flash";}
     else if (!strncmp(p, "host0:", 6)) { p += 6; sub = "host"; }
 
     while (*p == '/' || *p == '\\') p++;
-    snprintf(out, cap, "%s/%s/%s", g_root, sub, p);
+    if (!strcmp(sub, "disc") && g_disc_root[0]) snprintf(out, cap, "%s/%s", g_disc_root, p);
+    else snprintf(out, cap, "%s/%s/%s", g_root, sub, p);
 }
 
 static void hle_Open(void) {
@@ -118,6 +148,7 @@ static void hle_Open(void) {
         if (g_file[i].used) continue;
         g_file[i].f = f;
         g_file[i].used = 1;
+        g_file[i].async_pending = 0;
         psp_ret((uint32_t)(i + 3));   /* 0-2 are reserved for the std streams */
         return;
     }
@@ -200,6 +231,84 @@ static void hle_Lseek(void) {
     long pos = ftell(h->f);
     psp_cpu.r[PSP_REG_V0] = (uint32_t)pos;
     psp_cpu.r[PSP_REG_V1] = 0;
+}
+
+/* The async forms complete before they return. A file is on a host disk, and
+ * the game only learns of completion through the wait or poll that follows. */
+static void async_done(uint64_t result) {
+    io_file *h = fd_arg();
+    if (!h) return;                    /* the call already returned the error */
+    h->async_result = result;
+    h->async_pending = 1;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_ReadAsync(void) {
+    hle_Read();
+    async_done((uint64_t)(int64_t)(int32_t)psp_cpu.r[PSP_REG_V0]);
+}
+
+static void hle_LseekAsync(void) {
+    hle_Lseek();
+    async_done((uint64_t)psp_cpu.r[PSP_REG_V0] | ((uint64_t)psp_cpu.r[PSP_REG_V1] << 32));
+}
+
+/* sceIoWaitAsync and sceIoPollAsync: (fd, s64 *result). */
+static void hle_WaitAsync(void) {
+    io_file *h = fd_arg();
+    uint32_t out = psp_arg(1);
+    if (!h) { psp_ret(0x80020323); return; }
+    if (!h->async_pending) { psp_ret(0x8002032A); return; }   /* no async operation */
+    if (out) {
+        psp_write32(out, (uint32_t)h->async_result);
+        psp_write32(out + 4, (uint32_t)(h->async_result >> 32));
+    }
+    h->async_pending = 0;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+static void hle_ChangeAsyncPriority(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
+
+static void hle_Chdir(void) {
+    psp_str(psp_arg(0), g_cwd, sizeof g_cwd);
+    if (getenv("PSPRECOMP_TRACE_IO")) fprintf(stderr, "io: chdir \"%s\"\n", g_cwd);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* sceIoGetstat fills a SceIoStat: mode, attr, a 64-bit size, three 16-byte
+ * timestamps and six private words, 88 bytes in all. Only the first three are
+ * set; a game asking for a file's size does not read its dates. */
+#define SCE_IO_STAT_SIZE 88u
+static void hle_Getstat(void) {
+    char guest[512], host[1024];
+    uint32_t out = psp_arg(1);
+    psp_str(psp_arg(0), guest, sizeof guest);
+    map_path(guest, host, sizeof host);
+    size_t n = strlen(host);
+    while (n > 1 && (host[n - 1] == '/' || host[n - 1] == '\\')) host[--n] = '\0';
+
+    struct stat st;
+    int found = stat(host, &st) == 0;
+    if (getenv("PSPRECOMP_TRACE_IO"))
+        fprintf(stderr, "io: getstat \"%s\" -> \"%s\": %s\n", guest, host, found ? "ok" : "not found");
+    if (!found) { psp_ret(0x80010002); return; }
+
+    const int is_dir = (st.st_mode & S_IFMT) == S_IFDIR;
+    for (uint32_t i = 0; i < SCE_IO_STAT_SIZE; i++) psp_write8(out + i, 0);
+    psp_write32(out, (is_dir ? 0x1000u : 0x2000u) | 0x1FFu);
+    psp_write32(out + 4, is_dir ? 0x10u : 0x20u);
+    psp_write32(out + 8, (uint32_t)st.st_size);
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* Device control is device-specific and nothing here needs one yet. Named in
+ * the trace so that a game waiting on an answer can be spotted. */
+static void hle_Devctl(void) {
+    char dev[64];
+    psp_str(psp_arg(0), dev, sizeof dev);
+    if (getenv("PSPRECOMP_TRACE_IO"))
+        fprintf(stderr, "io: devctl \"%s\" cmd 0x%08X\n", dev, psp_arg(1));
+    psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
 static void hle_Rename(void) {
@@ -292,6 +401,15 @@ void psp_io_register(void) {
     psp_hle_register(0x6A638D83, "IoFileMgrForUser", "sceIoRead",   hle_Read);
     psp_hle_register(0x42EC03AC, "IoFileMgrForUser", "sceIoWrite",  hle_Write);
     psp_hle_register(0x27EB27B8, "IoFileMgrForUser", "sceIoLseek",  hle_Lseek);
+    psp_hle_register(0xA0B5A7C2, "IoFileMgrForUser", "sceIoReadAsync",  hle_ReadAsync);
+    psp_hle_register(0x71B19E77, "IoFileMgrForUser", "sceIoLseekAsync", hle_LseekAsync);
+    psp_hle_register(0xE23EEC33, "IoFileMgrForUser", "sceIoWaitAsync",   hle_WaitAsync);
+    psp_hle_register(0x35DBD746, "IoFileMgrForUser", "sceIoWaitAsyncCB", hle_WaitAsync);
+    psp_hle_register(0x3251EA56, "IoFileMgrForUser", "sceIoPollAsync",   hle_WaitAsync);
+    psp_hle_register(0xB293727F, "IoFileMgrForUser", "sceIoChangeAsyncPriority", hle_ChangeAsyncPriority);
+    psp_hle_register(0x55F4717D, "IoFileMgrForUser", "sceIoChdir",   hle_Chdir);
+    psp_hle_register(0xACE946E8, "IoFileMgrForUser", "sceIoGetstat", hle_Getstat);
+    psp_hle_register(0x54F5FB11, "IoFileMgrForUser", "sceIoDevctl",  hle_Devctl);
     psp_hle_register(0x779103A0, "IoFileMgrForUser", "sceIoRename", hle_Rename);
     psp_hle_register(0xB29DDF9C, "IoFileMgrForUser", "sceIoDopen",  hle_Dopen);
     psp_hle_register(0xE3EB004C, "IoFileMgrForUser", "sceIoDread",  hle_Dread);
