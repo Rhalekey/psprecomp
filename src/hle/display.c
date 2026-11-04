@@ -134,7 +134,7 @@ static void pace_vblank(uint32_t frame_us) {
     if (!origin) origin = now;
     const uint64_t target = origin + ((now - origin) / frame_us + 1) * frame_us;
     while (now < target) {
-        psp_threadman_yield();
+        psp_threadman_sleep_us(target - now);
         now = display_now_us();
     }
 }

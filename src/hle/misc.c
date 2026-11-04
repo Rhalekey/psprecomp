@@ -232,6 +232,15 @@ static uint64_t host_now_us(void) {
 }
 /* The two extra slots are sceAudioOutput2 and sceVaudio. */
 static uint64_t g_audio_due_us[AUDIO_CHANNELS + 2];
+
+/* Hold the caller until a block due at `due` is within the lead of real time. */
+static void wait_audio_due(uint64_t due, uint64_t play_us) {
+    for (;;) {
+        const uint64_t ready_at = host_now_us() + play_us + g_audio_lead_us;
+        if (ready_at >= due) return;
+        psp_threadman_sleep_us(due - ready_at);
+    }
+}
 #endif
 
 static void output_blocking(uint32_t ch, uint32_t vl, uint32_t vr, uint32_t buf) {
@@ -246,7 +255,7 @@ static void output_blocking(uint32_t ch, uint32_t vl, uint32_t vr, uint32_t buf)
         uint64_t now = host_now_us();
         if (g_audio_due_us[ch] < now) g_audio_due_us[ch] = now;   /* underrun */
         g_audio_due_us[ch] += play_us;
-        while (host_now_us() + play_us + g_audio_lead_us < g_audio_due_us[ch]) psp_threadman_yield();
+        wait_audio_due(g_audio_due_us[ch], play_us);
     }
 #else
     psp_threadman_delay(play_us);
@@ -280,7 +289,7 @@ static void pace_stream(int slot, uint32_t samples) {
     uint64_t now = host_now_us();
     if (g_audio_due_us[i] < now) g_audio_due_us[i] = now;
     g_audio_due_us[i] += play_us;
-    while (host_now_us() + play_us + g_audio_lead_us < g_audio_due_us[i]) psp_threadman_yield();
+    wait_audio_due(g_audio_due_us[i], play_us);
 #else
     psp_threadman_delay(play_us);
 #endif

@@ -225,6 +225,14 @@ void psp_threadman_reset(void);
  * is the usual caller: one core means "let a frame pass" is "let the others
  * run". */
 void psp_threadman_yield(void);
+/* Waits sleep in real time instead of ticking, and the host must then call
+ * psp_intr_tick at each vblank. Needs real threads. Set it before the game starts. */
+void psp_threadman_set_realtime(int on);
+/* Give the CPU away for this long in real time, or for a tick outside that mode. */
+void psp_threadman_sleep_us(uint64_t us);
+/* Wake a thread waiting on a semaphore or event flag, so that it runs pending
+ * callbacks. Safe from a host thread that is not running guest code. */
+void psp_threadman_kick(void);
 /* The running thread's uid, nonzero even on the boot thread. */
 uint32_t psp_threadman_current(void);
 /* Park for `us` of virtual time, as sceKernelDelayThread does. For HLE calls

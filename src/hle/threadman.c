@@ -89,6 +89,19 @@
 
 #define HOST_STACK_BYTES (16u * 1024u * 1024u)
 
+/* Real-time mode: a wait sleeps until what it waits for, instead of taking the CPU
+ * every tick to look.
+ *
+ * Ticking is what makes virtual time deterministic, and it is expensive: with a
+ * dozen threads each asleep for 100 ms, every one takes the CPU a hundred times to
+ * find out it is still asleep. A game that waits for the GE many times a frame then
+ * joins that queue at every wait, and spends its frame there.
+ *
+ * WAIT_STEP_US only bounds how long a wait can miss its wakeup. */
+#define WAIT_STEP_US 16000ull
+static int g_realtime;
+static HOST_TLS uint64_t g_tls_real_us;   /* how long the next park really sleeps */
+
 enum { TH_DORMANT = 0, TH_READY, TH_RUNNING, TH_SUSPENDED };
 
 /* What a parked thread is waiting for. A wake is targeted: signalling a
@@ -401,6 +414,7 @@ static int park_us(uint64_t timeout_us) {
     int woken = 0;
     if (t) {
         uint64_t real = timeout_us < REAL_TICK_US ? timeout_us : REAL_TICK_US;
+        if (g_tls_real_us) real = g_tls_real_us;
         host_mutex_lock(&t->wlock);
         if (!t->woken) {
             uint64_t dl = host_deadline_us() + real;
@@ -487,6 +501,15 @@ static void wake_waiters(int kind) { (void)kind; }
  * thread runs, an interrupt may be delivered" is one thing rather than five
  * copies of it. */
 static void check_terminated(void);
+
+static void park_for(int kind, uint64_t timeout_us);
+
+/* Park for this much real time, unless woken first. */
+static void park_real(int kind, uint64_t us) {
+    g_tls_real_us = us ? us : 1;
+    park_for(kind, us);
+    g_tls_real_us = 0;
+}
 
 static void park_for(int kind, uint64_t timeout_us) {
     check_terminated();
@@ -606,11 +629,39 @@ static void boot_record(void) {
  * "let the others run". */
 void psp_threadman_yield(void) { park_for(W_DELAY, TICK_US); }
 
+void psp_threadman_set_realtime(int on) {
+#if PSPRECOMP_REAL_THREADS
+    g_realtime = on;
+#else
+    (void)on;
+#endif
+}
+
+void psp_threadman_sleep_us(uint64_t us) {
+    if (g_realtime) park_real(W_DELAY, us);
+    else park_for(W_DELAY, TICK_US);
+}
+
+/* Called from the GE's thread. One waiter is enough: whichever wakes delivers the
+ * pending callbacks, and those wake whoever the game had waiting on them. */
+void psp_threadman_kick(void) {
+#if PSPRECOMP_REAL_THREADS
+    for (int i = 0; i < MAX_THREADS; i++) {
+        psp_thread *t = &g_thread[i];
+        if (!t->used || !t->wlock_ready) continue;
+        host_mutex_lock(&t->wlock);
+        const int hit = t->waiting && (t->wait_kind == W_SEMA || t->wait_kind == W_FLAG);
+        host_mutex_unlock(&t->wlock);
+        if (hit) { wake_thread(t); return; }
+    }
+#endif
+}
+
 uint32_t psp_threadman_current(void) { return g_tls_me ? g_tls_me->uid : 0xFFFFFFFFu; }
 
 void psp_threadman_frame_wait(void) {
     deliver_tick();
-    park_for(W_DELAY, FRAME_US);
+    if (!g_realtime) park_for(W_DELAY, FRAME_US);
 }
 
 uint64_t psp_threadman_switches(void) { return g_switches; }
@@ -748,6 +799,7 @@ static void warn_wait(const char *what, const char *name) {
 static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
                           int kind, const char *what, const char *name) {
     uint64_t deadline = timeout_us ? g_vtime_us + timeout_us : 0;
+    const uint64_t real_deadline = timeout_us ? host_now_us() + timeout_us : 0;
     uint64_t ticks = 0;
 
     for (;;) {
@@ -760,6 +812,16 @@ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
         return SCE_KERNEL_ERROR_WAIT_TIMEOUT;
 #endif
         check_terminated();
+        if (g_realtime) {
+            uint64_t step = WAIT_STEP_US;
+            if (real_deadline) {
+                const uint64_t now = host_now_us();
+                if (now >= real_deadline) return SCE_KERNEL_ERROR_WAIT_TIMEOUT;
+                if (real_deadline - now < step) step = real_deadline - now;
+            }
+            park_real(kind, step);
+            continue;
+        }
         if (deadline && g_vtime_us >= deadline) return SCE_KERNEL_ERROR_WAIT_TIMEOUT;
         if (!deadline && ++ticks > WAIT_TICKS_MAX) {
 #if PSPRECOMP_REAL_THREADS
@@ -1050,6 +1112,12 @@ static void hle_DeleteThread(void) {
  * interrupt per tick. A bounded park is what DelayThread is; a sleep is the
  * same shape with a wakeup as its exit. */
 static void park_ticks(uint64_t us, int kind) {
+    if (g_realtime) {
+        const uint64_t end = host_now_us() + (us ? us : 1);
+        for (uint64_t now = host_now_us(); now < end; now = host_now_us())
+            park_real(kind, end - now);
+        return;
+    }
     uint64_t left = us ? us : TICK_US;
     while (left) {
         uint64_t step = left < TICK_US ? left : TICK_US;
@@ -1624,7 +1692,9 @@ static int deliver_callbacks(void) {
  * the five wait points must not drift apart on it. */
 static void deliver_tick(void) {
     check_terminated();
-    psp_intr_tick();
+    /* In real time, interrupts come from the host's own vblank, not from waits. */
+    if (!g_realtime) psp_intr_tick();
+    psp_ge_deliver();
     deliver_callbacks();
 }
 

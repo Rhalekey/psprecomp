@@ -973,6 +973,11 @@ static void ge_worker(void) {
         ge_lock();
         g_ge_inflight--;
         ge_wake();
+        const int raised = g_ge_npending > 0;
+        ge_unlock();
+        /* Nothing else tells a sleeping game that its list is done. */
+        if (raised) psp_threadman_kick();
+        ge_lock();
     }
 }
 
