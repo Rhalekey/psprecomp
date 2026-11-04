@@ -645,6 +645,7 @@ static void mark_labels(ectx *c, const a_func *fn) {
 
     for (uint32_t a = fn->start; a < fn->end; a += 4) {
         if (!owned_by(an, a, owner)) continue;
+        if (an->case_map && an->case_map[widx(an, a)]) c->is_label[widx(an, a)] = 1;
         a_insn in;
         a_decode(fetch(an, a), a, &in);
         if (in.has_target && in.is_branch && owned_by(an, in.target, owner))
@@ -1043,6 +1044,19 @@ static void emit_function(ectx *c, const a_func *fn) {
             /* The target is read before the delay slot, as for jalr above. */
             fprintf(f, "    { uint32_t _t = %s;\n", RN[in.rs]);
             if (have_slot || taken_slot) { comment(c, &slot); emit_simple(c, &slot, "    "); }
+            /* Reach this function's own case labels directly. Going through
+             * dispatch nests a C call per jump, so a switch inside a loop would
+             * grow the host stack on every iteration. */
+            if (an->case_map) {
+                int ncases = 0;
+                for (uint32_t t = fn->start; t < fn->end; t += 4) {
+                    if (!owned_by(an, t, owner) || !an->case_map[widx(an, t)]) continue;
+                    if (c->is_slot[widx(an, t)]) continue;
+                    if (!ncases++) fprintf(f, "    switch (_t) {\n");
+                    fprintf(f, "    case 0x%08Xu: goto L_%08X;\n", t, t);
+                }
+                if (ncases) fprintf(f, "    default: break;\n    }\n");
+            }
             fprintf(f, "    psp_dispatch(_t);\n    return; }\n");
             if (have_slot && c->is_label[widx(an, a + 4)]) emit_slot_alias(c, a, &slot, 0);
             a += 4;

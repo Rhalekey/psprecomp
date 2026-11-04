@@ -890,6 +890,92 @@ static void check_jump_runs_foreign_slot(void) {
     }
 }
 
+/* A loop's back-edge and a join after an if/else both reach a block this same
+ * function has already walked. Neither may split the function. */
+static void check_loop_stays_one_function(void) {
+    static const uint32_t CODE[] = {
+        0x24020000u,   /* addiu $v0,$zero,0                     */
+        0x24420001u,   /* addiu $v0,$v0,1      loop head        */
+        0x1444FFFEu,   /* bne   $v0,$a0,-2     back to the head */
+        0x00000000u,
+        0x10800002u,   /* beq   $a0,$zero,+2   to the join      */
+        0x00000000u,
+        0x24420001u,   /* addiu $v0,$v0,1                       */
+        0x03E00008u,   /* jr    $ra            the join         */
+        0x00000000u,
+    };
+    uint32_t seed = BASE;
+    int nfuncs = 0;
+    char *csrc = emit_synthetic("t_loop", CODE, sizeof CODE / sizeof CODE[0], &seed, 1, &nfuncs);
+    CHECK(nfuncs == 1, "a loop and a join stay in one function, got %d", nfuncs);
+    free(csrc);
+}
+
+/* A switch's cases are blocks of its function, even though the table holding
+ * them looks exactly like a list of function pointers. */
+static void check_jump_table_stays_in_function(void) {
+    const uint32_t table = BASE + 16 * 4;
+    const uint32_t case0 = BASE + 10 * 4, case1 = BASE + 12 * 4;
+    const uint32_t hi = (table + 0x8000u) >> 16, lo = table & 0xFFFFu;
+    const uint32_t words[] = {
+        0x2C810002u,        /*  0 sltiu $at,$a0,2                */
+        0x1020000Cu,        /*  1 beq   $at,$zero,+12  to the end */
+        0x00000000u,        /*  2                                */
+        0x3C030000u | hi,   /*  3 lui   $v1,%hi(table)           */
+        0x00041080u,        /*  4 sll   $v0,$a0,2                */
+        0x24630000u | lo,   /*  5 addiu $v1,$v1,%lo(table)       */
+        0x00431021u,        /*  6 addu  $v0,$v0,$v1              */
+        0x8C420000u,        /*  7 lw    $v0,0($v0)               */
+        0x00400008u,        /*  8 jr    $v0                      */
+        0x00000000u,        /*  9                                */
+        0x10000003u,        /* 10 case 0: b +3         to the end */
+        0x24020001u,        /* 11 addiu $v0,$zero,1              */
+        0x24020002u,        /* 12 case 1: addiu $v0,$zero,2      */
+        0x00000000u,        /* 13                                */
+        0x03E00008u,        /* 14 jr    $ra                      */
+        0x00000000u,        /* 15                                */
+        case0, case1,       /* 16 the table, past the code extent */
+    };
+    const size_t nwords = sizeof words / sizeof words[0];
+    uint8_t image[sizeof words];
+    for (size_t i = 0; i < nwords; i++) {
+        image[i * 4 + 0] = (uint8_t)(words[i]);
+        image[i * 4 + 1] = (uint8_t)(words[i] >> 8);
+        image[i * 4 + 2] = (uint8_t)(words[i] >> 16);
+        image[i * 4 + 3] = (uint8_t)(words[i] >> 24);
+    }
+
+    a_analysis an;
+    memset(&an, 0, sizeof an);
+    an.code = image;
+    an.base = BASE;
+    an.size = 16 * 4;
+    an.scan_calls = 1;
+    an.scan_base = BASE;
+    an.scan_size = an.size;
+    an.image = image;
+    an.image_base = BASE;
+    an.image_size = (uint32_t)sizeof image;
+
+    /* The pointer scan would hand both cases in as seeds. */
+    const uint32_t seeds[] = { BASE, case0, case1 };
+    CHECK(a_discover(&an, seeds, 3) == 0, "jump-table discovery runs");
+    CHECK(an.nfuncs == 1, "the cases stay in their function, got %d", an.nfuncs);
+    CHECK(an.ntables == 1 && an.ntable_targets == 2, "one table of two cases, got %d/%d",
+          an.ntables, an.ntable_targets);
+    CHECK(an.nindirects == 0, "a resolved table is not left as unresolved, got %d", an.nindirects);
+
+    char *csrc = emit_case(&an, "t_table");
+    CHECK(csrc != NULL, "generated jump-table .c is readable");
+    if (csrc) {
+        char want[64];
+        snprintf(want, sizeof want, "case 0x%08Xu: goto L_%08X;", case1, case1);
+        expect_contains(csrc, want, "a computed jump reaches its own case directly");
+        free(csrc);
+    }
+    a_analysis_free(&an);
+}
+
 int main(void) {
     uint8_t code[sizeof CODE];
     for (size_t i = 0; i < sizeof CODE / sizeof CODE[0]; i++) {
@@ -1121,6 +1207,8 @@ int main(void) {
     check_jr_ra_continuation();
     check_link_branch_is_a_call();
     check_jump_runs_foreign_slot();
+    check_loop_stays_one_function();
+    check_jump_table_stays_in_function();
 
     if (failures) {
         printf("\n%d check(s) failed\n", failures);

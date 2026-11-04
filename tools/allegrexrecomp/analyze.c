@@ -32,6 +32,7 @@ static int u32_contains(const u32list *l, uint32_t x) {
 
 #define SEEN_CODE  0x01   /* decoded as an instruction */
 #define SEEN_ENTRY 0x02   /* known function entry */
+#define SEEN_SLOT  0x04   /* visited only as a delay slot; what follows it was not walked */
 
 static uint32_t word_index(const a_analysis *an, uint32_t addr) {
     return (addr - an->base) >> 2;
@@ -78,6 +79,29 @@ typedef struct {
 static int is_known_entry(const walk_ctx *c, uint32_t addr) {
     if (!a_in_range(c->an, addr)) return 0;
     return c->entry_map[word_index(c->an, addr)] != 0;
+}
+
+static int resolve_jump_table(a_analysis *an, uint32_t site, u32list *out);
+
+/* Follow a control transfer to `target`, a block of the function being walked.
+ *
+ * A word this same walk already reached is not a shared block: loop back-edges
+ * and branches that join after an if/else arrive here all the time. Only a word
+ * owned by another function is promoted, since the emitter cannot `goto` into a
+ * different C function. Promoting our own blocks too splits every loop and join
+ * into its own function, which still runs but hides where functions really end.
+ *
+ * A delay slot is marked as seen without being walked. Branching to one means
+ * execution carries on past it, so that continuation still has to be walked. */
+static void follow_block(walk_ctx *c, u32list *blocks, uint32_t target) {
+    uint32_t ti = word_index(c->an, target);
+    if (!(c->seen[ti] & SEEN_CODE) || c->entry_map[ti]) {
+        u32_push(blocks, target);
+    } else if (c->owner[ti] != c->cur_owner) {
+        u32_push(c->cross, target);
+    } else if (c->seen[ti] & SEEN_SLOT) {
+        if (a_in_range(c->an, target + 4)) u32_push(blocks, target + 4);
+    }
 }
 
 /* Record a call target. Import thunks are boundaries, not functions to walk
@@ -150,7 +174,7 @@ static int trace_function(walk_ctx *c, uint32_t entry, a_func *out) {
                     if (!(c->seen[didx] & SEEN_CODE)) {
                         a_insn din;
                         a_decode(fetch(an, d), d, &din);
-                        c->seen[didx] |= SEEN_CODE;
+                        c->seen[didx] |= SEEN_CODE | SEEN_SLOT;
                         c->owner[didx] = c->cur_owner;
                         insns++;
                         an->insns++;
@@ -196,9 +220,19 @@ static int trace_function(walk_ctx *c, uint32_t entry, a_func *out) {
                 /* `jr $rN` — a computed jump, usually a switch table. We
                  * cannot follow it without resolving the table, so record the
                  * site and stop. These are the concrete targets for jump-table
-                 * analysis; they are counted rather than silently dropped. */
+                 * analysis; they are counted rather than silently dropped.
+                 *
+                 * When the tables were resolved up front, the cases are blocks of
+                 * this function, and only a site with no table stays recorded. */
                 has_indirect = 1;
-                if (!u32_contains(c->indirects, a)) u32_push(c->indirects, a);
+                int ncases = 0;
+                if (an->case_map) {
+                    u32list cases = { 0 };
+                    ncases = resolve_jump_table(an, a, &cases);
+                    for (int i = 0; i < cases.n; i++) follow_block(c, &blocks, cases.v[i]);
+                    free(cases.v);
+                }
+                if (ncases <= 0 && !u32_contains(c->indirects, a)) u32_push(c->indirects, a);
                 break;
             }
 
@@ -206,22 +240,16 @@ static int trace_function(walk_ctx *c, uint32_t entry, a_func *out) {
                 /* Conditional: the target is another block of this function,
                  * and execution also falls through past the delay slot. */
                 if (in.has_target && a_in_range(an, in.target)) {
-                    uint32_t ti = word_index(an, in.target);
-                    if ((c->seen[ti] & SEEN_CODE) && !c->entry_map[ti]) {
-                        /* Already claimed by an earlier walk, and not an entry.
-                         * Two functions therefore share this block, which is a
-                         * walk-order artefact rather than a property of the
-                         * code -- whichever was traced first took it.
-                         *
-                         * The emitter cannot express a branch into another C
-                         * function's middle; it degrades to a dispatch, which
-                         * then misses because the address is not an entry.
-                         * Promoting it to one makes it reachable. Over-split
-                         * is the safe direction; unreachable is not. */
-                        u32_push(c->cross, in.target);
-                    } else {
-                        u32_push(&blocks, in.target);
-                    }
+                    /* If another walk already claimed the target, two functions
+                     * share this block, which is a walk-order artefact rather
+                     * than a property of the code.
+                     *
+                     * The emitter cannot express a branch into another C
+                     * function's middle; it degrades to a dispatch, which then
+                     * misses because the address is not an entry. Promoting it
+                     * to one makes it reachable. Over-split is the safe
+                     * direction; unreachable is not. */
+                    follow_block(c, &blocks, in.target);
                 }
                 a += 8;
                 continue;
@@ -248,7 +276,8 @@ static int trace_function(walk_ctx *c, uint32_t entry, a_func *out) {
                  * table, whereas a wrongly merged one has bogus boundaries. */
                 if (in.has_target && a_in_range(an, in.target)) {
                     uint32_t bi = word_index(an, in.target);
-                    if (in.target <= a && a != entry && !is_known_entry(c, in.target)) {
+                    int is_case = an->case_map && an->case_map[bi] && !c->entry_map[bi];
+                    if (is_case || (in.target <= a && a != entry && !is_known_entry(c, in.target))) {
                         /* Backward `j` -- a loop back-edge into this function's
                          * own blocks, unless another walk already claimed the
                          * target. Then the two functions share a block, exactly
@@ -264,11 +293,11 @@ static int trace_function(walk_ctx *c, uint32_t entry, a_func *out) {
                          *
                          * The branch path above has always promoted these. The
                          * jump path did not, so a whole class of shared block
-                         * stayed unreachable. */
-                        if ((c->seen[bi] & SEEN_CODE) && !c->entry_map[bi])
-                            u32_push(c->cross, in.target);
-                        else
-                            u32_push(&blocks, in.target);
+                         * stayed unreachable.
+                         *
+                         * A forward `j` to a case label is local flow too, not a
+                         * tail call: the label belongs to this switch. */
+                        follow_block(c, &blocks, in.target);
                     } else {
                         uint32_t ti = word_index(an, in.target);
                         if (!c->entry_map[ti]) {
@@ -467,6 +496,7 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
     an->insns = an->vfpu = an->invalid = 0;
     an->ntables = an->ntable_targets = 0;
     an->bytes_reached = 0;
+    an->case_map = NULL;
     /* The import stubs sit at the end of .text, so their extent is the best
      * available executable bound when no section header gives one. */
     if (!an->text_size && an->stub_addr && an->stub_size)
@@ -487,12 +517,48 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
     walk_ctx ctx = { an, seen, entry_map, owner, A_NO_OWNER,
                      &queue, &imports, &indirects, &cross };
 
+    /* Find the switch tables before choosing any entries.
+     *
+     * A table's entries are code addresses stored in data, so the pointer scan
+     * reports them as functions and every case gets split off from its switch.
+     * Knowing them first keeps them out of the seeds; the walk then reaches them
+     * from their `jr` as ordinary blocks. A real `jal` target stays an entry.
+     *
+     * Only with `scan_calls`, which is how a caller says it has a whole module
+     * to look at. A table the resolver misses is no worse off than before: its
+     * cases are still seeded and split. */
+    if (an->scan_calls && an->image) {
+        an->case_map = (uint8_t *)calloc(nwords ? nwords : 1, 1);
+        if (an->case_map) {
+            uint32_t sbase = an->scan_size ? an->scan_base : an->base;
+            uint32_t ssize = an->scan_size ? an->scan_size : an->size;
+            for (uint32_t off = 0; off + 4 <= ssize; off += 4) {
+                uint32_t a = sbase + off;
+                if (!a_in_range(an, a)) continue;
+                a_insn in;
+                a_decode(fetch(an, a), a, &in);
+                if (!in.is_indirect || in.is_call || in.is_return) continue;
+
+                u32list cases = { 0 };
+                int n = resolve_jump_table(an, a, &cases);
+                if (n > 0) {
+                    an->ntables++;
+                    an->ntable_targets += n;
+                    for (int i = 0; i < cases.n; i++)
+                        an->case_map[word_index(an, cases.v[i])] = 1;
+                }
+                free(cases.v);
+            }
+        }
+    }
+
     /* Pass 1: establish the complete set of function entries before walking
      * anything. Both the tail-call test and the ran-off-the-end test need to
      * ask "is this somebody's entry?", and neither can answer correctly if
      * entries are still being discovered as the walk proceeds. */
     for (int i = 0; i < nseeds; i++) {
         if (!a_in_range(an, seeds[i])) continue;
+        if (an->case_map && an->case_map[word_index(an, seeds[i])]) continue;
         entry_map[word_index(an, seeds[i])] = 1;
         u32_push(&queue, seeds[i]);
     }
@@ -561,7 +627,7 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
                         a_insn probe;
                         if (a_decode(fetch(an, addr), addr, &probe) && probe.op != A_INVALID) {
                             uint32_t ti = word_index(an, addr);
-                            if (!entry_map[ti]) {
+                            if (!entry_map[ti] && !(an->case_map && an->case_map[ti])) {
                                 entry_map[ti] = 1;
                                 u32_push(&queue, addr);
                             }
@@ -591,13 +657,14 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
     if (round > 0) {
         if (!an->image && !cross.n && !indirects.n) break;
         u32list targets = { 0 };
+        /* Every round re-resolves the same sites, so count only the latest. */
+        if (!an->case_map) an->ntables = an->ntable_targets = 0;
         for (int i = 0; i < indirects.n; i++) {
             int n = resolve_jump_table(an, indirects.v[i], &targets);
             if (n > 0) { an->ntables++; an->ntable_targets += n; }
         }
         for (int i = 0; i < cross.n; i++) u32_push(&targets, cross.v[i]);
         cross.n = 0;
-        indirects.n = 0;
         int added = 0;
         for (int i = 0; i < targets.n; i++) {
             uint32_t t = targets.v[i];
@@ -609,6 +676,7 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
         }
         free(targets.v);
         if (!added) break;
+        indirects.n = 0;   /* kept until here so a final round still reports them */
 
         /* Re-walk everything from a clean slate rather than walking only the
          * new entries.
@@ -711,6 +779,8 @@ void a_analysis_free(a_analysis *an) {
     free(an->imports);
     free(an->indirects);
     free(an->owner);
+    free(an->case_map);
+    an->case_map = NULL;
     an->funcs = NULL;
     an->imports = NULL;
     an->indirects = NULL;

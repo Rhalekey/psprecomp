@@ -100,6 +100,10 @@ typedef struct {
     /* Jump tables recovered from the `jr $rN` sites. */
     int       ntables;          /* tables resolved */
     int       ntable_targets;   /* total entries across them */
+    /* Per word: nonzero if a jump table lands here. Such a word is a block of
+     * the function holding the `jr`, so the emitter must give it a label. NULL
+     * when tables were not resolved up front (see a_discover). */
+    uint8_t  *case_map;
 
     /* Statistics over *discovered* code only — the number that matters, as
      * opposed to coverage over a whole segment that is mostly data. */
