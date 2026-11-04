@@ -87,7 +87,12 @@ typedef struct {
     int      zwrite;         /* !ZMSK */
     uint32_t zaddr;          /* ZBP/ZBW, in VRAM; 16 bits per pixel */
     int      zbw;            /* ZBW: width in pixels */
+    int cull;            /* PSP_CULL_*: which triangles a transformed draw discards */
 } psp_draw_state;
+
+#define PSP_CULL_NONE 0
+#define PSP_CULL_CW   1     /* as seen on screen */
+#define PSP_CULL_CCW  2
 
 typedef struct {
     const char *name;

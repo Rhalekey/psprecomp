@@ -268,6 +268,47 @@ static void draw_skinned_quad(uint8_t w0, uint8_t w1) {
     end_list();
 }
 
+/* Two triangles, one each way round on screen, side by side. */
+static void draw_culled_pair(int cull_on, int front) {
+    psp_ge_reset();
+    clear_fb();
+    g_pc = 0;
+    cmd(0x10, (VERTS >> 8) & 0xFF0000);
+    cmd(0x9C, FB & 0xFFFFFF);
+    cmd(0x9D, ((FB >> 8) & 0xFF0000) | 480);
+    cmd(0x12, (1u << 9) | (1u << 14) | (7u << 2) | (3u << 7));
+    cmd(0x01, VERTS & 0xFFFFFF);
+    fcmd(0x42, 240.0f);  fcmd(0x43, -136.0f);
+    fcmd(0x45, 2048.0f); fcmd(0x46, 2048.0f);
+    cmd(0x4C, (2048 - 240) << 4);
+    cmd(0x4D, (2048 - 136) << 4);
+    cmd(0x1D, (uint32_t)cull_on);
+    cmd(0x9B, (uint32_t)front);
+    /* Left: top, right, bottom-left is clockwise on screen. */
+    skinned_vertex(0, -0.5f,  0.5f, 0x80, 0);
+    skinned_vertex(1, -0.1f,  0.5f, 0x80, 0);
+    skinned_vertex(2, -0.5f, -0.5f, 0x80, 0);
+    /* Right: the same shape the other way round. */
+    skinned_vertex(3,  0.1f,  0.5f, 0x80, 0);
+    skinned_vertex(4,  0.1f, -0.5f, 0x80, 0);
+    skinned_vertex(5,  0.5f,  0.5f, 0x80, 0);
+    cmd(0x04, (3u << 16) | 6);
+    end_list();
+}
+
+static void test_culling(void) {
+    /* Bone 0 is identity after a reset, so the pair lands where it is written:
+     * the left one around x=170 and the right one around x=300. */
+    draw_culled_pair(0, 0);
+    CHECK(pixel(165, 90) != 0 && pixel(300, 90) != 0, "with culling off both draw");
+    draw_culled_pair(1, 0);
+    CHECK(pixel(165, 90) == 0, "front 0 culls the clockwise one: 0x%08X", pixel(165, 90));
+    CHECK(pixel(300, 90) != 0, "and keeps the other");
+    draw_culled_pair(1, 1);
+    CHECK(pixel(165, 90) != 0, "front 1 keeps the clockwise one");
+    CHECK(pixel(300, 90) == 0, "and culls the other: 0x%08X", pixel(300, 90));
+}
+
 static void test_skinning(void) {
     /* Unskinned, this square covers x 120-360. */
     draw_skinned_quad(0x80, 0);
@@ -735,6 +776,7 @@ int main(void) {
     test_clipping();
     test_transformed_quad();
     test_skinning();
+    test_culling();
     test_triangle_strip();
     test_framebuffer_is_vram_relative();
     test_textured_sprite();

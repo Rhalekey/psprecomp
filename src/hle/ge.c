@@ -27,6 +27,7 @@
 #include "psprecomp/hle.h"
 #include "psprecomp/dispatch.h"
 #include "psprecomp/render.h"
+#include "psprecomp/mem_fast.h"
 #include "ge_thread.h"
 
 #include <math.h>
@@ -74,6 +75,8 @@
 #define GE_ZBW          0x9F
 #define GE_ZTST         0xDE
 #define GE_ZMSK         0xE7
+#define GE_BCE          0x1D    /* back-face culling on or off */
+#define GE_CULL         0x9B    /* which way round a front face runs */
 #define GE_BOFS         0x2A
 #define GE_BONE         0x2B
 #define GE_WMS          0x3A
@@ -399,6 +402,8 @@ static int light_cmd(uint32_t cmd, uint32_t arg) {
     }
 }
 
+static int g_cull_on, g_cull_face;
+
 /* Tracked state, and the counters that make the report worth reading. */
 static struct {
     uint32_t fbp, fbw, vtype, vaddr, iaddr;
@@ -415,6 +420,7 @@ static struct {
 void psp_ge_reset(void) {
     memset(g_queue, 0, sizeof g_queue);
     memset(g_ge_cb, 0, sizeof g_ge_cb);
+    g_cull_on = g_cull_face = 0;
     g_ge_npending = 0;
     g_ge_delivering = 0;
     g_ge_delivered = g_ge_dropped = 0;
@@ -554,11 +560,11 @@ static int vertex_layout(uint32_t vtype, int *tex_off, int *col_off, int *nrm_of
 static void read3(uint32_t a, int fmt, int raw, float v[3]) {
     for (int i = 0; i < 3; i++) {
         switch (fmt) {
-        case 1:  v[i] = (float)(int8_t)psp_read8(a + (uint32_t)i);
+        case 1:  v[i] = (float)(int8_t)psp_fast_read8(a + (uint32_t)i);
                  if (!raw) v[i] /= 128.0f; break;
-        case 2:  v[i] = (float)(int16_t)psp_read16(a + (uint32_t)i * 2);
+        case 2:  v[i] = (float)(int16_t)psp_fast_read16(a + (uint32_t)i * 2);
                  if (!raw) v[i] /= 32768.0f; break;
-        default: v[i] = psp_read_f32(a + (uint32_t)i * 4); break;
+        default: v[i] = psp_fast_read_f32(a + (uint32_t)i * 4); break;
         }
     }
 }
@@ -572,9 +578,9 @@ static void skin_vertex(uint32_t addr, uint32_t vtype, float pos[3], float n[3])
     for (int r = 0; r < 3; r++) pos[r] = n[r] = 0;
     for (int b = 0; b < count; b++) {
         float w;
-        if (fmt == 1)      w = (float)psp_read8(addr + (uint32_t)b) / 128.0f;
-        else if (fmt == 2) w = (float)psp_read16(addr + (uint32_t)b * 2) / 32768.0f;
-        else               w = psp_read_f32(addr + (uint32_t)b * 4);
+        if (fmt == 1)      w = (float)psp_fast_read8(addr + (uint32_t)b) / 128.0f;
+        else if (fmt == 2) w = (float)psp_fast_read16(addr + (uint32_t)b * 2) / 32768.0f;
+        else               w = psp_fast_read_f32(addr + (uint32_t)b * 4);
         const float *B = &g_xf.bone[b * 12];
         for (int r = 0; r < 3; r++) {
             pos[r] += w * (B[r] * p0[0] + B[3 + r] * p0[1] + B[6 + r] * p0[2] + B[9 + r]);
@@ -592,9 +598,9 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
     out->rgba = g_material;
     if (col_off >= 0) {
         if (VT_COLOR(vtype) == 7)
-            out->rgba = psp_read32(addr + (uint32_t)col_off);
+            out->rgba = psp_fast_read32(addr + (uint32_t)col_off);
         else    /* 4, 5, 6: 565, 5551, 4444 -- the texture formats, numbered from 4 */
-            out->rgba = psp_color_expand(psp_read16(addr + (uint32_t)col_off),
+            out->rgba = psp_color_expand(psp_fast_read16(addr + (uint32_t)col_off),
                                          (int)VT_COLOR(vtype) - 4);
     }
 
@@ -602,13 +608,13 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
     if (tex_off >= 0) {
         uint32_t t = addr + (uint32_t)tex_off;
         switch (VT_TEX(vtype)) {
-        case 1: out->u = psp_read8(t);  out->v = psp_read8(t + 1);
+        case 1: out->u = psp_fast_read8(t);  out->v = psp_fast_read8(t + 1);
                 if (!through) { out->u /= 128.0f; out->v /= 128.0f; }
                 break;
-        case 2: out->u = psp_read16(t); out->v = psp_read16(t + 2);
+        case 2: out->u = psp_fast_read16(t); out->v = psp_fast_read16(t + 2);
                 if (!through) { out->u /= 32768.0f; out->v /= 32768.0f; }
                 break;
-        default: out->u = psp_read_f32(t); out->v = psp_read_f32(t + 4); break;
+        default: out->u = psp_fast_read_f32(t); out->v = psp_fast_read_f32(t + 4); break;
         }
         if (!through) {     /* normalised, scaled, then in texels */
             out->u = (out->u * g_xf.uscale + g_xf.uoff) * (float)g_ds.tex_w;
@@ -623,7 +629,7 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
         /* Through mode's depth is an unsigned 16-bit value. */
         out->x = (int)pos[0];
         out->y = (int)pos[1];
-        out->z = VT_POS(vtype) == 2 ? (float)psp_read16(addr + (uint32_t)pos_off + 4) : pos[2];
+        out->z = VT_POS(vtype) == 2 ? (float)psp_fast_read16(addr + (uint32_t)pos_off + 4) : pos[2];
         return 1;
     }
     float n[3] = { 0, 0, 1 };
@@ -647,7 +653,11 @@ static int trace_frame(void) {
     return f >= 0 && (long)psp_display_vblanks() == f;
 }
 
+/* GE_CULL 0 makes counter-clockwise triangles the front, so clockwise ones go, and
+ * 1 the reverse. Through-mode drawing is flat screen art and is never culled. */
 static void draw_prim(uint32_t type, uint32_t count) {
+    g_ds.cull = (g_cull_on && !VT_THROUGH(g_ge.vtype) && !g_ds.clear)
+                    ? (g_cull_face ? PSP_CULL_CCW : PSP_CULL_CW) : PSP_CULL_NONE;
     if (trace_frame())
         fprintf(stderr, "GE prim %u x%u vtype %06X vaddr %08X tex %d fmt %d %dx%d bw %d at %08X sw %d func %d clut fmt %d blend %d atest %d clear %d z %d/%d/%d\n",
                 type, count, g_ge.vtype, g_ge.vaddr, g_ds.tex_enable, g_ds.tex_fmt, g_ds.tex_w, g_ds.tex_h,
@@ -671,9 +681,9 @@ static void draw_prim(uint32_t type, uint32_t count) {
     uint32_t n = 0;
     for (; n < count; n++) {
         uint32_t idx = n;
-        if (isz == 1)      idx = psp_read8(g_ge.iaddr + n);
-        else if (isz == 2) idx = psp_read16(g_ge.iaddr + n * 2);
-        else if (isz == 4) idx = psp_read32(g_ge.iaddr + n * 4);
+        if (isz == 1)      idx = psp_fast_read8(g_ge.iaddr + n);
+        else if (isz == 2) idx = psp_fast_read16(g_ge.iaddr + n * 2);
+        else if (isz == 4) idx = psp_fast_read32(g_ge.iaddr + n * 4);
         if (!read_vertex(g_ge.vaddr + idx * (uint32_t)stride, g_ge.vtype,
                          tex_off, col_off, nrm_off, pos_off, &v[n])) break;
     }
@@ -684,7 +694,7 @@ static void draw_prim(uint32_t type, uint32_t count) {
 
     if (trace_frame()) {
         fprintf(stderr, "  mat %08X cbp %08X lt %d tex0 %08X\n", g_material, g_cbp, g_lt.enable,
-                psp_read32(g_ds.tex_addr));
+                psp_fast_read32(g_ds.tex_addr));
         for (uint32_t k = 0; k < n && k < 16; k++)
             fprintf(stderr, "  v%u (%d,%d,%.0f) rgba %08X uv %.1f %.1f texel %08X\n", k, v[k].x, v[k].y,
                     (double)v[k].z, v[k].rgba, v[k].u, v[k].v, psp_tex_fetch(&g_ds, (int)v[k].u, (int)v[k].v));
@@ -712,7 +722,7 @@ static void run_list(ge_queue *q) {
     while (budget--) {
         if (q->stall && q->list == q->stall) break;   /* caught up to the CPU */
 
-        uint32_t word = psp_read32(q->list);
+        uint32_t word = psp_fast_read32(q->list);
         uint32_t cmd  = word >> 24;
         uint32_t arg  = word & 0x00FFFFFF;
         q->list += 4;
@@ -775,7 +785,7 @@ static void run_list(ge_queue *q) {
              * arguments. That END does not end the list, so it is consumed here.
              * The behaviours that move the read pointer are not handled. */
             ge_raise(q, 1, arg & 0xFFFF);
-            if ((psp_read32(q->list) >> 24) == GE_END) q->list += 4;
+            if ((psp_fast_read32(q->list) >> 24) == GE_END) q->list += 4;
             break;
 
         case GE_BASE:        q->base = (arg & 0xFF0000) << 8; break;
@@ -798,6 +808,8 @@ static void run_list(ge_queue *q) {
             psp_render_current()->set_target(fb_vram(), g_ge.fbw, (int)g_psm);
             break;
 
+        case GE_BCE:   g_cull_on = arg & 1; break;
+        case GE_CULL:  g_cull_face = arg & 1; break;
         case GE_BOFS:  g_xf.bi = (int)(arg & 0x7F); break;
         case GE_BONE:  if (g_xf.bi < GE_BONES * 12) g_xf.bone[g_xf.bi++] = f24(arg); break;
         case GE_WMS:   g_xf.wi = (int)(arg & 0xF); break;
@@ -878,7 +890,7 @@ static void run_list(ge_queue *q) {
         case GE_CLOAD: {
             uint32_t n = (arg & 0x3F) * 32u;
             if (n > sizeof g_clut) n = sizeof g_clut;
-            for (uint32_t i = 0; i < n; i++) g_clut[i] = psp_read8(g_cbp + i);
+            for (uint32_t i = 0; i < n; i++) g_clut[i] = psp_fast_read8(g_cbp + i);
             break;
         }
         case GE_CMODE:
@@ -1081,10 +1093,10 @@ static void hle_SetCallback(void) {
         ge_callback *c = &g_ge_cb[i];
         if (c->used) continue;
         c->used = 1;
-        c->signal_fn  = psp_read32(data);
-        c->signal_arg = psp_read32(data + 4);
-        c->finish_fn  = psp_read32(data + 8);
-        c->finish_arg = psp_read32(data + 12);
+        c->signal_fn  = psp_fast_read32(data);
+        c->signal_arg = psp_fast_read32(data + 4);
+        c->finish_fn  = psp_fast_read32(data + 8);
+        c->finish_arg = psp_fast_read32(data + 12);
         psp_ret(i);
         return;
     }

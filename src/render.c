@@ -14,6 +14,7 @@
  */
 
 #include "psprecomp/render.h"
+#include "psprecomp/mem_fast.h"
 #include "psprecomp/mem.h"
 
 #include <string.h>
@@ -124,10 +125,10 @@ static uint32_t dxt_texel(const psp_draw_state *st, uint32_t x, uint32_t y) {
     const uint32_t blk = st->tex_addr + ((y >> 2) * ((uint32_t)st->tex_bw / 4) + (x >> 2)) * size;
     const uint32_t i = (y & 3) * 4 + (x & 3);
 
-    const uint32_t c0 = psp_read16(blk + 4), c1 = psp_read16(blk + 6);
+    const uint32_t c0 = psp_fast_read16(blk + 4), c1 = psp_fast_read16(blk + 6);
     const uint32_t a = psp_color_expand(c0, 0), b = psp_color_expand(c1, 0);
     uint32_t out;
-    switch ((psp_read32(blk) >> (2 * i)) & 3) {
+    switch ((psp_fast_read32(blk) >> (2 * i)) & 3) {
     case 0:  out = a; break;
     case 1:  out = b; break;
     case 2:
@@ -142,11 +143,11 @@ static uint32_t dxt_texel(const psp_draw_state *st, uint32_t x, uint32_t y) {
         break;
     }
     if (st->tex_fmt == PSP_TPSM_DXT3) {
-        const uint32_t al = (psp_read16(blk + 8 + (y & 3) * 2) >> ((x & 3) * 4)) & 0xF;
+        const uint32_t al = (psp_fast_read16(blk + 8 + (y & 3) * 2) >> ((x & 3) * 4)) & 0xF;
         out = (out & 0x00FFFFFFu) | ((al * 17) << 24);
     } else if (st->tex_fmt == PSP_TPSM_DXT5) {
-        const uint64_t bits = (uint64_t)psp_read16(blk + 12) | ((uint64_t)psp_read32(blk + 8) << 16);
-        const int a0 = psp_read8(blk + 14), a1 = psp_read8(blk + 15);
+        const uint64_t bits = (uint64_t)psp_fast_read16(blk + 12) | ((uint64_t)psp_fast_read32(blk + 8) << 16);
+        const int a0 = psp_fast_read8(blk + 14), a1 = psp_fast_read8(blk + 15);
         const int k = (int)(bits >> (3 * i)) & 7;
         int al;
         if (k == 0) al = a0;
@@ -172,17 +173,17 @@ uint32_t psp_tex_fetch(const psp_draw_state *st, int x, int y) {
     const uint32_t at = st->tex_addr + tex_offset(st, (uint32_t)x * (uint32_t)bpp / 8, (uint32_t)y);
     switch (st->tex_fmt) {
     case PSP_TPSM_565: case PSP_TPSM_5551: case PSP_TPSM_4444:
-        return psp_color_expand(psp_read16(at), st->tex_fmt);
+        return psp_color_expand(psp_fast_read16(at), st->tex_fmt);
     case PSP_TPSM_8888:
-        return psp_read32(at);
+        return psp_fast_read32(at);
     case PSP_TPSM_T4:
-        return clut_entry(st, (psp_read8(at) >> ((x & 1) * 4)) & 0xF);
+        return clut_entry(st, (psp_fast_read8(at) >> ((x & 1) * 4)) & 0xF);
     case PSP_TPSM_T8:
-        return clut_entry(st, psp_read8(at));
+        return clut_entry(st, psp_fast_read8(at));
     case PSP_TPSM_T16:
-        return clut_entry(st, psp_read16(at));
+        return clut_entry(st, psp_fast_read16(at));
     default:  /* T32 */
-        return clut_entry(st, psp_read32(at));
+        return clut_entry(st, psp_fast_read32(at));
     }
 }
 
@@ -290,7 +291,7 @@ static void sw_target(uint32_t addr, uint32_t stride, int fmt) {
 }
 
 static uint32_t fb_read(uint32_t at) {
-    return g_fb_fmt == 3 ? psp_read32(at) : psp_color_expand(psp_read16(at), g_fb_fmt);
+    return g_fb_fmt == 3 ? psp_fast_read32(at) : psp_color_expand(psp_fast_read16(at), g_fb_fmt);
 }
 
 static int depth_pass(int func, int z, int d) {
@@ -324,7 +325,7 @@ static void fragment(const psp_draw_state *st, int x, int y, uint32_t c, float u
     if (st->clear) {
         /* Clear mode writes only the buffers its flags name. A depth-only
          * clear leaves the colour alone. */
-        if (st->clear_depth && have_z) psp_write16(zat, (uint16_t)z);
+        if (st->clear_depth && have_z) psp_fast_write16(zat, (uint16_t)z);
         if (!st->clear_color && !st->clear_alpha) return;
         if (!st->clear_color || !st->clear_alpha) {
             uint32_t d = fb_read(at);
@@ -340,14 +341,14 @@ static void fragment(const psp_draw_state *st, int x, int y, uint32_t c, float u
         }
         if (st->atest && !alpha_pass(st, c)) return;
         if (st->ztest && have_z) {
-            if (!depth_pass(st->zfunc, z, psp_read16(zat))) return;
-            if (st->zwrite) psp_write16(zat, (uint16_t)z);
+            if (!depth_pass(st->zfunc, z, psp_fast_read16(zat))) return;
+            if (st->zwrite) psp_fast_write16(zat, (uint16_t)z);
         }
         if (st->blend) c = blend(st, c, fb_read(at));
     }
 
-    if (bytes == 4) psp_write32(at, c);
-    else            psp_write16(at, (uint16_t)color_pack(c, g_fb_fmt));
+    if (bytes == 4) psp_fast_write32(at, c);
+    else            psp_fast_write16(at, (uint16_t)color_pack(c, g_fb_fmt));
     g_pixels++;
 }
 
@@ -357,11 +358,12 @@ static int edge(const psp_vertex *p, const psp_vertex *q, int x, int y) {
 
 /* Barycentric fill with integer edge functions, so a shared edge belongs to
  * exactly one triangle: adjacent geometry neither double-draws nor leaves
- * seams. Both windings are accepted — back-face culling is not implemented, and
- * rejecting one winding would silently drop half of any real model. Colour is
- * interpolated when the shade model is Gouraud; flat uses the last vertex. */
+ * seams. Both windings are filled, and the game decides which to cull: `flip`
+ * says this triangle's vertices run the other way round, as every second one in a
+ * strip does. Colour is interpolated when the shade model is Gouraud; flat uses
+ * the last vertex. */
 static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c,
-                   const psp_draw_state *st) {
+                   const psp_draw_state *st, int flip) {
     int minx = a->x < b->x ? (a->x < c->x ? a->x : c->x) : (b->x < c->x ? b->x : c->x);
     int maxx = a->x > b->x ? (a->x > c->x ? a->x : c->x) : (b->x > c->x ? b->x : c->x);
     int miny = a->y < b->y ? (a->y < c->y ? a->y : c->y) : (b->y < c->y ? b->y : c->y);
@@ -372,9 +374,18 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     if (miny < 0) miny = 0;
     if (maxx > 479) maxx = 479;
     if (maxy > 271) maxy = 271;
+    if (minx < st->sc_x0) minx = st->sc_x0;
+    if (miny < st->sc_y0) miny = st->sc_y0;
+    if (maxx > st->sc_x1) maxx = st->sc_x1;
+    if (maxy > st->sc_y1) maxy = st->sc_y1;
+    if (minx > maxx || miny > maxy) return;
 
     const int area = edge(a, b, c->x, c->y);
     if (area == 0) return;
+    /* With y growing downwards, a positive area runs clockwise on screen. */
+    const int clockwise = flip ? area < 0 : area > 0;
+    if (st->cull == PSP_CULL_CW ? clockwise : st->cull == PSP_CULL_CCW ? !clockwise : 0) return;
+
     const float inv = 1.0f / (float)area;
     /* Coverage is decided on the integer grid; attributes are sampled at the
      * pixel centre, half a pixel on, as the GE does. Sampled at the corner, a
@@ -385,11 +396,19 @@ static void sw_tri(const psp_vertex *a, const psp_vertex *b, const psp_vertex *c
     const float h1 = 0.5f * (float)((c->x - b->x) - (c->y - b->y));
     const float h2 = 0.5f * (float)((a->x - c->x) - (a->y - c->y));
 
-    for (int y = miny; y <= maxy; y++) {
+    /* Each edge function changes by a constant per pixel, so they are stepped
+     * rather than worked out again, and the pixels of the bounding box outside the
+     * triangle cost almost nothing. */
+    const int dw0 = a->y - b->y, dw1 = b->y - c->y, dw2 = c->y - a->y;
+    int row0 = edge(a, b, minx, miny);   /* weight of c */
+    int row1 = edge(b, c, minx, miny);   /* weight of a */
+    int row2 = edge(c, a, minx, miny);   /* weight of b */
+    for (int y = miny; y <= maxy; y++, row0 += b->x - a->x, row1 += c->x - b->x, row2 += a->x - c->x) {
+        int w0 = row0 - dw0, w1 = row1 - dw1, w2 = row2 - dw2;
         for (int x = minx; x <= maxx; x++) {
-            int w0 = edge(a, b, x, y);   /* weight of c */
-            int w1 = edge(b, c, x, y);   /* weight of a */
-            int w2 = edge(c, a, x, y);   /* weight of b */
+            w0 += dw0;
+            w1 += dw1;
+            w2 += dw2;
             if (!((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
                 continue;
             float la = ((float)w1 + h1) * inv, lb = ((float)w2 + h2) * inv, lc = ((float)w0 + h0) * inv;
@@ -430,13 +449,13 @@ static void sw_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
         for (int i = 0; i + 1 < count; i += 2) sw_sprite(&v[i], &v[i + 1], st);
         break;
     case PSP_PRIM_TRIANGLES:
-        for (int i = 0; i + 2 < count; i += 3) sw_tri(&v[i], &v[i + 1], &v[i + 2], st);
+        for (int i = 0; i + 2 < count; i += 3) sw_tri(&v[i], &v[i + 1], &v[i + 2], st, 0);
         break;
     case PSP_PRIM_TRIANGLE_STRIP:
-        for (int i = 0; i + 2 < count; i++) sw_tri(&v[i], &v[i + 1], &v[i + 2], st);
+        for (int i = 0; i + 2 < count; i++) sw_tri(&v[i], &v[i + 1], &v[i + 2], st, i & 1);
         break;
     case PSP_PRIM_TRIANGLE_FAN:
-        for (int i = 1; i + 1 < count; i++) sw_tri(&v[0], &v[i], &v[i + 1], st);
+        for (int i = 1; i + 1 < count; i++) sw_tri(&v[0], &v[i], &v[i + 1], st, 0);
         break;
     default:
         break;                       /* points, lines: not yet */
