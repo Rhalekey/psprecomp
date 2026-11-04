@@ -117,6 +117,8 @@ static void map_path(const char *guest, char *out, size_t cap) {
     else snprintf(out, cap, "%s/%s/%s", g_root, sub, p);
 }
 
+void psp_io_host_path(const char *guest, char *out, size_t cap) { map_path(guest, out, cap); }
+
 static void hle_Open(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);

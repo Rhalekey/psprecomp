@@ -950,6 +950,63 @@ static void test_callbacks(void) {
           (unsigned long long)psp_power_registered());
 }
 
+/* Run one savedata request through the states a game polls, as a game does. */
+static uint32_t savedata_request(uint32_t param, uint32_t mode) {
+    psp_write32(param + 0x30, mode);
+    CHECK(call(psp_nid("sceUtilitySavedataInitStart"), param, 0, 0, 0) == 0, "savedata starts");
+    CHECK(call(psp_nid("sceUtilitySavedataGetStatus"), 0, 0, 0, 0) == 1, "it initialises");
+    CHECK(call(psp_nid("sceUtilitySavedataGetStatus"), 0, 0, 0, 0) == 2, "then runs");
+    call(psp_nid("sceUtilitySavedataUpdate"), 1, 0, 0, 0);
+    CHECK(call(psp_nid("sceUtilitySavedataGetStatus"), 0, 0, 0, 0) == 3, "then is done");
+    call(psp_nid("sceUtilitySavedataShutdownStart"), 0, 0, 0, 0);
+    CHECK(call(psp_nid("sceUtilitySavedataGetStatus"), 0, 0, 0, 0) == 4, "then shuts down");
+    CHECK(call(psp_nid("sceUtilitySavedataGetStatus"), 0, 0, 0, 0) == 0, "and is gone");
+    return psp_read32(param + 0x1C);
+}
+
+static void put_guest_string(uint32_t addr, const char *s) {
+    do psp_write8(addr++, (uint8_t)*s); while (*s++);
+}
+
+/* What the game wrote comes back byte for byte, through a slot list as well. */
+static void test_savedata(void) {
+    const uint32_t PARAM = 0x08840000u, LIST = PARAM + 0x1000u, DATA = PARAM + 0x2000u;
+    const uint32_t NO_DATA = 0x80110307u;
+    for (uint32_t i = 0; i < 0x3000u; i += 4) psp_write32(PARAM + i, 0);
+    put_guest_string(PARAM + 0x3C, "TESTGAME");
+    put_guest_string(PARAM + 0x64, "DATA.BIN");
+    put_guest_string(LIST, "SLOT0");
+    put_guest_string(LIST + 20, "SLOT1");
+    psp_write32(PARAM + 0x60, LIST);
+    psp_write32(PARAM + 0x74, DATA);
+    psp_write32(PARAM + 0x78, 64);
+    psp_write32(DATA, 0xCAFEF00Du);
+    psp_write32(DATA + 4, 0x12345678u);
+    psp_write32(PARAM + 0x7C, 8);
+    put_guest_string(PARAM + 0x80, "A title");
+
+    /* Clear what an earlier run of this test left. */
+    savedata_request(PARAM, 6);
+
+    CHECK(savedata_request(PARAM, 4) == NO_DATA, "a list load with no saves reports no data");
+    CHECK(savedata_request(PARAM, 5) == 0, "a list save succeeds");
+
+    psp_write32(DATA, 0);
+    psp_write32(DATA + 4, 0);
+    psp_write32(PARAM + 0x7C, 0);
+    psp_write8(PARAM + 0x80, 0);
+    psp_write8(PARAM + 0x4C, 0);
+    CHECK(savedata_request(PARAM, 4) == 0, "a list load finds it");
+    CHECK(psp_read32(DATA) == 0xCAFEF00Du && psp_read32(DATA + 4) == 0x12345678u,
+          "the data comes back, got 0x%08X", psp_read32(DATA));
+    CHECK(psp_read32(PARAM + 0x7C) == 8, "with its size, got %u", psp_read32(PARAM + 0x7C));
+    CHECK(psp_read8(PARAM + 0x80) == 'A', "and its description");
+    CHECK(psp_read8(PARAM + 0x4C) == 'S', "and the slot chosen is named");
+
+    CHECK(savedata_request(PARAM, 6) == 0, "a list delete removes it");
+    CHECK(savedata_request(PARAM, 4) == NO_DATA, "and it is gone");
+}
+
 int main(void) {
     CHECK(psp_mem_init() == 0, "memory init");
     psp_cpu_reset();
@@ -973,6 +1030,7 @@ int main(void) {
     test_unimplemented_logging();
     test_sub_interrupts();
     test_callbacks();
+    test_savedata();
 
     psp_mem_free();
 

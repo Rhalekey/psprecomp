@@ -3,13 +3,14 @@
  * On hardware these draw over the game. Here nothing is drawn yet: each dialog
  * walks through the states a game polls for and then reports having closed. That
  * is enough to get past one, not to use one, and each is logged so it is visible
- * when a game has asked for something the player never saw.
+ * when a game has asked for something the player never saw. A message answers yes
+ * to whatever it asked.
  *
- * Saves in particular are not stored: a load reports that there is no data, and a
- * save reports success without keeping anything.
+ * Saves do their work for real, in savedata.c.
  */
 
 #include "psprecomp/hle.h"
+#include "savedata.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -22,12 +23,16 @@
 #define ST_FINISHED 4
 
 #define DIALOG_KINDS 5
+#define KIND_MSGDIALOG 0
 #define KIND_SAVEDATA 1
+
+/* pspUtilityMsgDialogParams */
+#define MSG_TEXT 0x3Cu
+#define MSG_BUTTON 0x240u
+#define MSG_BUTTON_YES 1u
 
 /* Every dialog's parameters begin with this block, which holds its result. */
 #define PARAM_RESULT 0x1Cu
-#define SAVEDATA_MODE 0x30u
-#define SAVEDATA_NO_DATA 0x80110307u
 
 static int g_state[DIALOG_KINDS];
 
@@ -37,10 +42,12 @@ static void dialog_init(int kind, const char *name) {
     const uint32_t param = psp_arg(0);
     uint32_t result = 0;
     if (kind == KIND_SAVEDATA) {
-        /* Automatic load, load and list load are the even modes below 6. */
-        const uint32_t mode = psp_read32(param + SAVEDATA_MODE);
-        fprintf(stderr, "utility: Savedata mode %u (not stored)\n", mode);
-        if (mode < 6 && !(mode & 1)) result = SAVEDATA_NO_DATA;
+        result = psp_savedata_run(param);
+    } else if (kind == KIND_MSGDIALOG) {
+        char text[128];
+        psp_str(param + MSG_TEXT, text, sizeof text);
+        fprintf(stderr, "utility: message not shown, answering yes: %s\n", text);
+        psp_write32(param + MSG_BUTTON, MSG_BUTTON_YES);
     } else {
         fprintf(stderr, "utility: %s opened (nothing is shown)\n", name);
     }

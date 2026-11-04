@@ -185,6 +185,8 @@ void psp_io_reset(void);
 void psp_io_set_root(const char *root);
 /* Where disc0:/ lives, when it is not <root>/disc. */
 void psp_io_set_disc_root(const char *path);
+/* Where a guest path such as ms0:/PSP/... lands on the host. */
+void psp_io_host_path(const char *guest, char *out, size_t cap);
 uint64_t psp_io_bytes_read(void);
 
 void psp_utility_init(void);
