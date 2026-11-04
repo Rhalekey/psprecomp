@@ -195,6 +195,15 @@ void psp_io_set_disc_root(const char *path);
 void psp_io_host_path(const char *guest, char *out, size_t cap);
 uint64_t psp_io_bytes_read(void);
 
+/* What a savedata request did, for a host to tell the player: the system's own
+ * screens for this are not drawn. Runs on a guest thread, so keep it short. */
+enum {
+    PSP_SAVEDATA_SAVED, PSP_SAVEDATA_LOADED, PSP_SAVEDATA_NO_DATA,
+    PSP_SAVEDATA_DELETED, PSP_SAVEDATA_FAILED
+};
+typedef void (*psp_savedata_event_fn)(int event);
+void psp_savedata_set_event_handler(psp_savedata_event_fn fn);
+
 void psp_utility_init(void);
 void psp_utility_register(void);
 

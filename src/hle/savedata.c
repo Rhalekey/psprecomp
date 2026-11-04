@@ -61,6 +61,14 @@ enum {
 #define ERROR_LOAD_NO_DATA 0x80110307u
 #define ERROR_SAVE_FAILED  0x8011038Bu   /* the stick could not be written */
 
+static psp_savedata_event_fn g_on_event;
+
+void psp_savedata_set_event_handler(psp_savedata_event_fn fn) { g_on_event = fn; }
+
+static void report_event(int event) {
+    if (g_on_event) g_on_event(event);
+}
+
 static const char *const EXTRA_FILE[4] = { "ICON0.PNG", "ICON1.PMF", "PIC1.PNG", "SND0.AT3" };
 
 /* The save's folder on the host, for a name read out of guest memory. */
@@ -177,6 +185,7 @@ static uint32_t do_save(uint32_t param, const char *save) {
         if (buf && bytes && bytes <= MAX_FILE) write_file(dir, EXTRA_FILE[i], buf, bytes);
     }
     fprintf(stderr, "savedata: saved %u bytes to %s\n", size, dir);
+    report_event(PSP_SAVEDATA_SAVED);
     return 0;
 }
 
@@ -188,6 +197,7 @@ static uint32_t do_load(uint32_t param, const char *save) {
     const int got = file[0] ? read_file(dir, file, psp_read32(param + P_DATA), psp_read32(param + P_DATA_CAP)) : 0;
     if (got < 0) {
         fprintf(stderr, "savedata: nothing to load in %s\n", dir);
+        report_event(PSP_SAVEDATA_NO_DATA);
         return ERROR_LOAD_NO_DATA;
     }
     psp_write32(param + P_DATA_SIZE, (uint32_t)got);
@@ -200,6 +210,7 @@ static uint32_t do_load(uint32_t param, const char *save) {
         psp_write32(entry + 8, n > 0 ? (uint32_t)n : 0);
     }
     fprintf(stderr, "savedata: loaded %d bytes from %s\n", got, dir);
+    report_event(PSP_SAVEDATA_LOADED);
     return 0;
 }
 
@@ -240,7 +251,11 @@ uint32_t psp_savedata_run(uint32_t param) {
     switch (mode) {
     case MODE_AUTOSAVE: case MODE_SAVE: case MODE_MAKEDATA: case MODE_MAKEDATASECURE:
     case MODE_WRITEDATA: case MODE_WRITEDATASECURE:
-        return do_save(param, save);
+        {
+            const uint32_t result = do_save(param, save);
+            if (result) report_event(PSP_SAVEDATA_FAILED);
+            return result;
+        }
 
     case MODE_AUTOLOAD: case MODE_LOAD: case MODE_READDATA: case MODE_READDATASECURE:
         return do_load(param, save);
@@ -248,10 +263,17 @@ uint32_t psp_savedata_run(uint32_t param) {
     case MODE_LISTSAVE:
         if (!pick_slot(param, 0, save, sizeof save)) return ERROR_SAVE_FAILED;
         put_name(param, save);
-        return do_save(param, save);
+        {
+            const uint32_t result = do_save(param, save);
+            if (result) report_event(PSP_SAVEDATA_FAILED);
+            return result;
+        }
 
     case MODE_LISTLOAD:
-        if (!pick_slot(param, 1, save, sizeof save)) return ERROR_LOAD_NO_DATA;
+        if (!pick_slot(param, 1, save, sizeof save)) {
+            report_event(PSP_SAVEDATA_NO_DATA);
+            return ERROR_LOAD_NO_DATA;
+        }
         put_name(param, save);
         return do_load(param, save);
 
@@ -265,6 +287,7 @@ uint32_t psp_savedata_run(uint32_t param) {
         if (!slot_exists(param, save)) return ERROR_LOAD_NO_DATA;
         delete_slot(param, dir);
         fprintf(stderr, "savedata: deleted %s\n", dir);
+        report_event(PSP_SAVEDATA_DELETED);
         return 0;
     }
 

@@ -783,6 +783,104 @@ static void draw_overlay(int image_x, int image_top, int image_h) {
     glDisable(GL_SCISSOR_TEST);
 }
 
+/* ---- messages ------------------------------------------------------------ *
+ *
+ * One line of text over the picture for a few seconds, for what the system's own
+ * screens would have said. Windows draws the text, so any language works, and the
+ * result is kept as a little framebuffer to blit. */
+
+#define MESSAGE_MS 3000u
+
+static char g_message[256];
+static volatile LONG g_message_serial;
+static CRITICAL_SECTION g_message_lock;
+static volatile LONG g_message_lock_ready;
+
+void psp_render_gl_show_message(const char *utf8) {
+    if (InterlockedCompareExchange(&g_message_lock_ready, 1, 0) == 0)
+        InitializeCriticalSection(&g_message_lock);
+    EnterCriticalSection(&g_message_lock);
+    snprintf(g_message, sizeof g_message, "%s", utf8);
+    LeaveCriticalSection(&g_message_lock);
+    InterlockedIncrement(&g_message_serial);
+}
+
+static GLuint g_message_fbo, g_message_tex;
+static int g_message_w, g_message_h, g_message_for_h;
+static LONG g_message_drawn;
+static ULONGLONG g_message_until;
+
+/* Render the text with GDI into memory and hand the pixels to GL. */
+static void build_message(int image_h) {
+    WCHAR text[256];
+    EnterCriticalSection(&g_message_lock);
+    const int len = MultiByteToWideChar(CP_UTF8, 0, g_message, -1, text, 256);
+    LeaveCriticalSection(&g_message_lock);
+    if (len <= 1) return;
+
+    HDC dc = CreateCompatibleDC(NULL);
+    const int font_h = image_h / 18 > 12 ? image_h / 18 : 12;
+    HFONT font = CreateFontA(-font_h, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY,
+                             0, "Segoe UI");
+    HGDIOBJ old_font = SelectObject(dc, font);
+    SIZE size;
+    GetTextExtentPoint32W(dc, text, len - 1, &size);
+    const int margin = font_h / 2;
+    const int w = size.cx + 2 * margin, h = size.cy + margin;
+
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;             /* top-down, as targets are stored */
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    void *bits = NULL;
+    HBITMAP bitmap = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (bitmap && bits) {
+        HGDIOBJ old_bitmap = SelectObject(dc, bitmap);
+        memset(bits, 0, (size_t)w * (size_t)h * 4u);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(255, 255, 255));
+        TextOutW(dc, margin, margin / 2, text, len - 1);
+        GdiFlush();
+
+        if (!g_message_fbo) g_message_fbo = make_color_target(&g_message_tex, w, h, GL_LINEAR);
+        glBindTexture(GL_TEXTURE_2D, g_message_tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_BGRA, GL_UNSIGNED_BYTE, bits);
+        g_message_w = w;
+        g_message_h = h;
+        SelectObject(dc, old_bitmap);
+    }
+    if (bitmap) DeleteObject(bitmap);
+    SelectObject(dc, old_font);
+    DeleteObject(font);
+    DeleteDC(dc);
+}
+
+static void draw_message(int image_x, int image_y, int image_w, int image_h) {
+    const LONG serial = g_message_serial;
+    if (serial != g_message_drawn) {
+        g_message_drawn = serial;
+        g_message_until = GetTickCount64() + MESSAGE_MS;
+        g_message_for_h = 0;
+    }
+    if (!g_message_until || GetTickCount64() >= g_message_until) return;
+    if (g_message_for_h != image_h) {
+        g_message_for_h = image_h;
+        build_message(image_h);
+    }
+    if (!g_message_fbo) return;
+
+    const int x = image_x + (image_w - g_message_w) / 2;
+    const int y = image_y + image_h / 12;
+    p_glBindFramebuffer(GL_READ_FRAMEBUFFER, g_message_fbo);
+    p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);     /* creating it may have moved this */
+    p_glBlitFramebuffer(0, 0, g_message_w, g_message_h, x, y + g_message_h, x + g_message_w, y,
+                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
+}
+
 static void keep_snapshot(GLuint source_fbo, int source_w, int source_h) {
     p_glBindFramebuffer(GL_READ_FRAMEBUFFER, source_fbo);
     p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_small_fbo);
@@ -845,6 +943,8 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
     p_glBlitFramebuffer(0, 0, source_w, source_h, x0, y0 + h, x0 + w, y0, GL_COLOR_BUFFER_BIT, filter);
+    p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    draw_message(x0, y0, w, h);
     if (g_overlay) draw_overlay(x0, y0 + h, h);
     SwapBuffers(g_dc);
 

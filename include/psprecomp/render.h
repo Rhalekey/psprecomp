@@ -145,6 +145,8 @@ extern const psp_render_backend psp_render_gl;
 void psp_render_gl_set_scale(int scale);
 /* Show frames per second and the slowest frame in a corner of the window. */
 void psp_render_gl_set_overlay(int on);
+/* Show a line of UTF-8 text over the picture for a few seconds. Any thread. */
+void psp_render_gl_show_message(const char *utf8);
 /* Textures decoded so far and the real time that took, in microseconds. */
 void psp_render_gl_texture_stats(uint64_t *count, uint64_t *total_us, uint64_t *worst_us);
 
