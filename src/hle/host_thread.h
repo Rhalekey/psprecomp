@@ -98,6 +98,7 @@ static int host_thread_create(host_thread *thread, size_t stack,
     *thread = (HANDLE)handle;
     return 0;
 }
+static void host_thread_yield(void) { SwitchToThread(); }
 static void host_thread_join(host_thread thread) {
     if (WaitForSingleObject(thread, INFINITE) != WAIT_OBJECT_0) host_thread_error();
     if (!CloseHandle(thread)) host_thread_error();
@@ -105,6 +106,7 @@ static void host_thread_join(host_thread thread) {
 #else
 #include <errno.h>
 #include <pthread.h>
+#include <sched.h>
 #include <time.h>
 #define HOST_TLS _Thread_local
 typedef pthread_t host_thread;
@@ -146,6 +148,7 @@ static int host_thread_create(host_thread *thread, size_t stack,
     if (pthread_attr_destroy(&attr)) host_thread_error();
     return rc;
 }
+static void host_thread_yield(void) { sched_yield(); }
 static void host_thread_join(host_thread thread) { if (pthread_join(thread, NULL)) host_thread_error(); }
 #endif
 #endif

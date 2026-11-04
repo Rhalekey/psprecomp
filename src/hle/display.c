@@ -95,9 +95,46 @@ static void hle_SetMode(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
+/* Frame times, by the refreshes they span. An average of 50 could be every frame a
+ * little late or one frame in five a whole refresh late, and the cures differ. */
+static const uint32_t FRAME_BUCKET_MS[] = { 18, 21, 26, 35, 51 };
+#define FRAME_BUCKETS (sizeof FRAME_BUCKET_MS / sizeof FRAME_BUCKET_MS[0] + 1)
+static uint64_t g_frame_hist[FRAME_BUCKETS];
+static uint64_t g_last_flip_us;
+
+static uint64_t display_now_us(void);
+
+static void note_flip(void) {
+    const uint64_t now = display_now_us();
+    if (g_last_flip_us) {
+        const uint64_t ms = (now - g_last_flip_us) / 1000u;
+        size_t b = 0;
+        while (b < FRAME_BUCKETS - 1 && ms >= FRAME_BUCKET_MS[b]) b++;
+        g_frame_hist[b]++;
+    }
+    g_last_flip_us = now;
+}
+
+void psp_display_dump_frames(FILE *out) {
+    uint64_t total = 0;
+    for (size_t i = 0; i < FRAME_BUCKETS; i++) total += g_frame_hist[i];
+    if (!total) return;
+    fprintf(out, "frame times:");
+    for (size_t i = 0; i < FRAME_BUCKETS; i++) {
+        if (i < FRAME_BUCKETS - 1) fprintf(out, "  <%ums", FRAME_BUCKET_MS[i]);
+        else fprintf(out, "  more");
+        fprintf(out, " %.1f%%", 100.0 * (double)g_frame_hist[i] / (double)total);
+    }
+    fprintf(out, "\n");
+}
+
 static void hle_SetFrameBuf(void) {
     /* (topaddr, bufferwidth, pixelformat, sync) */
-    if (psp_arg(0) && psp_arg(0) != g_fb_addr) g_flips++;
+    if (psp_arg(0) && psp_arg(0) != g_fb_addr) {
+        g_flips++;
+        note_flip();
+        psp_sched_note("flip", NULL, 0);
+    }
     g_fb_addr   = psp_arg(0);
     g_fb_width  = psp_arg(1);
     g_fb_format = psp_arg(2);
@@ -141,9 +178,17 @@ static void pace_vblank(uint32_t frame_us) {
     }
 }
 
+void psp_display_wait_vblank(void) {
+    /* Unpaced still needs an interval: an interrupt loop must not spin. */
+    const uint32_t frame_us = g_frame_us;
+    pace_vblank(frame_us ? frame_us : 16683u);
+}
+
 static void hle_WaitVblank(void) {
     const uint32_t frame_us = g_frame_us;
+    const uint64_t began = display_now_us();
     if (frame_us) pace_vblank(frame_us);
+    psp_sched_note("vblank wait", NULL, (uint32_t)(display_now_us() - began));
     g_vblank_count++;
     /* A frame boundary is the guest asking for time to pass, so it is the third
      * point where an interrupt is delivered (src/hle/intrman.c) -- and, on one

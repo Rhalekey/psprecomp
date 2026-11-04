@@ -1044,6 +1044,22 @@ void psp_ge_flip(uint32_t addr, uint32_t stride, int fmt) {
     ge_unlock();
 }
 
+/* A short list is done long before a sleeping thread could be woken to hear about
+ * it, and a game can wait on dozens of them a frame. So a thread about to sleep on
+ * the GE's account watches it for a moment first. Returns nonzero if a callback was
+ * delivered, in which case what it was waiting for may have happened. */
+int psp_ge_wait_briefly(uint32_t us) {
+    if (!g_ge_async || psp_threadman_intr_disabled()) return 0;
+    for (uint64_t end = ge_now_us() + us;;) {
+        if (g_ge_npending) {
+            const uint64_t before = g_ge_delivered;
+            psp_ge_deliver();
+            return g_ge_delivered != before;
+        }
+        if (!g_ge_inflight || ge_now_us() >= end) return 0;
+    }
+}
+
 static int ge_busy(void) {
     ge_lock();
     const int busy = g_ge_inflight > 0;

@@ -144,9 +144,14 @@ void psp_display_reset(void);
 /* Hold vblank waits to this many per second, changeable at any time. 0, the
  * default, does not hold them at all. */
 void psp_display_set_refresh_rate(double hz);
+/* Sleep until the next refresh, on the one clock every vblank wait uses. A vblank
+ * interrupt must come from here too. On a clock of its own, however close its rate,
+ * it drifts against the waits and every so often makes a game miss a refresh. */
+void psp_display_wait_vblank(void);
 /* Times the game has switched to a new front buffer: its real frame rate, which
  * a thread waiting for vblanks on its own says nothing about. */
 uint64_t psp_display_flips(void);
+void     psp_display_dump_frames(FILE *out);
 int      psp_display_capture(const char *path);
 /* The front buffer as 480x272 pixels of 0xAABBGGRR; -1 before the game has
  * set a framebuffer. */
@@ -167,6 +172,7 @@ uint64_t psp_ge_pixels(void);
 void     psp_ge_set_async(int on);
 /* The game has switched to showing the buffer at `addr`. */
 void     psp_ge_flip(uint32_t addr, uint32_t stride, int fmt);
+int      psp_ge_wait_briefly(uint32_t us);
 /* Host time spent running display lists: the cost of software rendering. */
 uint64_t psp_ge_busy_us(void);
 /* Run the callbacks finished lists have raised. Called at every wait. */
@@ -264,6 +270,11 @@ uint64_t psp_threadman_handover_expired(void);
 void     psp_threadman_dump(FILE *out);
 /* Where each thread's real time has gone: running, queueing for the CPU, asleep. */
 void     psp_threadman_dump_times(FILE *out);
+void     psp_sched_note(const char *what, const char *name, uint32_t took_us);
+void     psp_sched_dump(FILE *out, uint32_t count);
+/* The same for one thread by name, running totals in microseconds. 0 if none. */
+int      psp_threadman_times(const char *name, uint64_t *life_us, uint64_t *asleep_us,
+                             uint64_t *sema_us, uint64_t *queue_us);
 
 /* ---- callbacks -----------------------------------------------------------
  *

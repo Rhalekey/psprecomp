@@ -143,6 +143,10 @@ extern const psp_render_backend psp_render_null;
 extern const psp_render_backend psp_render_gl;
 /* How many times the PSP's resolution targets are drawn at. Set it first. */
 void psp_render_gl_set_scale(int scale);
+/* Show frames per second and the slowest frame in a corner of the window. */
+void psp_render_gl_set_overlay(int on);
+/* Textures decoded so far and the real time that took, in microseconds. */
+void psp_render_gl_texture_stats(uint64_t *count, uint64_t *total_us, uint64_t *worst_us);
 
 /* Pixels written by the active backend -- the proof of life during bring-up. */
 uint64_t psp_render_pixels(void);

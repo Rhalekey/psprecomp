@@ -183,6 +183,10 @@ static uint32_t   g_upload[PSP_W * PSP_H];
 static uint32_t   g_snapshot[PSP_W * PSP_H];
 static volatile int g_have_snapshot;
 
+static int g_overlay;
+
+void psp_render_gl_set_overlay(int on) { g_overlay = on; }
+
 void psp_render_gl_set_scale(int scale) {
     if (scale >= 1 && scale <= 8) g_scale = scale;
 }
@@ -404,15 +408,36 @@ static uint32_t texture_hash(const psp_draw_state *st) {
     return p ? hash_words(p, bytes, HASH_SAMPLES) : 0;
 }
 
+static uint64_t g_decoded, g_decode_us, g_decode_worst_us;
+
+void psp_render_gl_texture_stats(uint64_t *count, uint64_t *total_us, uint64_t *worst_us) {
+    *count = g_decoded;
+    *total_us = g_decode_us;
+    *worst_us = g_decode_worst_us;
+}
+
+static uint64_t gl_now_us(void) {
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER now;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    return (uint64_t)((double)now.QuadPart * 1e6 / (double)freq.QuadPart);
+}
+
 static void decode_texture(gl_texture *e, const psp_draw_state *st) {
     const int w = st->tex_w, h = st->tex_h;
     if (w > TEX_MAX_SIDE || h > TEX_MAX_SIDE) return;
+    const uint64_t began = gl_now_us();
     for (int y = 0; y < h; y++)
         for (int x = 0; x < w; x++)
             g_decode[y * w + x] = psp_tex_fetch(st, x, y);
     glBindTexture(GL_TEXTURE_2D, e->tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_decode);
+    const uint64_t took = gl_now_us() - began;
+    g_decoded++;
+    g_decode_us += took;
+    if (took > g_decode_worst_us) g_decode_worst_us = took;
 }
 
 static void forget_textures(void) {
@@ -675,6 +700,89 @@ static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
     glDrawArrays(mode, 0, n);
 }
 
+/* ---- the frame rate overlay ---------------------------------------------- *
+ *
+ * A testing aid: frames shown per second and, under it, the slowest frame in that
+ * time in milliseconds. It counts what really reaches the window. Digits are seven
+ * segments of scissored clears, which needs neither a font nor a shader. */
+
+#define OVERLAY_PERIOD_MS 500u
+
+static void overlay_rect(int x, int y, int w, int h, float r, float g, float b) {
+    glScissor(x, y, w, h);
+    glClearColor(r, g, b, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+}
+
+/* `top` is the digit's upper edge, in GL's upward y. */
+static void overlay_digit(int x, int top, int t, int digit, float r, float g, float b) {
+    static const unsigned char SEGMENTS[10] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F };
+    const unsigned s = SEGMENTS[digit];
+    const int w = 4 * t;
+    if (s & 0x01) overlay_rect(x, top - t, w, t, r, g, b);                   /* top */
+    if (s & 0x02) overlay_rect(x + w - t, top - 4 * t, t, 4 * t, r, g, b);   /* upper right */
+    if (s & 0x04) overlay_rect(x + w - t, top - 7 * t, t, 4 * t, r, g, b);   /* lower right */
+    if (s & 0x08) overlay_rect(x, top - 7 * t, w, t, r, g, b);               /* bottom */
+    if (s & 0x10) overlay_rect(x, top - 7 * t, t, 4 * t, r, g, b);           /* lower left */
+    if (s & 0x20) overlay_rect(x, top - 4 * t, t, 4 * t, r, g, b);           /* upper left */
+    if (s & 0x40) overlay_rect(x, top - 4 * t, w, t, r, g, b);               /* middle */
+}
+
+/* Three digits, right-aligned, leading zeros blank. */
+static void overlay_number(int x, int top, int t, int value, float r, float g, float b) {
+    if (value > 999) value = 999;
+    const int d[3] = { value / 100, (value / 10) % 10, value % 10 };
+    for (int i = 0; i < 3; i++) {
+        if (i < 2 && !d[i] && (i == 1 ? !d[0] : 1)) continue;
+        overlay_digit(x + i * 5 * t, top, t, d[i], r, g, b);
+    }
+}
+
+static void draw_overlay(int image_x, int image_top, int image_h) {
+    static LARGE_INTEGER freq, last_flip, period_start;
+    static uint32_t frames;
+    static int shown_fps, shown_worst;
+    static double worst_ms;
+
+    LARGE_INTEGER now;
+    if (!freq.QuadPart) {
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&period_start);
+        last_flip = period_start;
+    }
+    QueryPerformanceCounter(&now);
+    const double frame_ms = 1000.0 * (double)(now.QuadPart - last_flip.QuadPart) / (double)freq.QuadPart;
+    if (frame_ms > worst_ms) worst_ms = frame_ms;
+    last_flip = now;
+    frames++;
+
+    const double period_ms = 1000.0 * (double)(now.QuadPart - period_start.QuadPart) / (double)freq.QuadPart;
+    if (period_ms >= OVERLAY_PERIOD_MS) {
+        shown_fps = (int)((double)frames * 1000.0 / period_ms + 0.5);
+        shown_worst = (int)(worst_ms + 0.5);
+        frames = 0;
+        worst_ms = 0;
+        period_start = now;
+    }
+
+    /* The numbers are drawn in proportion to the picture, in its top left corner. */
+    int t = image_h / 110;
+    if (t < 2) t = 2;
+    const int small = t > 3 ? t * 2 / 3 : 2;
+    const int margin = t;
+    const int box_w = 15 * t + 2 * margin;
+    const int box_h = 7 * t + 7 * small + 3 * margin;
+    glEnable(GL_SCISSOR_TEST);
+    overlay_rect(image_x, image_top - box_h, box_w, box_h, 0, 0, 0);
+
+    float r = 0.3f, g = 1.0f, b = 0.3f;                /* a full 60 */
+    if (shown_fps < 45) { r = 1.0f; g = 0.3f; b = 0.3f; }
+    else if (shown_fps < 57) { r = 1.0f; g = 0.9f; b = 0.2f; }
+    overlay_number(image_x + margin, image_top - margin, t, shown_fps, r, g, b);
+    overlay_number(image_x + margin, image_top - 2 * margin - 7 * t, small, shown_worst, 0.8f, 0.8f, 0.8f);
+    glDisable(GL_SCISSOR_TEST);
+}
+
 static void keep_snapshot(GLuint source_fbo, int source_w, int source_h) {
     p_glBindFramebuffer(GL_READ_FRAMEBUFFER, source_fbo);
     p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_small_fbo);
@@ -737,6 +845,7 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
     p_glBlitFramebuffer(0, 0, source_w, source_h, x0, y0 + h, x0 + w, y0, GL_COLOR_BUFFER_BIT, filter);
+    if (g_overlay) draw_overlay(x0, y0 + h, h);
     SwapBuffers(g_dc);
 
     g_bound = NULL;

@@ -99,6 +99,15 @@
  *
  * WAIT_STEP_US only bounds how long a wait can miss its wakeup. */
 #define WAIT_STEP_US 16000ull
+
+/* How long a wait watches the GE before sleeping. Enough for a typical list, and
+ * short enough that nothing else minds the CPU being held that long. */
+#define GE_SPIN_US 300u
+
+/* Windows wakes a sleeper on a 1 ms tick, and often a tick late. A delay that has to
+ * hit a deadline, such as the next vblank, sleeps most of the way and then watches
+ * the clock for this long, holding no CPU a guest could use. */
+#define PRECISE_US 2000ull
 static int g_realtime;
 static HOST_TLS uint64_t g_tls_real_us;   /* how long the next park really sleeps */
 
@@ -424,10 +433,17 @@ static int park_us(uint64_t timeout_us) {
         if (g_tls_real_us) real = g_tls_real_us;
         host_mutex_lock(&t->wlock);
         if (!t->woken) {
-            uint64_t dl = host_deadline_us() + real;
+            const uint64_t dl = host_deadline_us() + real;
+            const int precise = g_realtime && waiting_for == W_DELAY && real > PRECISE_US;
+            const uint64_t coarse_dl = precise ? dl - PRECISE_US : dl;
             while (!t->woken) {
-                if (host_cond_until(&t->wcv, &t->wlock, dl))
+                if (host_cond_until(&t->wcv, &t->wlock, coarse_dl))
                     break;
+            }
+            while (precise && !t->woken && host_deadline_us() < dl) {
+                host_mutex_unlock(&t->wlock);
+                host_thread_yield();
+                host_mutex_lock(&t->wlock);
             }
         }
         woken = t->woken;
@@ -672,6 +688,57 @@ void psp_threadman_kick(void) {
 #endif
 }
 
+int psp_threadman_times(const char *name, uint64_t *life_us, uint64_t *asleep_us,
+                        uint64_t *sema_us, uint64_t *queue_us) {
+#if PSPRECOMP_REAL_THREADS
+    for (int i = 0; i < MAX_THREADS; i++) {
+        const psp_thread *t = &g_thread[i];
+        if (!t->used || !t->us_started || strcmp(t->name, name) != 0) continue;
+        *life_us = host_deadline_us() - t->us_started;
+        *asleep_us = 0;
+        for (int k = 0; k < 16; k++) *asleep_us += t->us_waiting[k];
+        *sema_us = t->us_waiting[W_SEMA];
+        *queue_us = t->us_queueing;
+        return 1;
+    }
+#else
+    (void)name; (void)life_us; (void)asleep_us; (void)sema_us; (void)queue_us;
+#endif
+    return 0;
+}
+
+/* A short history of what threads waited for and when, to see the order of events
+ * in a frame, which no total can show. Written only by whoever holds the CPU. */
+#define SCHED_NOTES 512
+
+static struct {
+    uint64_t at_us;
+    const char *who, *what, *name;
+    uint32_t took_us;
+} g_notes[SCHED_NOTES];
+static uint32_t g_note_next;
+
+void psp_sched_note(const char *what, const char *name, uint32_t took_us) {
+    const uint32_t i = g_note_next++ % SCHED_NOTES;
+    g_notes[i].at_us = host_now_us();
+    g_notes[i].who = g_tls_me ? g_tls_me->name : "?";
+    g_notes[i].what = what;
+    g_notes[i].name = name;
+    g_notes[i].took_us = took_us;
+}
+
+void psp_sched_dump(FILE *out, uint32_t count) {
+    if (count > SCHED_NOTES) count = SCHED_NOTES;
+    if (count > g_note_next) count = g_note_next;
+    const uint64_t base = count ? g_notes[(g_note_next - count) % SCHED_NOTES].at_us : 0;
+    fprintf(out, "last %u scheduling notes: ms since first, thread, event, how long in us\n", count);
+    for (uint32_t k = g_note_next - count; k != g_note_next; k++) {
+        const uint32_t i = k % SCHED_NOTES;
+        fprintf(out, "  %8.2f %-18s %-18s %-22s %u\n", (double)(g_notes[i].at_us - base) / 1000.0,
+                g_notes[i].who, g_notes[i].what, g_notes[i].name ? g_notes[i].name : "", g_notes[i].took_us);
+    }
+}
+
 void psp_threadman_dump_times(FILE *out) {
 #if PSPRECOMP_REAL_THREADS
     const uint64_t now = host_deadline_us();
@@ -838,12 +905,17 @@ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
                           int kind, const char *what, const char *name) {
     uint64_t deadline = timeout_us ? g_vtime_us + timeout_us : 0;
     const uint64_t real_deadline = timeout_us ? host_now_us() + timeout_us : 0;
+    const uint64_t began = host_now_us();
     uint64_t ticks = 0;
 
     for (;;) {
         check_terminated();
         deliver_tick();
-        if (ready(ctx)) return SCE_KERNEL_ERROR_OK;
+        if (ready(ctx)) {
+            const uint64_t waited = host_now_us() - began;
+            if (waited >= 200) psp_sched_note(what, name, (uint32_t)waited);
+            return SCE_KERNEL_ERROR_OK;
+        }
 #if !PSPRECOMP_REAL_THREADS
         /* No other guest can make progress while this inline call is active. */
         warn_wait(what, name);
@@ -851,6 +923,7 @@ static uint32_t wait_loop(int (*ready)(void *), void *ctx, uint64_t timeout_us,
 #endif
         check_terminated();
         if (g_realtime) {
+            if (psp_ge_wait_briefly(GE_SPIN_US)) continue;
             uint64_t step = WAIT_STEP_US;
             if (real_deadline) {
                 const uint64_t now = host_now_us();
