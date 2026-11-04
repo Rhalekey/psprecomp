@@ -53,6 +53,7 @@ add_library(psprecomp STATIC
     src/hle/iofilemgr.c
     src/hle/misc.c
     src/hle/sync.c
+    src/hle/utility.c
 )
 
 target_include_directories(psprecomp PUBLIC

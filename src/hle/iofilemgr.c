@@ -301,13 +301,25 @@ static void hle_Getstat(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* Device control is device-specific and nothing here needs one yet. Named in
- * the trace so that a game waiting on an answer can be spotted. */
+/* Device control is device-specific. Only what a game has asked for is answered;
+ * the rest succeed and are named once each in the trace, so that a game waiting
+ * on an answer can be spotted. */
+#define DEVCTL_MS_INSERTED 0x02425823u
+
 static void hle_Devctl(void) {
     char dev[64];
+    static uint32_t seen[32];
+    static int nseen;
+    const uint32_t cmd = psp_arg(1), out = psp_arg(4);
     psp_str(psp_arg(0), dev, sizeof dev);
-    if (getenv("PSPRECOMP_TRACE_IO"))
-        fprintf(stderr, "io: devctl \"%s\" cmd 0x%08X\n", dev, psp_arg(1));
+
+    int known = 0;
+    for (int i = 0; i < nseen; i++) known |= seen[i] == cmd;
+    if (!known && nseen < 32) seen[nseen++] = cmd;
+    if (!known && getenv("PSPRECOMP_TRACE_IO"))
+        fprintf(stderr, "io: devctl \"%s\" cmd 0x%08X\n", dev, cmd);
+
+    if (cmd == DEVCTL_MS_INSERTED && out) psp_write32(out, 1);   /* (out is argument 5) */
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

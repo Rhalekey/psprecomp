@@ -911,6 +911,40 @@ static void check_loop_stays_one_function(void) {
     free(csrc);
 }
 
+/* A function nothing refers to is still emitted, and still callable: its address
+ * may be built in a way no scan recognises. */
+static void check_unreached_code_is_swept(void) {
+    static const uint32_t CODE[] = {
+        0x03E00008u,   /* jr $ra                      */
+        0x00000000u,
+        0x00000000u,   /* padding                     */
+        0x24020001u,   /* addiu $v0,$zero,1  unreached */
+        0x03E00008u,   /* jr $ra                      */
+        0x00000000u,
+    };
+    uint8_t bytes[sizeof CODE];
+    memcpy(bytes, CODE, sizeof bytes);
+
+    a_analysis an;
+    memset(&an, 0, sizeof an);
+    an.code = bytes;
+    an.base = BASE;
+    an.size = (uint32_t)sizeof bytes;
+    an.scan_calls = 1;
+    an.scan_base = BASE;
+    an.scan_size = an.size;
+    an.image = bytes;
+    an.image_base = BASE;
+    an.image_size = an.size;
+
+    const uint32_t seed = BASE;
+    CHECK(a_discover(&an, &seed, 1) == 0, "sweep discovery runs");
+    CHECK(an.nfuncs == 2, "the unreached function is found, got %d", an.nfuncs);
+    if (an.nfuncs == 2)
+        CHECK(an.funcs[1].addr == BASE + 12, "it starts past the padding, got 0x%08X", an.funcs[1].addr);
+    a_analysis_free(&an);
+}
+
 /* A switch's cases are blocks of its function, even though the table holding
  * them looks exactly like a list of function pointers. */
 static void check_jump_table_stays_in_function(void) {
@@ -1209,6 +1243,7 @@ int main(void) {
     check_jump_runs_foreign_slot();
     check_loop_stays_one_function();
     check_jump_table_stays_in_function();
+    check_unreached_code_is_swept();
 
     {
         static const uint32_t CODE_CMOV[] = {

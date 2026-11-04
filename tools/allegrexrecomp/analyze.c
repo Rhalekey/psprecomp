@@ -507,6 +507,48 @@ static int resolve_jump_table(a_analysis *an, uint32_t site, u32list *out) {
     return taken;
 }
 
+/* Does control never fall through this instruction? */
+static int ends_flow(const a_insn *in) {
+    if (in->is_return) return 1;
+    if (in->is_call) return 0;
+    if (in->is_jump || in->is_indirect) return 1;
+    return in->is_branch && in->op == A_BEQ && in->rs == 0 && in->rt == 0;
+}
+
+/* Promote what no walk has reached in the scanned range.
+ *
+ * Whatever seeds are used, some function is always only reachable through an
+ * address built in a way no scan recognises, and a call to it ends the program.
+ * Every word of `.text` decodes, so an unreached stretch is code rather than
+ * data, and it costs nothing to have it available. A stretch begins where the
+ * code before it stopped: after a walked word, or after an unconditional transfer
+ * and its delay slot, past any nop padding. */
+static void sweep_gaps(a_analysis *an, const uint8_t *seen, u32list *out) {
+    const uint32_t sbase = an->scan_size ? an->scan_base : an->base;
+    const uint32_t ssize = an->scan_size ? an->scan_size : an->size;
+    for (uint32_t off = 0; off + 4 <= ssize; off += 4) {
+        const uint32_t a = sbase + off;
+        if (!a_in_range(an, a)) continue;
+        const uint32_t i = word_index(an, a);
+        if ((seen[i] & SEEN_CODE) || fetch(an, a) == 0) continue;
+        if (an->case_map && an->case_map[i]) continue;   /* reached from its `jr` */
+
+        uint32_t p = a;
+        while (p > sbase && !(seen[word_index(an, p - 4)] & SEEN_CODE) && fetch(an, p - 4) == 0) p -= 4;
+        int starts = p == sbase || (seen[word_index(an, p - 4)] & SEEN_CODE);
+        a_insn in;
+        if (!starts) {
+            a_decode(fetch(an, p - 4), p - 4, &in);
+            starts = ends_flow(&in);
+        }
+        if (!starts && p - 8 >= sbase) {
+            a_decode(fetch(an, p - 8), p - 8, &in);
+            starts = ends_flow(&in);
+        }
+        if (starts) u32_push(out, a);
+    }
+}
+
 static int cmp_func(const void *a, const void *b) {
     uint32_t x = ((const a_func *)a)->addr, y = ((const a_func *)b)->addr;
     return (x > y) - (x < y);
@@ -676,7 +718,7 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
  * which shows up as a dispatch miss at run time. The cap is a termination
  * guarantee, not an expected limit: entries only ever accumulate, so this
  * converges in a handful of rounds. */
-    for (int round = 0; round < 8; round++) {
+    for (int round = 0; round < 16; round++) {
     if (round > 0) {
         if (!an->image && !cross.n && !indirects.n) break;
         u32list targets = { 0 };
@@ -688,6 +730,7 @@ int a_discover(a_analysis *an, const uint32_t *seeds, int nseeds) {
         }
         for (int i = 0; i < cross.n; i++) u32_push(&targets, cross.v[i]);
         cross.n = 0;
+        if (an->scan_calls) sweep_gaps(an, seen, &targets);
         int added = 0;
         for (int i = 0; i < targets.n; i++) {
             uint32_t t = targets.v[i];
