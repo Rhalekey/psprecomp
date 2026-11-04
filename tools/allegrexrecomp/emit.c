@@ -428,6 +428,10 @@ static void emit_simple(ectx *c, const a_insn *in, const char *ind) {
         fprintf(f, "%spsp_vscl(%u, %u, %u, %u);\n", ind, in->vd, in->vs, in->vt, in->vsize); return;
     case A_VCMP:
         fprintf(f, "%spsp_vcmp(%u, %u, %u, %u);\n", ind, in->vd & 0xF, in->vs, in->vt, in->vsize); return;
+    case A_VCMOV:   /* bit 19 selects vcmovf, bits 16..18 the condition */
+        fprintf(f, "%spsp_vcmov(%u, %u, %u, %u, %u);\n", ind, in->vd, in->vs,
+                (in->raw >> 16) & 7, (in->raw >> 19) & 1, in->vsize);
+        return;
     case A_VSGE: case A_VSLT: case A_VSCMP: case A_VHDP: case A_VCRS: case A_VCRSP: case A_VDET: {
         const char *fn = in->op == A_VSGE ? "vsge" : in->op == A_VSLT ? "vslt" :
                          in->op == A_VSCMP ? "vscmp" : in->op == A_VHDP ? "vhdp" :

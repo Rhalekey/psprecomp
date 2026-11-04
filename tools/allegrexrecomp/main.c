@@ -458,6 +458,50 @@ static int cmd_cover(const char *path) {
 /* Load a decrypted module and run discovery over it. On success the caller
  * owns both `b` (psp_blob_free) and `an` (a_analysis_free). Shared by `funcs`
  * and `emit`, which differ only in what they do with the result. */
+/* Find static initialisers kept in .data, where Metrowerks puts them.
+ *
+ * The compiler emits them just below a table of pointers to them, so the table
+ * identifies them where a scan could not: a run of ascending pointers into the
+ * data before the run, starting at a function prologue, with its last target
+ * close by. On Project Diva that matches one table of 11 entries out of 4,532
+ * pointers into .data. The rest of the table may be thunks, which have no
+ * prologue of their own, so all of it is taken once the first entry qualifies.
+ * Returns the number found, which may exceed `max`. */
+#define INIT_TABLE_REACH 0x10000u
+
+static uint32_t image_word(const a_analysis *an, uint32_t addr) {
+    const uint8_t *p = an->image + (addr - an->image_base);
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static int static_init_seeds(const a_analysis *an, uint32_t text_end, uint32_t *out, int max) {
+    if (!an->image || text_end < an->image_base) return 0;
+    const uint32_t end = an->image_base + (an->image_size & ~3u);
+    int found = 0;
+    for (uint32_t a = (text_end + 3u) & ~3u; a + 4 <= end; a += 4) {
+        uint32_t first = image_word(an, a);
+        if (first < text_end || first >= a || (first & 3)) continue;
+
+        uint32_t n = 1, last = first;
+        while (a + (n + 1) * 4 <= end) {
+            const uint32_t v = image_word(an, a + n * 4);
+            if (v <= last || v >= a || (v & 3)) break;
+            last = v;
+            n++;
+        }
+        const uint32_t head = image_word(an, first);
+        const int prologue = (head >> 16) == 0x27BDu && (head & 0x8000u);
+        if (n >= 2 && prologue && a - last < INIT_TABLE_REACH) {
+            for (uint32_t i = 0; i < n; i++) {
+                if (found < max) out[found] = image_word(an, a + i * 4);
+                found++;
+            }
+        }
+        a += (n - 1) * 4;
+    }
+    return found;
+}
+
 static int load_and_discover(const char *path, psp_blob *b, elf_info *e,
                              a_analysis *an, int *out_nseeds, int *out_nexports,
                              int *out_nptr, int *out_scanned) {
@@ -481,16 +525,6 @@ static int load_and_discover(const char *path, psp_blob *b, elf_info *e,
         an->base = e->seg[0].addr;
         an->size = e->seg[0].filesz;
     } else {
-        an->code = b->data + e->text_offset;
-        an->base = e->text_addr;
-        an->size = e->text_size;
-    }
-    /* A statically linked module has no relocations, so its function pointers
-     * are found by scanning data for anything that looks like a code address.
-     * With the whole segment as the extent, every pointer to a global passes
-     * that test and .data gets recompiled as code. Its section headers already
-     * say where the code is, so use them. */
-    if (e->type != ET_PSP_PRX && e->text_from_section) {
         an->code = b->data + e->text_offset;
         an->base = e->text_addr;
         an->size = e->text_size;
@@ -553,15 +587,27 @@ static int load_and_discover(const char *path, psp_blob *b, elf_info *e,
 
         if (data_off < seg_end && (size_t)seg_end <= b->size) {
             uint32_t region_len = seg_end - data_off;
-            int avail = a_scan_data_pointers(an, b->data + data_off, region_len, NULL, 0);
 
-            uint32_t *bigger = (uint32_t *)realloc(seeds, (size_t)(nseeds + avail) * sizeof *seeds);
+            /* Only `.text` may be seeded this way. Measured against the whole
+             * segment, every pointer to a global passes the test and .data gets
+             * recompiled as code. Code outside .text is found by its table. */
+            a_analysis text = *an;
+            if (e->type != ET_PSP_PRX && e->text_from_section) {
+                text.code = b->data + e->text_offset;
+                text.base = e->text_addr;
+                text.size = e->text_size;
+            }
+            int avail = a_scan_data_pointers(&text, b->data + data_off, region_len, NULL, 0);
+            int ninit = static_init_seeds(an, e->text_addr + e->text_size, NULL, 0);
+
+            uint32_t *bigger = (uint32_t *)realloc(seeds, (size_t)(nseeds + avail + ninit) * sizeof *seeds);
             if (bigger) {
                 seeds = bigger;
-                nptr = a_scan_data_pointers(an, b->data + data_off, region_len,
+                nptr = a_scan_data_pointers(&text, b->data + data_off, region_len,
                                             seeds + nseeds, avail);
                 if (nptr > avail) nptr = avail;
                 nseeds += nptr;
+                nseeds += static_init_seeds(an, e->text_addr + e->text_size, seeds + nseeds, ninit);
                 if (out_scanned) *out_scanned = 1;
             }
         }

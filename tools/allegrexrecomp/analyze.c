@@ -113,6 +113,10 @@ static void note_call(walk_ctx *c, uint32_t target) {
         return;
     }
     if (!a_in_range(c->an, target)) return;
+    /* A target only reached by walking (a call from outside the scanned range)
+     * is not in the entry set yet, and a re-walk starts from that set alone. */
+    if (c->an->scan_calls && !c->entry_map[word_index(c->an, target)])
+        u32_push(c->cross, target);
     u32_push(c->func_queue, target);
 }
 
@@ -138,7 +142,16 @@ static int trace_function(walk_ctx *c, uint32_t entry, a_func *out) {
 
         while (a_in_range(an, a)) {
             uint32_t idx = word_index(an, a);
-            if (c->seen[idx] & SEEN_CODE) break;    /* already walked */
+            if (c->seen[idx] & SEEN_CODE) {         /* already walked */
+                /* Running into another function's block needs the same promotion
+                 * as branching to it, or the emitter has nowhere to fall to. */
+                if (c->owner[idx] != c->cur_owner) {
+                    if (!c->entry_map[idx]) u32_push(c->cross, a);
+                } else if ((c->seen[idx] & SEEN_SLOT) && a_in_range(an, a + 4)) {
+                    u32_push(&blocks, a + 4);
+                }
+                break;
+            }
 
             /* Arriving at a different function's entry means we walked off the
              * end of this one — a tail call, or a function that ends without a
@@ -277,7 +290,17 @@ static int trace_function(walk_ctx *c, uint32_t entry, a_func *out) {
                 if (in.has_target && a_in_range(an, in.target)) {
                     uint32_t bi = word_index(an, in.target);
                     int is_case = an->case_map && an->case_map[bi] && !c->entry_map[bi];
-                    if (is_case || (in.target <= a && a != entry && !is_known_entry(c, in.target))) {
+                    /* With a whole module's entries known, a forward `j` that
+                     * crosses none of them stays inside this function. Compilers
+                     * that use `j` for local flow would otherwise split here. */
+                    int is_local = 0;
+                    if (an->case_map && in.target > a && !c->entry_map[bi]) {
+                        is_local = 1;
+                        for (uint32_t t = a + 4; t < in.target; t += 4)
+                            if (c->entry_map[word_index(an, t)]) { is_local = 0; break; }
+                    }
+                    if (is_case || is_local ||
+                        (in.target <= a && a != entry && !is_known_entry(c, in.target))) {
                         /* Backward `j` -- a loop back-edge into this function's
                          * own blocks, unless another walk already claimed the
                          * target. Then the two functions share a block, exactly

@@ -679,6 +679,18 @@ void psp_vmmul(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
 /* Compare, writing one condition bit per lane plus the any/all summary bits
  * that vcmov and the bvt/bvf branches read. Conditions 8-15 test vs alone:
  * zero, NaN, infinity, and NaN-or-infinity, then the same four negated. */
+void psp_vcmov(uint32_t vd, uint32_t vs, uint32_t cc, uint32_t if_false, int size) {
+    int d[4], s[4];
+    float v[4];
+    psp_vfpu_regs(vd, size, d);
+    psp_vfpu_regs(vs, size, s);
+    for (int i = 0; i < size; i++) v[i] = psp_cpu.v[s[i]];   /* vd may overlap vs */
+    for (int i = 0; i < size && cc != 7; i++) {
+        const uint32_t bit = cc == 6 ? (uint32_t)i : cc;
+        if (((psp_cpu.vfpu_cc >> bit) & 1u) != (if_false & 1u)) psp_cpu.v[d[i]] = v[i];
+    }
+}
+
 void psp_vcmp(uint32_t cond, uint32_t vs, uint32_t vt, int size) {
     float s[4], t[4];
     read_src(0, vs, size, s);

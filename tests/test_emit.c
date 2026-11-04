@@ -1210,6 +1210,20 @@ int main(void) {
     check_loop_stays_one_function();
     check_jump_table_stays_in_function();
 
+    {
+        static const uint32_t CODE_CMOV[] = {
+            0xD2A00102u,   /* vcmovt.s S002, S001, 0 */
+            0x03E00008u,   /* jr $ra                 */
+            0x00000000u,
+        };
+        uint32_t seed = BASE;
+        char *csrc = emit_synthetic("t_cmov", CODE_CMOV, 3, &seed, 1, NULL);
+        if (csrc) {
+            expect_contains(csrc, "psp_vcmov(2, 1, 0, 0, 1);", "vcmov is emitted");
+            free(csrc);
+        }
+    }
+
     if (failures) {
         printf("\n%d check(s) failed\n", failures);
         return 1;

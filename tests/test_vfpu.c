@@ -276,6 +276,23 @@ static void test_more_ops(void) {
     CHECK_F(out[1], 0.0f, "cross y");
     CHECK_F(out[2], 1.0f, "cross z");
 
+    /* vcmov moves only when the condition bit matches. */
+    {
+        float got;
+        uint32_t bits;
+        psp_mtv(0, 0x3F800000u);    /* 1.0 */
+        psp_mtv(1, 0);
+        psp_cpu.vfpu_cc = 0;
+        psp_vcmov(1, 0, 0, 0, 1);
+        bits = psp_mfv(1);
+        memcpy(&got, &bits, sizeof got);
+        CHECK_F(got, 0.0f, "vcmovt with the bit clear moves nothing");
+        psp_vcmov(1, 0, 0, 1, 1);
+        bits = psp_mfv(1);
+        memcpy(&got, &bits, sizeof got);
+        CHECK_F(got, 1.0f, "vcmovf with the bit clear moves");
+    }
+
     /* vidt writes the identity column the register names: C730 (0x1F) is
      * (0, 0, 0, 1), C710 (0x1D) is (0, 1, 0, 0). WTF keeps s733 = 1 this way. */
     psp_vidt(0x1F, 4);
