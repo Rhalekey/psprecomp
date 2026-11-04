@@ -141,8 +141,9 @@ void psp_sysmem_set_range(uint32_t lo, uint32_t hi);
 void psp_display_init(void);
 void psp_display_register(void);
 void psp_display_reset(void);
-/* Hold vblank waits to the real refresh rate. Off by default, for tests. */
-void psp_display_set_pacing(int on);
+/* Hold vblank waits to this many per second, changeable at any time. 0, the
+ * default, does not hold them at all. */
+void psp_display_set_refresh_rate(double hz);
 int      psp_display_capture(const char *path);
 /* The front buffer as 480x272 pixels of 0xAABBGGRR; -1 before the game has
  * set a framebuffer. */

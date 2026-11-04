@@ -107,13 +107,14 @@ static void hle_SetFrameBuf(void) {
  * the most useful single number to have during bring-up, because it tells you
  * whether the game is looping or stuck -- and the yield is what lets the
  * threads that feed that loop run. */
-static int g_pacing;
-
-void psp_display_set_pacing(int on) { g_pacing = on; }
-
 /* Hold a vblank wait until the next refresh. Nothing else slows a game down, and
- * one that counts frames to time things would otherwise race through them. */
-#define VBLANK_US 16683u   /* 59.94 Hz */
+ * one that counts frames to time things would otherwise race through them.
+ * The rate can change while the game runs; 0 means no pacing. */
+static volatile uint32_t g_frame_us;
+
+void psp_display_set_refresh_rate(double hz) {
+    g_frame_us = hz > 0 ? (uint32_t)(1000000.0 / hz) : 0;
+}
 
 static uint64_t display_now_us(void) {
     struct timespec ts;
@@ -121,19 +122,20 @@ static uint64_t display_now_us(void) {
     return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
 }
 
-static void pace_vblank(void) {
+static void pace_vblank(uint32_t frame_us) {
     static uint64_t next;
     uint64_t now = display_now_us();
-    if (now > next + VBLANK_US) next = now;       /* fell behind: do not catch up */
+    if (now > next + frame_us) next = now;        /* fell behind: do not catch up */
     while (now < next) {
         psp_threadman_yield();
         now = display_now_us();
     }
-    next += VBLANK_US;
+    next += frame_us;
 }
 
 static void hle_WaitVblank(void) {
-    if (g_pacing) pace_vblank();
+    const uint32_t frame_us = g_frame_us;
+    if (frame_us) pace_vblank(frame_us);
     g_vblank_count++;
     /* A frame boundary is the guest asking for time to pass, so it is the third
      * point where an interrupt is delivered (src/hle/intrman.c) -- and, on one
