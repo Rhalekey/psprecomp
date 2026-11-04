@@ -16,6 +16,21 @@
 #include "cpu.h"
 #include "mem.h"
 
+/* Every load and store in a game goes through these, so a release build of its
+ * generated code resolves RAM inline. It gives up the memory watch instruments,
+ * which is why a host opts in rather than getting it by default. */
+#ifdef PSPRECOMP_FAST_MEMORY
+#include "mem_fast.h"
+#define psp_read8     psp_fast_read8
+#define psp_read16    psp_fast_read16
+#define psp_read32    psp_fast_read32
+#define psp_read_f32  psp_fast_read_f32
+#define psp_write8    psp_fast_write8
+#define psp_write16   psp_fast_write16
+#define psp_write32   psp_fast_write32
+#define psp_write_f32 psp_fast_write_f32
+#endif
+
 #include <stdint.h>
 #include <math.h>      /* NAN / INFINITY: a VFPU immediate can encode either */
 

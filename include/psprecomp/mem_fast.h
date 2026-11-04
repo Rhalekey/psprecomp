@@ -49,6 +49,12 @@ static inline float psp_fast_read_f32(uint32_t addr) {
     return v;
 }
 
+static inline void psp_fast_write8(uint32_t addr, uint8_t v) {
+    uint8_t *p = psp_fast_ptr(addr, 1);
+    if (p) *p = v;
+    else psp_write8(addr, v);
+}
+
 static inline void psp_fast_write16(uint32_t addr, uint16_t v) {
     uint8_t *p = psp_fast_ptr(addr, 2);
     if (p) memcpy(p, &v, sizeof v);
@@ -59,6 +65,12 @@ static inline void psp_fast_write32(uint32_t addr, uint32_t v) {
     uint8_t *p = psp_fast_ptr(addr, 4);
     if (p) memcpy(p, &v, sizeof v);
     else psp_write32(addr, v);
+}
+
+static inline void psp_fast_write_f32(uint32_t addr, float v) {
+    uint8_t *p = psp_fast_ptr(addr, 4);
+    if (p) memcpy(p, &v, sizeof v);
+    else psp_write_f32(addr, v);
 }
 
 #endif

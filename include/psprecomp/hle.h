@@ -262,6 +262,8 @@ uint64_t psp_threadman_vtime_us(void);
 uint64_t psp_threadman_handovers(void);
 uint64_t psp_threadman_handover_expired(void);
 void     psp_threadman_dump(FILE *out);
+/* Where each thread's real time has gone: running, queueing for the CPU, asleep. */
+void     psp_threadman_dump_times(FILE *out);
 
 /* ---- callbacks -----------------------------------------------------------
  *

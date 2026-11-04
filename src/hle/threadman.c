@@ -125,6 +125,11 @@ typedef struct {
     char     name[32];
     uint32_t entry;
     uint32_t priority;
+    /* Real time spent asleep, by what it was waiting for, and then queueing for
+     * the CPU once ready. What is left of a thread's life is running. */
+    uint64_t us_waiting[16];
+    uint64_t us_queueing;
+    uint64_t us_started;
     uint32_t stack_size;
     uint32_t stack_base;   /* low address of the allocation */
     uint32_t attr;
@@ -390,6 +395,8 @@ static int handover_wait_locked(void) {
 static int park_us(uint64_t timeout_us) {
     psp_thread *t = g_tls_me;
     int depth = g_tls_depth;
+    const uint64_t parked_at = host_deadline_us();
+    const int waiting_for = t ? t->wait_kind : 0;
 
     if (t) {
         t->ctx = psp_cpu;               /* this IS the context switch */
@@ -430,6 +437,7 @@ static int park_us(uint64_t timeout_us) {
         host_mutex_unlock(&t->wlock);
     }
 
+    const uint64_t ready_at = host_deadline_us();
     if (depth) {
         host_mutex_lock(&g_baton_m);
         /* The handover, before the CPU is taken back: a started thread that has
@@ -452,7 +460,14 @@ static int park_us(uint64_t timeout_us) {
 
     if (timeout_us) g_vtime_us += timeout_us;
     g_parks++;
-    if (t) { t->parks++; psp_cpu = t->ctx; g_current = t; }
+    if (t) {
+        const uint64_t resumed_at = host_deadline_us();
+        t->us_waiting[waiting_for & 15] += ready_at - parked_at;
+        t->us_queueing += resumed_at - ready_at;
+        t->parks++;
+        psp_cpu = t->ctx;
+        g_current = t;
+    }
     TRACE_SCHED("park done: %s woken=%d\n", t ? t->name : "(none)", woken);
     return woken;
 }
@@ -654,6 +669,29 @@ void psp_threadman_kick(void) {
         host_mutex_unlock(&t->wlock);
         if (hit) { wake_thread(t); return; }
     }
+#endif
+}
+
+void psp_threadman_dump_times(FILE *out) {
+#if PSPRECOMP_REAL_THREADS
+    const uint64_t now = host_deadline_us();
+    fprintf(out, "thread time, %%: run  queue | sema  flag delay  end\n");
+    for (int i = 0; i < MAX_THREADS; i++) {
+        const psp_thread *t = &g_thread[i];
+        if (!t->used || !t->us_started || now <= t->us_started) continue;
+        const double life = (double)(now - t->us_started);
+        uint64_t asleep = 0;
+        for (int k = 0; k < 16; k++) asleep += t->us_waiting[k];
+        const double run = life - (double)asleep - (double)t->us_queueing;
+        fprintf(out, "  %-20s %5.1f %5.1f | %5.1f %5.1f %5.1f %5.1f\n", t->name,
+                100.0 * run / life, 100.0 * (double)t->us_queueing / life,
+                100.0 * (double)t->us_waiting[W_SEMA] / life,
+                100.0 * (double)t->us_waiting[W_FLAG] / life,
+                100.0 * (double)t->us_waiting[W_DELAY] / life,
+                100.0 * (double)t->us_waiting[W_THREAD_END] / life);
+    }
+#else
+    (void)out;
 #endif
 }
 
@@ -865,6 +903,9 @@ static void *guest_thread_main(void *arg) {
     baton_acquire();                        /* wait for our turn on the CPU */
     g_tls_me = t;
     g_current = t;
+    t->us_started = host_deadline_us();
+    memset(t->us_waiting, 0, sizeof t->us_waiting);
+    t->us_queueing = 0;
 
     /* A fresh register file: a thread must not see the leftovers of whatever
      * ran before it. $sp and the o32 argument registers are the firmware's to
