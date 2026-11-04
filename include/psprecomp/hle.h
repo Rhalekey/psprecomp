@@ -191,6 +191,17 @@ void psp_io_reset(void);
 void psp_io_set_root(const char *root);
 /* Where disc0:/ lives, when it is not <root>/disc. */
 void psp_io_set_disc_root(const char *path);
+/* A file with no file behind it, or none the game should see as it is. */
+typedef struct {
+    uint64_t size;
+    void *ctx;
+    size_t (*read)(void *ctx, uint64_t offset, void *dst, size_t n);
+    void (*close)(void *ctx);
+} psp_io_virtual;
+/* Asked before a file is opened for reading. Returns 1 and fills `out` to provide
+ * it. This is what lets a host replace a game's files without changing them. */
+typedef int (*psp_io_open_hook)(const char *guest, const char *host, psp_io_virtual *out);
+void psp_io_set_open_hook(psp_io_open_hook hook);
 /* Where a guest path such as ms0:/PSP/... lands on the host. */
 void psp_io_host_path(const char *guest, char *out, size_t cap);
 uint64_t psp_io_bytes_read(void);

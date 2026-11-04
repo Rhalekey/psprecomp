@@ -950,6 +950,57 @@ static void test_callbacks(void) {
           (unsigned long long)psp_power_registered());
 }
 
+static void put_guest_string(uint32_t addr, const char *s) {
+    do psp_write8(addr++, (uint8_t)*s); while (*s++);
+}
+
+/* A provided file behaves like a real one through the ordinary calls. */
+static const char g_virtual_text[] = "provided by the host";
+static int g_virtual_closed;
+
+static size_t virtual_read(void *ctx, uint64_t offset, void *dst, size_t n) {
+    (void)ctx;
+    const size_t size = sizeof g_virtual_text - 1;
+    if (offset >= size) return 0;
+    if (n > size - offset) n = size - (size_t)offset;
+    memcpy(dst, g_virtual_text + offset, n);
+    return n;
+}
+
+static void virtual_close(void *ctx) { (void)ctx; g_virtual_closed++; }
+
+static int virtual_hook(const char *guest, const char *host, psp_io_virtual *out) {
+    (void)host;
+    if (strcmp(guest, "disc0:/virtual.bin") != 0) return 0;
+    out->size = sizeof g_virtual_text - 1;
+    out->ctx = NULL;
+    out->read = virtual_read;
+    out->close = virtual_close;
+    return 1;
+}
+
+static void test_provided_files(void) {
+    const uint32_t PATH = 0x08850000u, BUF = PATH + 0x100u;
+    psp_io_set_open_hook(virtual_hook);
+    put_guest_string(PATH, "disc0:/virtual.bin");
+    const uint32_t fd = call(psp_nid("sceIoOpen"), PATH, 1, 0, 0);
+    CHECK(fd >= 3 && fd < 0x80000000u, "a provided file opens, got 0x%08X", fd);
+
+    psp_cpu.r[PSP_REG_T0] = 2;     /* SEEK_END */
+    CHECK(call(psp_nid("sceIoLseek"), fd, 0, 0, 0) == sizeof g_virtual_text - 1, "it has its size");
+    psp_cpu.r[PSP_REG_T0] = 0;
+    CHECK(call(psp_nid("sceIoLseek"), fd, 0, 9, 0) == 9, "it can be seeked");
+    CHECK(call(psp_nid("sceIoRead"), fd, BUF, 4, 0) == 4, "and read");
+    CHECK(psp_read8(BUF) == 'b' && psp_read8(BUF + 3) == 't', "from where it was seeked");
+    CHECK(call(psp_nid("sceIoRead"), fd, BUF, 100, 0) == sizeof g_virtual_text - 1 - 13, "up to its end");
+    call(psp_nid("sceIoClose"), fd, 0, 0, 0);
+    CHECK(g_virtual_closed == 1, "and closed");
+
+    put_guest_string(PATH, "disc0:/not-a-virtual-file.bin");
+    CHECK(call(psp_nid("sceIoOpen"), PATH, 1, 0, 0) >= 0x80000000u, "anything else is still looked for on disk");
+    psp_io_set_open_hook(NULL);
+}
+
 /* Run one savedata request through the states a game polls, as a game does. */
 static uint32_t savedata_request(uint32_t param, uint32_t mode) {
     psp_write32(param + 0x30, mode);
@@ -962,10 +1013,6 @@ static uint32_t savedata_request(uint32_t param, uint32_t mode) {
     CHECK(call(psp_nid("sceUtilitySavedataGetStatus"), 0, 0, 0, 0) == 4, "then shuts down");
     CHECK(call(psp_nid("sceUtilitySavedataGetStatus"), 0, 0, 0, 0) == 0, "and is gone");
     return psp_read32(param + 0x1C);
-}
-
-static void put_guest_string(uint32_t addr, const char *s) {
-    do psp_write8(addr++, (uint8_t)*s); while (*s++);
 }
 
 /* What the game wrote comes back byte for byte, through a slot list as well. */
@@ -1031,6 +1078,7 @@ int main(void) {
     test_sub_interrupts();
     test_callbacks();
     test_savedata();
+    test_provided_files();
 
     psp_mem_free();
 

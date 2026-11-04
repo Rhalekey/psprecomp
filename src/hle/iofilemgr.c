@@ -39,6 +39,10 @@ typedef struct {
     /* The async calls run at once; this is what the next wait or poll reports. */
     int async_pending;
     uint64_t async_result;
+    /* A file a host provides instead of one on disk: `f` is then NULL. */
+    int is_virtual;
+    psp_io_virtual v;
+    uint64_t pos;
 } io_file;
 
 typedef struct {
@@ -58,6 +62,9 @@ static io_dir  g_dir[MAX_DIRS];
 static char    g_root[512];
 static char    g_disc_root[512];
 static char    g_cwd[512];
+static psp_io_open_hook g_open_hook;
+
+void psp_io_set_open_hook(psp_io_open_hook hook) { g_open_hook = hook; }
 static uint64_t g_bytes_read;
 
 void psp_io_set_root(const char *root) {
@@ -67,6 +74,8 @@ void psp_io_set_root(const char *root) {
 void psp_io_reset(void) {
     for (int i = 0; i < MAX_FILES; i++) {
         if (g_file[i].used && g_file[i].f) fclose(g_file[i].f);
+        if (g_file[i].used && g_file[i].is_virtual) g_file[i].v.close(g_file[i].v.ctx);
+        g_file[i].is_virtual = 0;
         g_file[i].used = 0;
         g_file[i].f = NULL;
     }
@@ -131,14 +140,20 @@ static void hle_Open(void) {
     else if ((flags & PSP_O_RDWR) == PSP_O_RDWR) mode = "r+b";
     else if (flags & PSP_O_WRONLY)            mode = (flags & PSP_O_CREAT) ? "wb" : "r+b";
 
-    FILE *f = fopen(host, mode);
-    if (!f && (flags & PSP_O_CREAT)) f = fopen(host, "w+b");
+    /* A host may provide the file, unless the game means to write to it. */
+    psp_io_virtual provided;
+    int is_virtual = 0;
+    if (g_open_hook && !(flags & (PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC | PSP_O_APPEND)))
+        is_virtual = g_open_hook(guest, host, &provided);
+
+    FILE *f = is_virtual ? NULL : fopen(host, mode);
+    if (!f && !is_virtual && (flags & PSP_O_CREAT)) f = fopen(host, "w+b");
     /* PSPRECOMP_TRACE_IO=1 names every open and whether it worked. A game
      * that cannot find its assets usually does not crash; it waits. */
     if (getenv("PSPRECOMP_TRACE_IO"))
         fprintf(stderr, "io: open \"%s\" -> \"%s\" flags 0x%X: %s\n",
-                guest, host, flags, f ? "ok" : "not found");
-    if (!f) {
+                guest, host, flags, is_virtual ? "provided" : f ? "ok" : "not found");
+    if (!f && !is_virtual) {
         /* A failed open is normal (a game probing for a save file) and is not
          * worth a warning, but the mapped path is worth knowing when a game
          * cannot find assets it expects. */
@@ -151,10 +166,14 @@ static void hle_Open(void) {
         g_file[i].f = f;
         g_file[i].used = 1;
         g_file[i].async_pending = 0;
+        g_file[i].is_virtual = is_virtual;
+        g_file[i].pos = 0;
+        if (is_virtual) g_file[i].v = provided;
         psp_ret((uint32_t)(i + 3));   /* 0-2 are reserved for the std streams */
         return;
     }
-    fclose(f);
+    if (is_virtual) provided.close(provided.ctx);
+    else fclose(f);
     psp_ret(0x80010018);              /* too many open files */
 }
 
@@ -167,8 +186,10 @@ static io_file *fd_arg(void) {
 static void hle_Close(void) {
     io_file *h = fd_arg();
     if (!h) { psp_ret(0x80020323); return; }
-    fclose(h->f);
+    if (h->is_virtual) h->v.close(h->v.ctx);
+    else fclose(h->f);
     h->f = NULL;
+    h->is_virtual = 0;
     h->used = 0;
     psp_ret(0);
 }
@@ -185,7 +206,13 @@ static void hle_Read(void) {
     uint8_t *tmp = (uint8_t *)malloc(size);
     if (!tmp) { psp_ret(0x80020190); return; }
 
-    size_t got = fread(tmp, 1, size, h->f);
+    size_t got;
+    if (h->is_virtual) {
+        got = h->v.read(h->v.ctx, h->pos, tmp, size);
+        h->pos += got;
+    } else {
+        got = fread(tmp, 1, size, h->f);
+    }
     if (got && psp_mem_write_block(dst, tmp, (uint32_t)got) != 0) {
         /* Fall back to byte-at-a-time so a partially mapped destination still
          * gets what fits, and the bad-access counter records the rest. */
@@ -208,6 +235,7 @@ static void hle_Write(void) {
         return;
     }
     if (!h) { psp_ret(0x80020323); return; }
+    if (h->is_virtual) { psp_ret(0x80010009); return; }   /* not open for writing */
 
     uint8_t *tmp = (uint8_t *)malloc(size ? size : 1);
     if (!tmp) { psp_ret(0x80020190); return; }
@@ -226,6 +254,16 @@ static void hle_Lseek(void) {
     uint64_t off = (uint64_t)psp_arg(2) | ((uint64_t)psp_arg(3) << 32);
     uint32_t whence = psp_arg(4);
     if (!h) { psp_ret(0x80020323); return; }
+
+    if (h->is_virtual) {
+        const int64_t base = whence == 1 ? (int64_t)h->pos : whence == 2 ? (int64_t)h->v.size : 0;
+        const int64_t to = base + (int64_t)off;
+        if (to < 0) { psp_ret(0xFFFFFFFFu); return; }
+        h->pos = (uint64_t)to;
+        psp_cpu.r[PSP_REG_V0] = (uint32_t)h->pos;
+        psp_cpu.r[PSP_REG_V1] = (uint32_t)(h->pos >> 32);
+        return;
+    }
 
     int w = (whence == 1) ? SEEK_CUR : (whence == 2) ? SEEK_END : SEEK_SET;
     if (fseek(h->f, (long)(int64_t)off, w) != 0) { psp_ret(0xFFFFFFFFu); return; }
@@ -290,7 +328,19 @@ static void hle_Getstat(void) {
     while (n > 1 && (host[n - 1] == '/' || host[n - 1] == '\\')) host[--n] = '\0';
 
     struct stat st;
+    memset(&st, 0, sizeof st);
     int found = stat(host, &st) == 0;
+
+    /* A provided file has the size the game will find when it opens it. */
+    psp_io_virtual provided;
+    uint64_t size = (uint64_t)st.st_size;
+    int is_virtual = g_open_hook && g_open_hook(guest, host, &provided);
+    if (is_virtual) {
+        size = provided.size;
+        provided.close(provided.ctx);
+        st.st_mode = S_IFREG;
+        found = 1;
+    }
     if (getenv("PSPRECOMP_TRACE_IO"))
         fprintf(stderr, "io: getstat \"%s\" -> \"%s\": %s\n", guest, host, found ? "ok" : "not found");
     if (!found) { psp_ret(0x80010002); return; }
@@ -299,7 +349,8 @@ static void hle_Getstat(void) {
     for (uint32_t i = 0; i < SCE_IO_STAT_SIZE; i++) psp_write8(out + i, 0);
     psp_write32(out, (is_dir ? 0x1000u : 0x2000u) | 0x1FFu);
     psp_write32(out + 4, is_dir ? 0x10u : 0x20u);
-    psp_write32(out + 8, (uint32_t)st.st_size);
+    psp_write32(out + 8, (uint32_t)size);
+    psp_write32(out + 12, (uint32_t)(size >> 32));
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
