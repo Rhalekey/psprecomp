@@ -21,6 +21,8 @@ enum {
 };
 
 static volatile LONG g_closed;
+static volatile LONG g_external;     /* something else presents to the window */
+static HWND g_hwnd;
 static int g_scale;
 static const char *g_title = "psprecomp";
 static uint32_t g_px[W * H];
@@ -66,6 +68,7 @@ static uint32_t pad(uint8_t *ax, uint8_t *ay) {
 static void paint(HWND h) {
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(h, &ps);
+    if (g_external) { EndPaint(h, &ps); return; }
     RECT r;
     GetClientRect(h, &r);
     const int cw = r.right, ch = r.bottom;
@@ -106,7 +109,7 @@ static LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         uint32_t b = pad(&ax, &ay);
         if (GetForegroundWindow() == h) b |= keyboard();   /* keys only when focused */
         psp_ctrl_set(b, ax, ay);
-        InvalidateRect(h, NULL, FALSE);
+        if (!g_external) InvalidateRect(h, NULL, FALSE);
         return 0;
     }
     case WM_PAINT:      paint(h); return 0;
@@ -120,6 +123,7 @@ static DWORD WINAPI window_main(LPVOID arg) {
     HANDLE ready = (HANDLE)arg;
     WNDCLASSA wc;
     ZeroMemory(&wc, sizeof wc);
+    wc.style = CS_OWNDC;
     wc.lpfnWndProc = proc;
     wc.hInstance = GetModuleHandleA(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -142,6 +146,7 @@ static DWORD WINAPI window_main(LPVOID arg) {
                            CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
                            NULL, NULL, wc.hInstance, NULL);
     if (!h) { InterlockedExchange(&g_closed, 1); SetEvent(ready); return 1; }
+    g_hwnd = h;
     SetTimer(h, 1, 16, NULL);
     SetEvent(ready);
 
@@ -167,6 +172,8 @@ int psp_window_start(const char *title, int scale) {
 }
 
 int psp_window_closed(void) { return g_closed != 0; }
+void *psp_window_handle(void) { return g_hwnd; }
+void psp_window_set_external(int on) { InterlockedExchange(&g_external, on); }
 
 #else
 
@@ -174,5 +181,7 @@ int psp_window_closed(void) { return g_closed != 0; }
  * obvious next step. */
 int psp_window_start(const char *title, int scale) { (void)title; (void)scale; return -1; }
 int psp_window_closed(void) { return 0; }
+void *psp_window_handle(void) { return 0; }
+void psp_window_set_external(int on) { (void)on; }
 
 #endif

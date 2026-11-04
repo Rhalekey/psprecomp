@@ -165,6 +165,8 @@ uint64_t psp_ge_pixels(void);
  * the CPU. Needs real threads; without them, or by default, they run inside the
  * enqueue. Turn it on before any list is queued. */
 void     psp_ge_set_async(int on);
+/* The game has switched to showing the buffer at `addr`. */
+void     psp_ge_flip(uint32_t addr, uint32_t stride, int fmt);
 /* Host time spent running display lists: the cost of software rendering. */
 uint64_t psp_ge_busy_us(void);
 /* Run the callbacks finished lists have raised. Called at every wait. */

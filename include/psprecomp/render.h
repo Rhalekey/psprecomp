@@ -24,6 +24,10 @@ typedef struct {
     uint32_t rgba;
     float    u, v;
     int      behind;         /* behind the eye: triangles using it are dropped */
+    /* The same position before the division by w, for a backend that clips and
+     * interpolates with perspective: x and y are pixels times w, z is depth times
+     * w. In through mode w is 1. */
+    float    px, py, pz, pw;
 } psp_vertex;
 
 /* GE primitive types, from the PRIM argument's type field. */
@@ -65,6 +69,7 @@ typedef struct {
     int      tex_func;       /* TFUNC bits 0-2 */
     int      tex_alpha;      /* TFUNC bit 8: texture alpha is used */
     int      tex_double;     /* TFUNC bit 16: colour doubling */
+    int      tex_min_linear, tex_mag_linear;   /* TFLT, without mipmaps */
     uint32_t tex_env;        /* TEC, for the blend function */
 
     const uint8_t *clut;     /* bytes captured at the last CLOAD */
@@ -112,6 +117,15 @@ typedef struct {
 
     /* sceDisplaySetFrameBuf -- show what has accumulated. */
     void (*present)(void);
+
+    /* Optional, for a backend drawing on the GE's own thread. thread_init runs
+     * there before anything else; a failure falls back to the software backend.
+     * flip shows the buffer at `addr`, in order with the lists around it. A
+     * backend whose pixels never reach guest VRAM copies a frame into `out`,
+     * 480x272 of 0xAABBGGRR, and returns 0. */
+    int  (*thread_init)(void);
+    void (*flip)(uint32_t addr, uint32_t stride, int fmt);
+    int  (*read_frame)(uint32_t *out);
 } psp_render_backend;
 
 /* Select a backend by name ("software", "null", ...). Returns 0 on success,
@@ -124,6 +138,11 @@ const psp_render_backend *psp_render_current(void);
 /* Backends provided by the runtime. */
 extern const psp_render_backend psp_render_software;
 extern const psp_render_backend psp_render_null;
+/* OpenGL 3.3, with real threads on Windows. Needs the host window and the GE's
+ * thread, so select it before psp_ge_set_async(1). */
+extern const psp_render_backend psp_render_gl;
+/* How many times the PSP's resolution targets are drawn at. Set it first. */
+void psp_render_gl_set_scale(int scale);
 
 /* Pixels written by the active backend -- the proof of life during bring-up. */
 uint64_t psp_render_pixels(void);

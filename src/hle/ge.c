@@ -28,6 +28,7 @@
 #include "psprecomp/dispatch.h"
 #include "psprecomp/render.h"
 #include "psprecomp/mem_fast.h"
+#include "psprecomp/window.h"
 #include "ge_thread.h"
 
 #include <math.h>
@@ -75,6 +76,7 @@
 #define GE_ZBW          0x9F
 #define GE_ZTST         0xDE
 #define GE_ZMSK         0xE7
+#define GE_TFLT         0xC6    /* texture filters */
 #define GE_BCE          0x1D    /* back-face culling on or off */
 #define GE_CULL         0x9B    /* which way round a front face runs */
 #define GE_BOFS         0x2A
@@ -279,7 +281,7 @@ static void xf_reset(void) {
 /* Model space to screen pixels. Returns 0 for a point behind the eye.
  * ponytail: no near-plane clipping, so a primitive with any vertex behind the
  * eye is dropped whole; add clipping when 3D scenes lose triangles. */
-static int transform(const float p[3], float *sx, float *sy, float *sz) {
+static int transform(const float p[3], float *sx, float *sy, float *sz, psp_vertex *out) {
     const float *W = g_xf.world, *V = g_xf.view, *P = g_xf.proj;
     float w[3], v[3], c[4];
     for (int r = 0; r < 3; r++)
@@ -288,6 +290,10 @@ static int transform(const float p[3], float *sx, float *sy, float *sz) {
         v[r] = V[r] * w[0] + V[3 + r] * w[1] + V[6 + r] * w[2] + V[9 + r];
     for (int r = 0; r < 4; r++)
         c[r] = P[r] * v[0] + P[4 + r] * v[1] + P[8 + r] * v[2] + P[12 + r];
+    out->px = c[0] * g_xf.xscale + c[3] * (g_xf.xpos - g_xf.offx);
+    out->py = c[1] * g_xf.yscale + c[3] * (g_xf.ypos - g_xf.offy);
+    out->pz = c[2] * g_xf.zscale + c[3] * g_xf.zpos;
+    out->pw = c[3];
     if (c[3] <= 0) return 0;
     *sx = c[0] / c[3] * g_xf.xscale + g_xf.xpos - g_xf.offx;
     *sy = c[1] / c[3] * g_xf.yscale + g_xf.ypos - g_xf.offy;
@@ -630,6 +636,10 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
         out->x = (int)pos[0];
         out->y = (int)pos[1];
         out->z = VT_POS(vtype) == 2 ? (float)psp_fast_read16(addr + (uint32_t)pos_off + 4) : pos[2];
+        out->px = pos[0];
+        out->py = pos[1];
+        out->pz = out->z;
+        out->pw = 1.0f;
         return 1;
     }
     float n[3] = { 0, 0, 1 };
@@ -637,7 +647,7 @@ static int read_vertex(uint32_t addr, uint32_t vtype, int tex_off, int col_off,
     if (VT_WEIGHT(vtype)) skin_vertex(addr, vtype, pos, n);
     if (g_lt.enable) out->rgba = light_vertex(pos, n, out->rgba);
     float sx, sy, sz;
-    if (!transform(pos, &sx, &sy, &sz)) { out->behind = 1; g_xf.behind++; return 1; }
+    if (!transform(pos, &sx, &sy, &sz, out)) { out->behind = 1; g_xf.behind++; return 1; }
     out->x = (int)floorf(sx);
     out->y = (int)floorf(sy);
     out->z = sz;
@@ -808,6 +818,10 @@ static void run_list(ge_queue *q) {
             psp_render_current()->set_target(fb_vram(), g_ge.fbw, (int)g_psm);
             break;
 
+        case GE_TFLT:
+            g_ds.tex_min_linear = (int)(arg & 1);
+            g_ds.tex_mag_linear = (int)((arg >> 8) & 1);
+            break;
         case GE_BCE:   g_cull_on = arg & 1; break;
         case GE_CULL:  g_cull_face = arg & 1; break;
         case GE_BOFS:  g_xf.bi = (int)(arg & 0x7F); break;
@@ -972,12 +986,32 @@ static void run_list_timed(ge_queue *q) {
  * same puts software rendering on a core of its own. */
 static int g_ge_async, g_ge_thread_running, g_ge_inflight;
 
+/* A buffer switch takes effect after the lists queued before it, or the screen
+ * would show a frame the GE has not finished. */
+static int g_flip_pending;
+static uint32_t g_flip_after, g_flip_addr, g_flip_stride;
+static int g_flip_fmt;
+
 static void ge_worker(void) {
+    if (psp_render_current()->thread_init && psp_render_current()->thread_init() != 0) {
+        fprintf(stderr, "ge: falling back to the software renderer\n");
+        psp_render_select("software");
+        psp_window_set_external(0);
+    }
     ge_lock();
     for (;;) {
         ge_queue *q = NULL;
         for (int i = 0; i < MAX_QUEUES; i++)
             if (g_queue[i].queued && (!q || g_queue[i].id < q->id)) q = &g_queue[i];
+        if (g_flip_pending && (!q || q->id >= g_flip_after)) {
+            const uint32_t addr = g_flip_addr, stride = g_flip_stride;
+            const int fmt = g_flip_fmt;
+            g_flip_pending = 0;
+            ge_unlock();
+            psp_render_current()->flip(addr, stride, fmt);
+            ge_lock();
+            continue;
+        }
         if (!q) { ge_wait(); continue; }
         q->queued = 0;
         ge_unlock();
@@ -996,6 +1030,18 @@ static void ge_worker(void) {
 void psp_ge_set_async(int on) {
     if (on && !g_ge_thread_running) g_ge_thread_running = ge_thread_start(ge_worker);
     g_ge_async = on && g_ge_thread_running;
+}
+
+void psp_ge_flip(uint32_t addr, uint32_t stride, int fmt) {
+    if (!g_ge_async || !psp_render_current()->flip) return;
+    ge_lock();
+    g_flip_pending = 1;
+    g_flip_after = g_next_id;
+    g_flip_addr = addr;
+    g_flip_stride = stride;
+    g_flip_fmt = fmt;
+    ge_wake();
+    ge_unlock();
 }
 
 static int ge_busy(void) {

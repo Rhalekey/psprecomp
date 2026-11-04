@@ -72,6 +72,7 @@ int psp_display_capture(const char *path) {
  * runs: a frame being drawn into the *back* buffer is never seen, which is the
  * point of the game double-buffering. */
 int psp_display_read(uint32_t *out) {
+    if (psp_render_current()->read_frame) return psp_render_current()->read_frame(out);
     const uint32_t addr = g_fb_addr, stride = g_fb_width, fmt = g_fb_format;
     if (!addr) return -1;
     const int bpp = (fmt == PSP_DISPLAY_PIXEL_FORMAT_8888) ? 4 : 2;
@@ -101,6 +102,7 @@ static void hle_SetFrameBuf(void) {
     g_fb_width  = psp_arg(1);
     g_fb_format = psp_arg(2);
     if (!g_fb_width) g_fb_width = 512;
+    if (g_fb_addr) psp_ge_flip(g_fb_addr, g_fb_width, (int)g_fb_format);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

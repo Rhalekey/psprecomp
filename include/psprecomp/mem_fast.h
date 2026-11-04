@@ -14,9 +14,9 @@
 static inline uint8_t *psp_fast_ptr(uint32_t addr, uint32_t size) {
     const uint32_t a = addr & PSP_ADDR_MASK;
     uint32_t off = a - PSP_VRAM_BASE;
-    if (off <= PSP_VRAM_SIZE - size) return psp_mem.vram + off;
+    if (size <= PSP_VRAM_SIZE && off <= PSP_VRAM_SIZE - size) return psp_mem.vram + off;
     off = a - PSP_RAM_BASE;
-    if (off <= PSP_RAM_SIZE - size) return psp_mem.ram + off;
+    if (size <= PSP_RAM_SIZE && off <= PSP_RAM_SIZE - size) return psp_mem.ram + off;
     return NULL;
 }
 

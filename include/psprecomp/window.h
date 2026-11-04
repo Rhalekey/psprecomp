@@ -28,4 +28,9 @@ int psp_window_start(const char *title, int scale);
 /* Nonzero once the user has closed the window. */
 int psp_window_closed(void);
 
+/* The native window, for a render backend that presents to it directly, and whether
+ * one does. While set, the window stops drawing the front buffer itself. */
+void *psp_window_handle(void);
+void psp_window_set_external(int on);
+
 #endif

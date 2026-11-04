@@ -79,7 +79,8 @@ backend is wrong the same way, which is at least diagnosable.
 |---|---|---|
 | **software** | Working | The reference. Triangles, strips, fans and sprites; textures (all formats including DXT, swizzle, CLUTs) through the shared `psp_tex_fetch()`; texture function, alpha test, depth test, blend, clear mode, scissor; lighting and indexed drawing in the interpreter. Tests assert pixel positions and colours. No GPU, no dependencies, runs in CI. |
 | **null** | Working | Counts primitives, draws nothing. What the bring-up host uses when the question is "did it ask to draw". |
-| **sdl3-vulkan** | Not started | The intended presentation path. See below. |
+| **gl** | Working | OpenGL 3.3 on Windows. Runs on the GE's thread, draws framebuffers at a multiple of the PSP's resolution, and clips with the GPU. Stencil, colour test, fog and mipmaps are not done, as in the software path. |
+| **sdl3-vulkan** | Not started | An alternative for other platforms. See below. |
 
 ## The SDL3 + Vulkan backend, when it happens
 
