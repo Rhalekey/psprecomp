@@ -151,6 +151,9 @@ void psp_render_gl_set_replacement_dir(const char *dir);
 void psp_render_gl_set_dump_dir(const char *dir);
 /* Show frames per second and the slowest frame in a corner of the window. */
 void psp_render_gl_set_overlay(int on);
+/* A folder of .rgba files, tried before the replacement folder, or NULL for none. Any thread
+ * can call this while the game runs; textures already in use change to match. */
+void psp_render_gl_set_language_dir(const char *dir);
 /* Show a line of UTF-8 text over the picture for a few seconds. Any thread. */
 void psp_render_gl_show_message(const char *utf8);
 /* Textures decoded so far and the real time that took, in microseconds. */

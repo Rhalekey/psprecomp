@@ -200,12 +200,27 @@ void psp_render_gl_set_present_filter(int linear) { g_present_linear = linear; }
 static char g_replace_dir[1024];
 static char g_dump_dir[1024];
 
+/* Pictures in the language being played, tried first. Asked for from any thread, and taken
+ * up by the one that draws, which then has to forget what it has made. */
+static char g_language_dir[1024];
+static void *volatile g_language_asked;
+
 void psp_render_gl_set_dump_dir(const char *dir) {
     snprintf(g_dump_dir, sizeof g_dump_dir, "%s", dir ? dir : "");
 }
 
 void psp_render_gl_set_replacement_dir(const char *dir) {
     snprintf(g_replace_dir, sizeof g_replace_dir, "%s", dir ? dir : "");
+}
+
+void psp_render_gl_set_language_dir(const char *dir) {
+    /* Only ever replaced whole, so that the thread that draws never reads half of one. */
+    const char *text = dir ? dir : "";
+    char *copy = (char *)malloc(strlen(text) + 1);
+    if (!copy) return;
+    strcpy(copy, text);
+    void *before = InterlockedExchangePointer((void *volatile *)&g_language_asked, copy);
+    free(before);
 }
 
 void psp_render_gl_set_overlay(int on) { g_overlay = on; }
@@ -462,8 +477,15 @@ static int g_replace_cached;
 
 static FILE *open_replacement(uint32_t hash, const char *kind, uint32_t size[2]) {
     char path[1200];
-    snprintf(path, sizeof path, "%s\\%08X.%s", g_replace_dir, hash, kind);
-    FILE *f = fopen(path, "rb");
+    FILE *f = NULL;
+    if (g_language_dir[0] && !strcmp(kind, "rgba")) {
+        snprintf(path, sizeof path, "%s\\%08X.%s", g_language_dir, hash, kind);
+        f = fopen(path, "rb");
+    }
+    if (!f && g_replace_dir[0]) {
+        snprintf(path, sizeof path, "%s\\%08X.%s", g_replace_dir, hash, kind);
+        f = fopen(path, "rb");
+    }
     if (!f) return NULL;
     if (fread(size, 4, 2, f) == 2 && size[0] && size[0] <= REPLACE_MAX_SIDE && size[1] && size[1] <= REPLACE_MAX_SIDE) {
         fprintf(stderr, "gl: texture replaced by %s\n", path);
@@ -603,7 +625,7 @@ static void dump_texture(uint32_t colours, int w, int h) {
 
 /* The file standing in for what is in g_decode, or NULL. */
 static const uint32_t *replacement_for(int w, int h, int *out_w, int *out_h) {
-    if ((!g_replace_dir[0] && !g_dump_dir[0]) || w < REPLACE_MIN_SIDE || h < REPLACE_MIN_SIDE) return NULL;
+    if ((!g_replace_dir[0] && !g_language_dir[0] && !g_dump_dir[0]) || w < REPLACE_MIN_SIDE || h < REPLACE_MIN_SIDE) return NULL;
 
     /* A picture is known by its colours, and letters by their shape alone. */
     uint32_t colours = 2166136261u, shape = 2166136261u;
@@ -614,7 +636,7 @@ static const uint32_t *replacement_for(int w, int h, int *out_w, int *out_h) {
         colours = (colours ^ key) * 16777619u;
         shape = (shape ^ solid) * 16777619u;
     }
-    if (!g_replace_dir[0]) {
+    if (!g_replace_dir[0] && !g_language_dir[0]) {
         if (g_dump_dir[0]) dump_texture(colours, w, h);
         return NULL;
     }
@@ -675,7 +697,22 @@ static void forget_textures(void) {
     g_live_textures = 0;
 }
 
+/* Another language: what was read from files and made from them is for the last one. */
+static void take_up_language(void) {
+    if (!g_language_asked) return;
+    char *asked = (char *)InterlockedExchangePointer((void *volatile *)&g_language_asked, NULL);
+    if (!asked) return;
+    if (strcmp(asked, g_language_dir) != 0) {
+        snprintf(g_language_dir, sizeof g_language_dir, "%s", asked);
+        for (int i = 0; i < g_replace_cached; i++) free(g_replace_cache[i].pixels);
+        g_replace_cached = 0;
+        forget_textures();
+    }
+    free(asked);
+}
+
 static gl_texture *get_texture(const psp_draw_state *st) {
+    take_up_language();
     const uint32_t clut = is_indexed(st->tex_fmt) && st->clut ? hash_words(st->clut, 1024, 256) : 0;
     uint32_t slot = (st->tex_addr * 2654435761u) ^ clut ^ ((uint32_t)st->tex_w << 3) ^
                     ((uint32_t)st->tex_h << 13) ^ ((uint32_t)st->tex_fmt << 23);
