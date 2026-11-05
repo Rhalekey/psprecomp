@@ -159,6 +159,8 @@ typedef struct {
     uint64_t checked_frame;
     GLuint tex;
     int min_linear, mag_linear, clamp_u, clamp_v;
+    int decodes;     /* how often its contents have changed */
+    int upscaled;
 } gl_texture;
 
 static struct {
@@ -184,6 +186,35 @@ static uint32_t   g_snapshot[PSP_W * PSP_H];
 static volatile int g_have_snapshot;
 
 static int g_overlay;
+static int g_present_linear = 1;
+
+void psp_render_gl_set_present_filter(int linear) { g_present_linear = linear; }
+
+/* Textures reach the card larger than the game made them. Coordinates are relative to
+ * a texture's size, so the game cannot tell. */
+#define UPSCALE_MAX_SIDE 512
+#define UPSCALE_MAX_FACTOR 4
+#define UPSCALE_MAX_DECODES 2   /* one that keeps changing is animated, so leave it */
+
+static int g_tex_upscale = 1;
+static uint32_t *g_upscale_a, *g_upscale_b;
+
+/* Larger versions of whole textures, made outside the game. A file is named for the hash
+ * of which pixels are solid, which survives the way the game stores a texture's colours,
+ * and holds a width, a height and one byte of coverage per pixel over white. */
+#define REPLACE_SIDE 512
+#define REPLACE_SOLID_ALPHA 127
+#define REPLACE_NOTE_SIDE 256
+
+static char g_replace_dir[1024];
+
+void psp_render_gl_set_replacement_dir(const char *dir) {
+    snprintf(g_replace_dir, sizeof g_replace_dir, "%s", dir ? dir : "");
+}
+
+void psp_render_gl_set_texture_upscale(int factor) {
+    g_tex_upscale = factor == 2 || factor == UPSCALE_MAX_FACTOR ? factor : 1;
+}
 
 void psp_render_gl_set_overlay(int on) { g_overlay = on; }
 
@@ -424,6 +455,93 @@ static uint64_t gl_now_us(void) {
     return (uint64_t)((double)now.QuadPart * 1e6 / (double)freq.QuadPart);
 }
 
+/* Double a picture with Eric Johnston's EPX: each pixel becomes four, and a corner takes
+ * the colour of its two neighbours when they agree. Diagonal edges come out as finer
+ * steps, and solid colours and gradients stay as they are. */
+static void epx_double(const uint32_t *src, int w, int h, uint32_t *dst) {
+    for (int y = 0; y < h; y++) {
+        const uint32_t *row = src + y * w;
+        const uint32_t *above = y ? row - w : row;
+        const uint32_t *below = y + 1 < h ? row + w : row;
+        uint32_t *out = dst + y * 2 * (w * 2);
+        for (int x = 0; x < w; x++) {
+            const uint32_t p = row[x], a = above[x], d = below[x];
+            const uint32_t c = x ? row[x - 1] : p, b = x + 1 < w ? row[x + 1] : p;
+            out[x * 2] = c == a && c != d && a != b ? a : p;
+            out[x * 2 + 1] = a == b && a != c && b != d ? b : p;
+            out[w * 2 + x * 2] = d == c && d != b && c != a ? c : p;
+            out[w * 2 + x * 2 + 1] = b == d && b != a && d != c ? d : p;
+        }
+    }
+}
+
+/* Returns the pixels to upload and sets their size. */
+static const uint32_t *upscale_texture(gl_texture *e, int *w, int *h) {
+    e->upscaled = 0;
+    if (g_tex_upscale <= 1 || e->decodes > UPSCALE_MAX_DECODES || *w > UPSCALE_MAX_SIDE || *h > UPSCALE_MAX_SIDE) {
+        return g_decode;
+    }
+    const size_t most = (size_t)UPSCALE_MAX_SIDE * UPSCALE_MAX_FACTOR * UPSCALE_MAX_SIDE * UPSCALE_MAX_FACTOR;
+    if (!g_upscale_a) g_upscale_a = (uint32_t *)malloc(most * sizeof *g_upscale_a);
+    if (!g_upscale_b) g_upscale_b = (uint32_t *)malloc(most * sizeof *g_upscale_b);
+    if (!g_upscale_a || !g_upscale_b) return g_decode;
+    epx_double(g_decode, *w, *h, g_upscale_a);
+    *w *= 2;
+    *h *= 2;
+    const uint32_t *result = g_upscale_a;
+    if (g_tex_upscale == UPSCALE_MAX_FACTOR) {
+        epx_double(g_upscale_a, *w, *h, g_upscale_b);
+        *w *= 2;
+        *h *= 2;
+        result = g_upscale_b;
+    }
+    e->upscaled = 1;
+    return result;
+}
+
+static uint32_t *g_replace_pixels;
+
+/* The file standing in for what is in g_decode, or NULL. */
+static const uint32_t *replacement_for(int w, int h, int fmt, int *out_w, int *out_h) {
+    if (!g_replace_dir[0]) return NULL;
+    if (w >= REPLACE_NOTE_SIDE && h >= REPLACE_NOTE_SIDE) {
+        uint32_t solid = 0, levels[8] = {0};
+        for (int i = 0; i < w * h; i++) {
+            const uint32_t a = g_decode[i] >> 24;
+            solid += a > REPLACE_SOLID_ALPHA;
+            levels[a >> 5]++;
+        }
+        fprintf(stderr, "gl: texture %dx%d format %d, %u solid, alpha levels %u %u %u %u %u %u %u %u\n", w, h, fmt, solid,
+                levels[0], levels[1], levels[2], levels[3], levels[4], levels[5], levels[6], levels[7]);
+    }
+    if (w != REPLACE_SIDE || h != REPLACE_SIDE) return NULL;
+    uint32_t hash = 2166136261u;
+    for (int i = 0; i < w * h; i++) hash = (hash ^ ((g_decode[i] >> 24) > REPLACE_SOLID_ALPHA ? 1u : 0u)) * 16777619u;
+
+    char path[1200];
+    snprintf(path, sizeof path, "%s\\%08X.alpha", g_replace_dir, hash);
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    uint32_t size[2] = {0, 0};
+    const uint32_t *result = NULL;
+    if (fread(size, 4, 2, f) == 2 && size[0] && size[0] <= 4096 && size[1] && size[1] <= 4096) {
+        const size_t count = (size_t)size[0] * size[1];
+        uint8_t *alpha = (uint8_t *)malloc(count);
+        free(g_replace_pixels);
+        g_replace_pixels = (uint32_t *)malloc(count * sizeof *g_replace_pixels);
+        if (alpha && g_replace_pixels && fread(alpha, 1, count, f) == count) {
+            for (size_t i = 0; i < count; i++) g_replace_pixels[i] = ((uint32_t)alpha[i] << 24) | 0x00FFFFFFu;
+            *out_w = (int)size[0];
+            *out_h = (int)size[1];
+            result = g_replace_pixels;
+        }
+        free(alpha);
+    }
+    fclose(f);
+    if (result) fprintf(stderr, "gl: texture replaced by %s\n", path);
+    return result;
+}
+
 static void decode_texture(gl_texture *e, const psp_draw_state *st) {
     const int w = st->tex_w, h = st->tex_h;
     if (w > TEX_MAX_SIDE || h > TEX_MAX_SIDE) return;
@@ -431,9 +549,14 @@ static void decode_texture(gl_texture *e, const psp_draw_state *st) {
     for (int y = 0; y < h; y++)
         for (int x = 0; x < w; x++)
             g_decode[y * w + x] = psp_tex_fetch(st, x, y);
+    e->decodes++;
+    int up_w = w, up_h = h;
+    const uint32_t *pixels = replacement_for(w, h, st->tex_fmt, &up_w, &up_h);
+    if (pixels) e->upscaled = 1;
+    else pixels = upscale_texture(e, &up_w, &up_h);
     glBindTexture(GL_TEXTURE_2D, e->tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_decode);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, up_w, up_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
     const uint64_t took = gl_now_us() - began;
     g_decoded++;
     g_decode_us += took;
@@ -493,15 +616,16 @@ static gl_texture *get_texture(const psp_draw_state *st) {
 }
 
 static void bind_sampler(GLuint tex, int *min_seen, int *mag_seen, int *u_seen, int *v_seen,
-                         const psp_draw_state *st) {
+                         const psp_draw_state *st, int smooth) {
     glBindTexture(GL_TEXTURE_2D, tex);
-    if (*min_seen != st->tex_min_linear) {
-        *min_seen = st->tex_min_linear;
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, st->tex_min_linear ? GL_LINEAR : GL_NEAREST);
+    const int min_linear = st->tex_min_linear || smooth, mag_linear = st->tex_mag_linear || smooth;
+    if (*min_seen != min_linear) {
+        *min_seen = min_linear;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min_linear ? GL_LINEAR : GL_NEAREST);
     }
-    if (*mag_seen != st->tex_mag_linear) {
-        *mag_seen = st->tex_mag_linear;
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, st->tex_mag_linear ? GL_LINEAR : GL_NEAREST);
+    if (*mag_seen != mag_linear) {
+        *mag_seen = mag_linear;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mag_linear ? GL_LINEAR : GL_NEAREST);
     }
     if (*u_seen != st->tex_clamp_u) {
         *u_seen = st->tex_clamp_u;
@@ -521,14 +645,14 @@ static int setup_texture(const psp_draw_state *st) {
         gl_target *t = find_target(st->tex_addr);
         if (t && t != g_bound) {
             int unknown_min = -1, unknown_mag = -1, unknown_u = -1, unknown_v = -1;
-            bind_sampler(t->color, &unknown_min, &unknown_mag, &unknown_u, &unknown_v, st);
+            bind_sampler(t->color, &unknown_min, &unknown_mag, &unknown_u, &unknown_v, st, 0);
             p_glUniform2f(U.uvscale, 1.0f / (float)LOGICAL, 1.0f / (float)LOGICAL);
             return 1;
         }
     }
     gl_texture *e = get_texture(st);
     if (!e) return 0;
-    bind_sampler(e->tex, &e->min_linear, &e->mag_linear, &e->clamp_u, &e->clamp_v, st);
+    bind_sampler(e->tex, &e->min_linear, &e->mag_linear, &e->clamp_u, &e->clamp_v, st, e->upscaled);
     p_glUniform2f(U.uvscale, 1.0f / (float)st->tex_w, 1.0f / (float)st->tex_h);
     return 1;
 }
@@ -907,7 +1031,7 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
         source = t->fbo;
         source_w = PSP_W * g_scale;
         source_h = PSP_H * g_scale;
-        filter = GL_LINEAR;
+        filter = g_present_linear ? GL_LINEAR : GL_NEAREST;
     } else {
         const uint32_t bytes = fmt == 3 ? 4u : 2u;
         for (uint32_t y = 0; y < PSP_H; y++) {

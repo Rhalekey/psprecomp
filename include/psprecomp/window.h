@@ -21,6 +21,8 @@
 #ifndef PSPRECOMP_WINDOW_H
 #define PSPRECOMP_WINDOW_H
 
+#include <stdint.h>
+
 /* Open the window, `scale` times the PSP's 480x272, or with `scale` 0 as
  * large as fits the screen. Returns 0 if it opened. */
 int psp_window_start(const char *title, int scale);
@@ -32,5 +34,8 @@ int psp_window_closed(void);
  * one does. While set, the window stops drawing the front buffer itself. */
 void *psp_window_handle(void);
 void psp_window_set_external(int on);
+
+/* The PSP buttons held right now, for a screen shown before the game runs. */
+uint32_t psp_window_buttons(void);
 
 #endif

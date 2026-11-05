@@ -209,7 +209,7 @@ static uint32_t do_load(uint32_t param, const char *save) {
         const int n = read_file(dir, EXTRA_FILE[i], buf, bytes);
         psp_write32(entry + 8, n > 0 ? (uint32_t)n : 0);
     }
-    fprintf(stderr, "savedata: loaded %d bytes from %s\n", got, dir);
+    fprintf(stderr, "savedata: loaded %d bytes to 0x%08X from %s\n", got, psp_read32(param + P_DATA), dir);
     report_event(PSP_SAVEDATA_LOADED);
     return 0;
 }

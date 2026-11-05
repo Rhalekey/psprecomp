@@ -41,6 +41,11 @@ typedef struct {
  * contents did not change is left untouched. Returns 0 on success. */
 int a_emit(const a_analysis *an, const emit_opts *o);
 
+/* Make the generated function at `addr` call psp_game_hook(addr), which the game's
+ * host supplies, on entry. That is how a host changes what a function is given
+ * without the game's code being edited. */
+void a_emit_add_hook(uint32_t addr);
+
 /* Emit one function to `out`, for reading rather than compiling. Returns -1 if
  * no discovered function starts at `addr`. */
 int a_emit_one(const a_analysis *an, uint32_t addr, FILE *out);

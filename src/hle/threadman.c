@@ -1287,7 +1287,8 @@ static void hle_CancelWakeupThread(void) {
 
 static int end_reached(void *p) {
     psp_thread *t = ((struct end_ctx *)p)->t;
-    return t->exited;
+    /* A thread that was never started has nothing to wait for. */
+    return t->exited || t->state == TH_DORMANT;
 }
 
 static void wait_thread_end(void) {

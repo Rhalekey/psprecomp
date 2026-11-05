@@ -282,6 +282,9 @@ static void test_threads(void) {
     uint32_t thid = call5(CREATE, 0 /*name*/, ENTRY, 32 /*prio*/, 0x4000 /*stack*/, 0);
     CHECK(thid != 0, "thread created, got 0x%08X", thid);
 
+    /* Nothing will ever end a thread nobody started, so this must not park. */
+    CHECK(call(WAITEND, thid, 0, 0, 0) == 0, "waiting for a thread never started returns");
+
     /* The caller's context must survive the thread running. */
     psp_cpu.r[PSP_REG_S0] = 0xC0FFEE;
     uint32_t caller_sp = psp_cpu.r[PSP_REG_SP];

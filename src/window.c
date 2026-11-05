@@ -8,6 +8,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <xinput.h>
+#include <stdio.h>
 
 #define W 480
 #define H 272
@@ -22,6 +23,7 @@ enum {
 
 static volatile LONG g_closed;
 static volatile LONG g_external;     /* something else presents to the window */
+static volatile LONG g_buttons;
 static HWND g_hwnd;
 static int g_scale;
 static const char *g_title = "psprecomp";
@@ -39,7 +41,29 @@ static uint32_t keyboard(void) {
     return b;
 }
 
-/* The first XInput controller, if one is connected. */
+/* Asking an empty slot is slow enough to hurt if done every frame, so while nothing
+ * is connected the slots are tried in turn, one a second or so. */
+#define PAD_SLOTS 4
+#define PAD_RETRY_TICKS 60
+
+static int read_pad(XINPUT_STATE *s) {
+    static int slot = -1, next_slot, wait;
+    if (slot >= 0) {
+        if (XInputGetState((DWORD)slot, s) == ERROR_SUCCESS) return 1;
+        fprintf(stderr, "window: controller %d disconnected\n", slot);
+        slot = -1;
+    }
+    if (wait-- > 0) return 0;
+    wait = PAD_RETRY_TICKS / PAD_SLOTS;
+    const int trying = next_slot;
+    next_slot = (next_slot + 1) % PAD_SLOTS;
+    if (XInputGetState((DWORD)trying, s) != ERROR_SUCCESS) return 0;
+    slot = trying;
+    fprintf(stderr, "window: controller found in slot %d\n", slot);
+    return 1;
+}
+
+/* The first XInput controller connected, if any. */
 static uint32_t pad(uint8_t *ax, uint8_t *ay) {
     static const struct { WORD x; uint32_t bit; } P[] = {
         { XINPUT_GAMEPAD_DPAD_UP, B_UP }, { XINPUT_GAMEPAD_DPAD_RIGHT, B_RIGHT },
@@ -50,7 +74,7 @@ static uint32_t pad(uint8_t *ax, uint8_t *ay) {
         { XINPUT_GAMEPAD_START, B_START }, { XINPUT_GAMEPAD_BACK, B_SELECT },
     };
     XINPUT_STATE s;
-    if (XInputGetState(0, &s) != ERROR_SUCCESS) return 0;
+    if (!read_pad(&s)) return 0;
     uint32_t b = 0;
     for (size_t i = 0; i < sizeof P / sizeof P[0]; i++)
         if (s.Gamepad.wButtons & P[i].x) b |= P[i].bit;
@@ -109,6 +133,7 @@ static LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         uint32_t b = pad(&ax, &ay);
         if (GetForegroundWindow() == h) b |= keyboard();   /* keys only when focused */
         psp_ctrl_set(b, ax, ay);
+        InterlockedExchange(&g_buttons, (LONG)b);
         if (!g_external) InvalidateRect(h, NULL, FALSE);
         return 0;
     }
@@ -174,6 +199,7 @@ int psp_window_start(const char *title, int scale) {
 int psp_window_closed(void) { return g_closed != 0; }
 void *psp_window_handle(void) { return g_hwnd; }
 void psp_window_set_external(int on) { InterlockedExchange(&g_external, on); }
+uint32_t psp_window_buttons(void) { return (uint32_t)g_buttons; }
 
 #else
 
@@ -183,5 +209,6 @@ int psp_window_start(const char *title, int scale) { (void)title; (void)scale; r
 int psp_window_closed(void) { return 0; }
 void *psp_window_handle(void) { return 0; }
 void psp_window_set_external(int on) { (void)on; }
+uint32_t psp_window_buttons(void) { return 0; }
 
 #endif

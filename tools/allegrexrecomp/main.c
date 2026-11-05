@@ -1051,6 +1051,9 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "funcs"))   return cmd_funcs(argv[2], argc > 3 && !strcmp(argv[3], "--list"));
     if (!strcmp(cmd, "emit")) {
         if (argc < 4) return usage();
+        for (int i = 5; i + 1 < argc; i += 2) {
+            if (!strcmp(argv[i], "--hook")) a_emit_add_hook((uint32_t)strtoul(argv[i + 1], NULL, 16));
+        }
         return cmd_emit(argv[2], argv[3], argc > 4 ? argv[4] : NULL);
     }
     if (!strcmp(cmd, "dump")) {

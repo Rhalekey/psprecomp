@@ -3,6 +3,22 @@
 #include "emit.h"
 #include "decode.h"
 
+/* Functions the host wants to be told about; see a_emit_add_hook. */
+#define MAX_HOOKS 32
+static uint32_t g_hooks[MAX_HOOKS];
+static int g_nhooks;
+
+void a_emit_add_hook(uint32_t addr) {
+    if (g_nhooks < MAX_HOOKS) g_hooks[g_nhooks++] = addr;
+}
+
+static int is_hooked(uint32_t addr) {
+    for (int i = 0; i < g_nhooks; i++) {
+        if (g_hooks[i] == addr) return 1;
+    }
+    return 0;
+}
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -728,8 +744,10 @@ static void emit_function(ectx *c, const a_func *fn) {
      * a thunk and a dispatch entry. The switch costs one jump on entry and
      * makes the whole class -- jump tables, indirect calls, cross-function
      * branches -- resolve by construction. */
+    if (is_hooked(fn->addr)) fprintf(f, "void psp_game_hook(uint32_t addr);\n");
     fprintf(f, "static void psp_body_%08X(uint32_t _entry) {\n", fn->addr);
     fprintf(f, "    PSP_ENTER(0x%08Xu);\n", fn->addr);
+    if (is_hooked(fn->addr)) fprintf(f, "    if (_entry == 0x%08Xu) psp_game_hook(0x%08Xu);\n", fn->addr, fn->addr);
     /* A function must leave $sp as it found it. Any that does not corrupts
      * every callee-saved register its caller restores afterwards -- the
      * restores read `sp + offset`, so a shifted $sp reads a different slot and
