@@ -145,11 +145,10 @@ extern const psp_render_backend psp_render_gl;
 void psp_render_gl_set_scale(int scale);
 /* Smooth the picture when fitting it to the window, or keep hard pixels. */
 void psp_render_gl_set_present_filter(int linear);
-/* Enlarge textures 2 or 4 times on their way to the card, so 2D art and text stay smooth
- * at a high render scale. 1 leaves them as they are. */
-void psp_render_gl_set_texture_upscale(int factor);
 /* Where larger versions of whole textures are kept. See render_gl.c. */
 void psp_render_gl_set_replacement_dir(const char *dir);
+/* Save each texture with no larger version to this folder as a PNG named for its hash. */
+void psp_render_gl_set_dump_dir(const char *dir);
 /* Show frames per second and the slowest frame in a corner of the window. */
 void psp_render_gl_set_overlay(int on);
 /* Show a line of UTF-8 text over the picture for a few seconds. Any thread. */

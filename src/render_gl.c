@@ -159,8 +159,8 @@ typedef struct {
     uint64_t checked_frame;
     GLuint tex;
     int min_linear, mag_linear, clamp_u, clamp_v;
-    int decodes;     /* how often its contents have changed */
-    int upscaled;
+    int replaced;    /* a larger file stands in for it */
+    int use_logged;
 } gl_texture;
 
 static struct {
@@ -190,29 +190,22 @@ static int g_present_linear = 1;
 
 void psp_render_gl_set_present_filter(int linear) { g_present_linear = linear; }
 
-/* Textures reach the card larger than the game made them. Coordinates are relative to
- * a texture's size, so the game cannot tell. */
-#define UPSCALE_MAX_SIDE 512
-#define UPSCALE_MAX_FACTOR 4
-#define UPSCALE_MAX_DECODES 2   /* one that keeps changing is animated, so leave it */
-
-static int g_tex_upscale = 1;
-static uint32_t *g_upscale_a, *g_upscale_b;
-
-/* Larger versions of whole textures, made outside the game. A file is named for the hash
- * of which pixels are solid, which survives the way the game stores a texture's colours,
- * and holds a width, a height and one byte of coverage per pixel over white. */
-#define REPLACE_SIDE 512
+/* Larger versions of whole textures, made outside the game, and named for a hash of the
+ * original that survives the way the game stores colours. An .rgba file replaces a picture.
+ * An .alpha file holds one byte of coverage over white per pixel, for a font. */
+#define REPLACE_MIN_SIDE 32
+#define REPLACE_MAX_SIDE 4096
 #define REPLACE_SOLID_ALPHA 127
 
 static char g_replace_dir[1024];
+static char g_dump_dir[1024];
+
+void psp_render_gl_set_dump_dir(const char *dir) {
+    snprintf(g_dump_dir, sizeof g_dump_dir, "%s", dir ? dir : "");
+}
 
 void psp_render_gl_set_replacement_dir(const char *dir) {
     snprintf(g_replace_dir, sizeof g_replace_dir, "%s", dir ? dir : "");
-}
-
-void psp_render_gl_set_texture_upscale(int factor) {
-    g_tex_upscale = factor == 2 || factor == UPSCALE_MAX_FACTOR ? factor : 1;
 }
 
 void psp_render_gl_set_overlay(int on) { g_overlay = on; }
@@ -454,96 +447,204 @@ static uint64_t gl_now_us(void) {
     return (uint64_t)((double)now.QuadPart * 1e6 / (double)freq.QuadPart);
 }
 
-/* Double a picture with Eric Johnston's EPX: each pixel becomes four, and a corner takes
- * the colour of its two neighbours when they agree. Diagonal edges come out as finer
- * steps, and solid colours and gradients stay as they are. */
-static void epx_double(const uint32_t *src, int w, int h, uint32_t *dst) {
-    for (int y = 0; y < h; y++) {
-        const uint32_t *row = src + y * w;
-        const uint32_t *above = y ? row - w : row;
-        const uint32_t *below = y + 1 < h ? row + w : row;
-        uint32_t *out = dst + y * 2 * (w * 2);
-        for (int x = 0; x < w; x++) {
-            const uint32_t p = row[x], a = above[x], d = below[x];
-            const uint32_t c = x ? row[x - 1] : p, b = x + 1 < w ? row[x + 1] : p;
-            out[x * 2] = c == a && c != d && a != b ? a : p;
-            out[x * 2 + 1] = a == b && a != c && b != d ? b : p;
-            out[w * 2 + x * 2] = d == c && d != b && c != a ? c : p;
-            out[w * 2 + x * 2 + 1] = b == d && b != a && d != c ? d : p;
-        }
-    }
-}
+/* What has been read from files, kept: a game reloads the same textures often, and a file
+ * is too large to read again each time. A texture with no file is remembered as well. */
+#define REPLACE_CACHE 256
 
-/* Returns the pixels to upload and sets their size. */
-static const uint32_t *upscale_texture(gl_texture *e, int *w, int *h) {
-    e->upscaled = 0;
-    if (g_tex_upscale <= 1 || e->decodes > UPSCALE_MAX_DECODES || *w > UPSCALE_MAX_SIDE || *h > UPSCALE_MAX_SIDE) {
-        return g_decode;
-    }
-    const size_t most = (size_t)UPSCALE_MAX_SIDE * UPSCALE_MAX_FACTOR * UPSCALE_MAX_SIDE * UPSCALE_MAX_FACTOR;
-    if (!g_upscale_a) g_upscale_a = (uint32_t *)malloc(most * sizeof *g_upscale_a);
-    if (!g_upscale_b) g_upscale_b = (uint32_t *)malloc(most * sizeof *g_upscale_b);
-    if (!g_upscale_a || !g_upscale_b) return g_decode;
-    epx_double(g_decode, *w, *h, g_upscale_a);
-    *w *= 2;
-    *h *= 2;
-    const uint32_t *result = g_upscale_a;
-    if (g_tex_upscale == UPSCALE_MAX_FACTOR) {
-        epx_double(g_upscale_a, *w, *h, g_upscale_b);
-        *w *= 2;
-        *h *= 2;
-        result = g_upscale_b;
-    }
-    e->upscaled = 1;
-    return result;
-}
+typedef struct {
+    uint32_t colours, shape;
+    int w, h;
+    uint32_t *pixels;
+} replacement;
 
-static uint32_t *g_replace_pixels;
+static replacement g_replace_cache[REPLACE_CACHE];
+static int g_replace_cached;
 
-/* The file standing in for what is in g_decode, or NULL. */
-static const uint32_t *replacement_for(int w, int h, int fmt, int *out_w, int *out_h) {
-    if (!g_replace_dir[0]) return NULL;
-    if (w != REPLACE_SIDE || h != REPLACE_SIDE) return NULL;
-    uint32_t hash = 2166136261u, solid = 0;
-    int left = w, right = -1, top = h, bottom = -1;
-    for (int y = 0; y < h; y++) {
-        for (int x = 0; x < w; x++) {
-            const uint32_t is_solid = (g_decode[y * w + x] >> 24) > REPLACE_SOLID_ALPHA ? 1u : 0u;
-            hash = (hash ^ is_solid) * 16777619u;
-            if (!is_solid) continue;
-            solid++;
-            if (x < left) left = x;
-            if (x > right) right = x;
-            if (y < top) top = y;
-            if (y > bottom) bottom = y;
-        }
-    }
-    /* Tells a texture that should have matched from one that is not what was expected. */
-    fprintf(stderr, "gl: texture format %d shape %08X, %u solid, x %d..%d y %d..%d\n", fmt, hash, solid, left, right, top,
-            bottom);
-
+static FILE *open_replacement(uint32_t hash, const char *kind, uint32_t size[2]) {
     char path[1200];
-    snprintf(path, sizeof path, "%s\\%08X.alpha", g_replace_dir, hash);
+    snprintf(path, sizeof path, "%s\\%08X.%s", g_replace_dir, hash, kind);
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
-    uint32_t size[2] = {0, 0};
-    const uint32_t *result = NULL;
-    if (fread(size, 4, 2, f) == 2 && size[0] && size[0] <= 4096 && size[1] && size[1] <= 4096) {
-        const size_t count = (size_t)size[0] * size[1];
-        uint8_t *alpha = (uint8_t *)malloc(count);
-        free(g_replace_pixels);
-        g_replace_pixels = (uint32_t *)malloc(count * sizeof *g_replace_pixels);
-        if (alpha && g_replace_pixels && fread(alpha, 1, count, f) == count) {
-            for (size_t i = 0; i < count; i++) g_replace_pixels[i] = ((uint32_t)alpha[i] << 24) | 0x00FFFFFFu;
-            *out_w = (int)size[0];
-            *out_h = (int)size[1];
-            result = g_replace_pixels;
-        }
-        free(alpha);
+    if (fread(size, 4, 2, f) == 2 && size[0] && size[0] <= REPLACE_MAX_SIDE && size[1] && size[1] <= REPLACE_MAX_SIDE) {
+        fprintf(stderr, "gl: texture replaced by %s\n", path);
+        return f;
     }
     fclose(f);
-    if (result) fprintf(stderr, "gl: texture replaced by %s\n", path);
-    return result;
+    return NULL;
+}
+
+static uint32_t *read_replacement(uint32_t colours, uint32_t shape, int *w, int *h) {
+    uint32_t size[2] = {0, 0};
+    FILE *f = open_replacement(colours, "rgba", size);
+    const int whole = f != NULL;
+    if (!f) f = open_replacement(shape, "alpha", size);
+    if (!f) return NULL;
+
+    const size_t count = (size_t)size[0] * size[1];
+    uint32_t *pixels = (uint32_t *)malloc(count * sizeof *pixels);
+    int ok = 0;
+    if (pixels) {
+        if (whole) {
+            ok = fread(pixels, 4, count, f) == count;
+        } else {
+            uint8_t *alpha = (uint8_t *)malloc(count);
+            if (alpha && fread(alpha, 1, count, f) == count) {
+                for (size_t i = 0; i < count; i++) pixels[i] = ((uint32_t)alpha[i] << 24) | 0x00FFFFFFu;
+                ok = 1;
+            }
+            free(alpha);
+        }
+    }
+    fclose(f);
+    if (!ok) {
+        free(pixels);
+        return NULL;
+    }
+    *w = (int)size[0];
+    *h = (int)size[1];
+    return pixels;
+}
+
+/* A PNG with no compression, which needs nothing but a checksum routine. */
+static uint32_t png_crc(uint32_t crc, const uint8_t *p, size_t n) {
+    static uint32_t table[256];
+    if (!table[1]) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            table[i] = c;
+        }
+    }
+    for (size_t i = 0; i < n; i++) crc = table[(crc ^ p[i]) & 255] ^ (crc >> 8);
+    return crc;
+}
+
+static void put_be32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
+
+static void png_chunk(FILE *f, const char *kind, const uint8_t *data, uint32_t n) {
+    uint8_t head[8];
+    put_be32(head, n);
+    memcpy(head + 4, kind, 4);
+    fwrite(head, 1, 8, f);
+    if (n) fwrite(data, 1, n, f);
+    uint32_t crc = png_crc(0xFFFFFFFFu, head + 4, 4);
+    if (n) crc = png_crc(crc, data, n);
+    uint8_t tail[4];
+    put_be32(tail, crc ^ 0xFFFFFFFFu);
+    fwrite(tail, 1, 4, f);
+}
+
+#define STORED_BLOCK 65535u
+
+/* Each texture with no larger version, once, named for the hash a replacement would use.
+ * In the order the texture has in memory, which for this kind of game can be upside down. */
+static void dump_texture(uint32_t colours, int w, int h) {
+    char path[1200];
+    snprintf(path, sizeof path, "%s\\%08X.png", g_dump_dir, colours);
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        fclose(f);
+        return;
+    }
+    const size_t row = (size_t)w * 4 + 1, raw_size = row * (size_t)h;
+    const size_t blocks = raw_size / STORED_BLOCK + 1;
+    uint8_t *z = (uint8_t *)malloc(2 + raw_size + blocks * 5 + 4);
+    uint8_t *raw = (uint8_t *)malloc(raw_size);
+    f = fopen(path, "wb");
+    if (z && raw && f) {
+        uint32_t a1 = 1, a2 = 0;
+        for (int y = 0; y < h; y++) {
+            uint8_t *line = raw + row * (size_t)y;
+            line[0] = 0;
+            memcpy(line + 1, g_decode + y * w, (size_t)w * 4);
+        }
+        size_t at = 0, out = 0;
+        z[out++] = 0x78;
+        z[out++] = 0x01;
+        while (at < raw_size) {
+            const uint32_t n = raw_size - at > STORED_BLOCK ? STORED_BLOCK : (uint32_t)(raw_size - at);
+            z[out++] = at + n == raw_size;
+            z[out++] = (uint8_t)n;
+            z[out++] = (uint8_t)(n >> 8);
+            z[out++] = (uint8_t)~n;
+            z[out++] = (uint8_t)(~n >> 8);
+            memcpy(z + out, raw + at, n);
+            for (uint32_t i = 0; i < n; i++) {
+                a1 = (a1 + raw[at + i]) % 65521u;
+                a2 = (a2 + a1) % 65521u;
+            }
+            out += n;
+            at += n;
+        }
+        put_be32(z + out, (a2 << 16) | a1);
+        out += 4;
+
+        static const uint8_t signature[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+        fwrite(signature, 1, 8, f);
+        uint8_t ihdr[13];
+        put_be32(ihdr, (uint32_t)w);
+        put_be32(ihdr + 4, (uint32_t)h);
+        ihdr[8] = 8;
+        ihdr[9] = 6;
+        ihdr[10] = ihdr[11] = ihdr[12] = 0;
+        png_chunk(f, "IHDR", ihdr, 13);
+        png_chunk(f, "IDAT", z, (uint32_t)out);
+        png_chunk(f, "IEND", NULL, 0);
+    }
+    if (f) fclose(f);
+    free(z);
+    free(raw);
+}
+
+/* The file standing in for what is in g_decode, or NULL. */
+static const uint32_t *replacement_for(int w, int h, int *out_w, int *out_h) {
+    if ((!g_replace_dir[0] && !g_dump_dir[0]) || w < REPLACE_MIN_SIDE || h < REPLACE_MIN_SIDE) return NULL;
+
+    /* A picture is known by its colours, and letters by their shape alone. */
+    uint32_t colours = 2166136261u, shape = 2166136261u;
+    for (int i = 0; i < w * h; i++) {
+        const uint32_t p = g_decode[i], alpha = p >> 24;
+        const uint32_t solid = alpha > REPLACE_SOLID_ALPHA ? 1u : 0u;
+        const uint32_t key = alpha ? solid | ((p >> 5) & 7u) << 1 | ((p >> 13) & 7u) << 4 | ((p >> 21) & 7u) << 7 | 1u << 10 : 0u;
+        colours = (colours ^ key) * 16777619u;
+        shape = (shape ^ solid) * 16777619u;
+    }
+    if (!g_replace_dir[0]) {
+        if (g_dump_dir[0]) dump_texture(colours, w, h);
+        return NULL;
+    }
+
+    for (int i = 0; i < g_replace_cached; i++) {
+        const replacement *r = &g_replace_cache[i];
+        if (r->colours == colours && r->shape == shape) {
+            if (!r->pixels) return NULL;  /* and it has been saved already, if that is wanted */
+            *out_w = r->w;
+            *out_h = r->h;
+            return r->pixels;
+        }
+    }
+    int file_w = 0, file_h = 0;
+    uint32_t *pixels = read_replacement(colours, shape, &file_w, &file_h);
+    if (g_replace_cached < REPLACE_CACHE) {
+        replacement *r = &g_replace_cache[g_replace_cached++];
+        r->colours = colours;
+        r->shape = shape;
+        r->w = file_w;
+        r->h = file_h;
+        r->pixels = pixels;
+    }
+    if (!pixels) {
+        if (g_dump_dir[0]) dump_texture(colours, w, h);
+        return NULL;
+    }
+    *out_w = file_w;
+    *out_h = file_h;
+    return pixels;
 }
 
 static void decode_texture(gl_texture *e, const psp_draw_state *st) {
@@ -553,11 +654,10 @@ static void decode_texture(gl_texture *e, const psp_draw_state *st) {
     for (int y = 0; y < h; y++)
         for (int x = 0; x < w; x++)
             g_decode[y * w + x] = psp_tex_fetch(st, x, y);
-    e->decodes++;
     int up_w = w, up_h = h;
-    const uint32_t *pixels = replacement_for(w, h, st->tex_fmt, &up_w, &up_h);
-    if (pixels) e->upscaled = 1;
-    else pixels = upscale_texture(e, &up_w, &up_h);
+    const uint32_t *pixels = replacement_for(w, h, &up_w, &up_h);
+    e->replaced = pixels != NULL;
+    if (!pixels) pixels = g_decode;
     glBindTexture(GL_TEXTURE_2D, e->tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, up_w, up_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
@@ -656,7 +756,14 @@ static int setup_texture(const psp_draw_state *st) {
     }
     gl_texture *e = get_texture(st);
     if (!e) return 0;
-    bind_sampler(e->tex, &e->min_linear, &e->mag_linear, &e->clamp_u, &e->clamp_v, st, e->upscaled);
+    bind_sampler(e->tex, &e->min_linear, &e->mag_linear, &e->clamp_u, &e->clamp_v, st, e->replaced);
+    /* How a replaced texture is used, once: its look depends on this as much as on the file. */
+    if (e->replaced && !e->use_logged) {
+        e->use_logged = 1;
+        fprintf(stderr, "gl: replaced %dx%d at 0x%08X: func %d alpha %d blend %d src %d dst %d op %d filter %d %d\n", st->tex_w, st->tex_h,
+                st->tex_addr, st->tex_func, st->tex_alpha, st->blend, st->blend_src, st->blend_dst, st->blend_op, st->tex_min_linear,
+                st->tex_mag_linear);
+    }
     p_glUniform2f(U.uvscale, 1.0f / (float)st->tex_w, 1.0f / (float)st->tex_h);
     return 1;
 }
