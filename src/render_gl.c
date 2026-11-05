@@ -204,7 +204,6 @@ static uint32_t *g_upscale_a, *g_upscale_b;
  * and holds a width, a height and one byte of coverage per pixel over white. */
 #define REPLACE_SIDE 512
 #define REPLACE_SOLID_ALPHA 127
-#define REPLACE_NOTE_SIDE 256
 
 static char g_replace_dir[1024];
 
@@ -504,19 +503,24 @@ static uint32_t *g_replace_pixels;
 /* The file standing in for what is in g_decode, or NULL. */
 static const uint32_t *replacement_for(int w, int h, int fmt, int *out_w, int *out_h) {
     if (!g_replace_dir[0]) return NULL;
-    if (w >= REPLACE_NOTE_SIDE && h >= REPLACE_NOTE_SIDE) {
-        uint32_t solid = 0, levels[8] = {0};
-        for (int i = 0; i < w * h; i++) {
-            const uint32_t a = g_decode[i] >> 24;
-            solid += a > REPLACE_SOLID_ALPHA;
-            levels[a >> 5]++;
-        }
-        fprintf(stderr, "gl: texture %dx%d format %d, %u solid, alpha levels %u %u %u %u %u %u %u %u\n", w, h, fmt, solid,
-                levels[0], levels[1], levels[2], levels[3], levels[4], levels[5], levels[6], levels[7]);
-    }
     if (w != REPLACE_SIDE || h != REPLACE_SIDE) return NULL;
-    uint32_t hash = 2166136261u;
-    for (int i = 0; i < w * h; i++) hash = (hash ^ ((g_decode[i] >> 24) > REPLACE_SOLID_ALPHA ? 1u : 0u)) * 16777619u;
+    uint32_t hash = 2166136261u, solid = 0;
+    int left = w, right = -1, top = h, bottom = -1;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            const uint32_t is_solid = (g_decode[y * w + x] >> 24) > REPLACE_SOLID_ALPHA ? 1u : 0u;
+            hash = (hash ^ is_solid) * 16777619u;
+            if (!is_solid) continue;
+            solid++;
+            if (x < left) left = x;
+            if (x > right) right = x;
+            if (y < top) top = y;
+            if (y > bottom) bottom = y;
+        }
+    }
+    /* Tells a texture that should have matched from one that is not what was expected. */
+    fprintf(stderr, "gl: texture format %d shape %08X, %u solid, x %d..%d y %d..%d\n", fmt, hash, solid, left, right, top,
+            bottom);
 
     char path[1200];
     snprintf(path, sizeof path, "%s\\%08X.alpha", g_replace_dir, hash);
