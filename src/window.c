@@ -63,8 +63,17 @@ static int read_pad(XINPUT_STATE *s) {
     return 1;
 }
 
+/* The PSP stick is 0..255 with 128 at rest and y growing downwards. Here too y grows
+ * downwards, and both run -32768..32767. */
+static void stick(int x, int y, uint8_t *ax, uint8_t *ay) {
+    const long long d = XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE;
+    if ((long long)x * x + (long long)y * y <= d * d) return;
+    *ax = (uint8_t)((x + 32768) >> 8);
+    *ay = (uint8_t)((y + 32768) >> 8);
+}
+
 /* The first XInput controller connected, if any. */
-static uint32_t pad(uint8_t *ax, uint8_t *ay) {
+static uint32_t xinput_pad(uint8_t *ax, uint8_t *ay) {
     static const struct { WORD x; uint32_t bit; } P[] = {
         { XINPUT_GAMEPAD_DPAD_UP, B_UP }, { XINPUT_GAMEPAD_DPAD_RIGHT, B_RIGHT },
         { XINPUT_GAMEPAD_DPAD_DOWN, B_DOWN }, { XINPUT_GAMEPAD_DPAD_LEFT, B_LEFT },
@@ -80,13 +89,124 @@ static uint32_t pad(uint8_t *ax, uint8_t *ay) {
         if (s.Gamepad.wButtons & P[i].x) b |= P[i].bit;
     if (s.Gamepad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) b |= B_L;
     if (s.Gamepad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) b |= B_R;
-    /* The PSP stick is 0..255 with 128 at rest and y growing downwards. */
-    const int lx = s.Gamepad.sThumbLX, ly = s.Gamepad.sThumbLY;
-    if (lx * lx + ly * ly > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE * XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) {
-        *ax = (uint8_t)((lx + 32768) >> 8);
-        *ay = (uint8_t)((32767 - ly) >> 8);
+    stick(s.Gamepad.sThumbLX, -1 - s.Gamepad.sThumbLY, ax, ay);
+    return b;
+}
+
+/* SDL3 knows the other controllers: PlayStation, Nintendo and many more. It is an optional
+ * DLL beside the executable, so that without it the game still runs, on XInput. Everything
+ * below comes from SDL3's stable interface. */
+enum {
+    SDL_INIT_GAMEPAD_ = 0x2000,
+    SDL_SOUTH = 0, SDL_EAST = 1, SDL_WEST = 2, SDL_NORTH = 3, SDL_BACK = 4, SDL_START = 6,
+    SDL_LEFT_SHOULDER = 9, SDL_RIGHT_SHOULDER = 10,
+    SDL_DPAD_UP = 11, SDL_DPAD_DOWN = 12, SDL_DPAD_LEFT = 13, SDL_DPAD_RIGHT = 14,
+    SDL_AXIS_LEFTX = 0, SDL_AXIS_LEFTY = 1, SDL_AXIS_LEFT_TRIGGER = 4, SDL_AXIS_RIGHT_TRIGGER = 5,
+    SDL_TRIGGER_DOWN = 30 * 128,        /* XInput's threshold, on SDL's scale */
+    SDL_MAX_PADS = 8
+};
+
+static struct {
+    _Bool (*Init)(uint32_t);
+    _Bool (*SetHint)(const char *, const char *);
+    const char *(*GetError)(void);
+    void (*PumpEvents)(void);
+    void (*FlushEvents)(uint32_t, uint32_t);
+    uint32_t *(*GetGamepads)(int *);
+    void *(*OpenGamepad)(uint32_t);
+    void (*CloseGamepad)(void *);
+    _Bool (*GamepadConnected)(void *);
+    const char *(*GetGamepadName)(void *);
+    _Bool (*GetGamepadButton)(void *, int);
+    int16_t (*GetGamepadAxis)(void *, int);
+    void (*free)(void *);
+} sdl;
+
+/* Runs on the window's thread, as all of SDL's use here does. */
+static int sdl_ready(void) {
+    static int state;                   /* 0 not tried, 1 ready, -1 not available */
+    if (state) return state > 0;
+    state = -1;
+    /* Only from beside the executable, never from wherever else Windows would look.
+     * System32 is for what SDL itself needs, which these flags also govern. */
+    HMODULE m = LoadLibraryExA("SDL3.dll", NULL, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!m) {
+        fprintf(stderr, "window: SDL3.dll did not load (error %lu), only XInput controllers will work\n", GetLastError());
+        return 0;
+    }
+#define SDL_FN(field, name) \
+    if (!(*(FARPROC *)&sdl.field = GetProcAddress(m, name))) { \
+        fprintf(stderr, "window: SDL3.dll has no %s, only XInput controllers will work\n", name); \
+        return 0; \
+    }
+    SDL_FN(Init, "SDL_Init") SDL_FN(SetHint, "SDL_SetHint") SDL_FN(GetError, "SDL_GetError")
+    SDL_FN(PumpEvents, "SDL_PumpEvents") SDL_FN(FlushEvents, "SDL_FlushEvents")
+    SDL_FN(GetGamepads, "SDL_GetGamepads") SDL_FN(OpenGamepad, "SDL_OpenGamepad")
+    SDL_FN(CloseGamepad, "SDL_CloseGamepad") SDL_FN(GamepadConnected, "SDL_GamepadConnected")
+    SDL_FN(GetGamepadName, "SDL_GetGamepadName") SDL_FN(GetGamepadButton, "SDL_GetGamepadButton")
+    SDL_FN(GetGamepadAxis, "SDL_GetGamepadAxis") SDL_FN(free, "SDL_free")
+#undef SDL_FN
+    /* SDL has no window of its own here, so it must not wait for one to have focus. */
+    sdl.SetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
+    if (!sdl.Init(SDL_INIT_GAMEPAD_)) {
+        fprintf(stderr, "window: SDL3 did not start (%s), only XInput controllers will work\n", sdl.GetError());
+        return 0;
+    }
+    state = 1;
+    return 1;
+}
+
+/* Every controller SDL can see, all playing as one. Buttons go by where they sit and not by
+ * what is printed on them, so the bottom one is Cross everywhere, B on a Nintendo controller. */
+static uint32_t sdl_pad(uint8_t *ax, uint8_t *ay) {
+    static const struct { int button; uint32_t bit; } P[] = {
+        { SDL_DPAD_UP, B_UP }, { SDL_DPAD_RIGHT, B_RIGHT },
+        { SDL_DPAD_DOWN, B_DOWN }, { SDL_DPAD_LEFT, B_LEFT },
+        { SDL_SOUTH, B_CROSS }, { SDL_EAST, B_CIRCLE },
+        { SDL_WEST, B_SQUARE }, { SDL_NORTH, B_TRIANGLE },
+        { SDL_LEFT_SHOULDER, B_L }, { SDL_RIGHT_SHOULDER, B_R },
+        { SDL_START, B_START }, { SDL_BACK, B_SELECT },
+    };
+    static struct { void *gamepad; uint32_t id; } open[SDL_MAX_PADS];
+    static int open_count, wait;
+    sdl.PumpEvents();
+    sdl.FlushEvents(0, 0xFFFFFFFFu);    /* nothing reads them, and they would pile up */
+    for (int i = open_count - 1; i >= 0; i--) {
+        if (sdl.GamepadConnected(open[i].gamepad)) continue;
+        fprintf(stderr, "window: controller disconnected\n");
+        sdl.CloseGamepad(open[i].gamepad);
+        open[i] = open[--open_count];
+    }
+    if (wait-- <= 0) {
+        wait = PAD_RETRY_TICKS;
+        int count = 0;
+        uint32_t *ids = sdl.GetGamepads(&count);
+        for (int i = 0; ids && i < count && open_count < SDL_MAX_PADS; i++) {
+            int known = 0;
+            for (int k = 0; k < open_count; k++) known |= open[k].id == ids[i];
+            if (known) continue;
+            void *gamepad = sdl.OpenGamepad(ids[i]);
+            if (!gamepad) continue;
+            fprintf(stderr, "window: controller found: %s\n", sdl.GetGamepadName(gamepad));
+            open[open_count].gamepad = gamepad;
+            open[open_count++].id = ids[i];
+        }
+        if (ids) sdl.free(ids);
+    }
+    uint32_t b = 0;
+    for (int n = 0; n < open_count; n++) {
+        void *gamepad = open[n].gamepad;
+        for (size_t i = 0; i < sizeof P / sizeof P[0]; i++)
+            if (sdl.GetGamepadButton(gamepad, P[i].button)) b |= P[i].bit;
+        if (sdl.GetGamepadAxis(gamepad, SDL_AXIS_LEFT_TRIGGER) > SDL_TRIGGER_DOWN) b |= B_L;
+        if (sdl.GetGamepadAxis(gamepad, SDL_AXIS_RIGHT_TRIGGER) > SDL_TRIGGER_DOWN) b |= B_R;
+        stick(sdl.GetGamepadAxis(gamepad, SDL_AXIS_LEFTX), sdl.GetGamepadAxis(gamepad, SDL_AXIS_LEFTY), ax, ay);
     }
     return b;
+}
+
+static uint32_t pad(uint8_t *ax, uint8_t *ay) {
+    return sdl_ready() ? sdl_pad(ax, ay) : xinput_pad(ax, ay);
 }
 
 static void paint(HWND h) {

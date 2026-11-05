@@ -1,11 +1,11 @@
 /* psprecomp -- a window to play in.
  *
- * Shows the PSP display, scaled, and turns the keyboard and the first game
- * controller into sceCtrl input. It runs on a host thread of its own and
+ * Shows the PSP display, scaled, and turns the keyboard and game controllers
+ * into sceCtrl input. It runs on a host thread of its own and
  * reads the game's front buffer on a 60 Hz timer, so it never waits on the
  * game and the game never waits on it.
  *
- *   Keyboard            Controller (XInput)     PSP
+ *   Keyboard            Controller (Xbox names) PSP
  *   arrows              d-pad                   d-pad
  *   (none)              left stick              analog stick
  *   Z                   A                       Cross
@@ -16,7 +16,11 @@
  *   Enter               Start                   Start
  *   Backspace           Back                    Select
  *
- * Windows only for now (Win32 + GDI + XInput: no dependencies). Elsewhere
+ * The face buttons go by position, so the bottom one is Cross on any controller.
+ * With SDL3.dll beside the executable, all connected controllers SDL knows work
+ * at once, PlayStation and Nintendo included; without it, the first XInput one does.
+ *
+ * Windows only for now (Win32 + GDI + XInput, no build dependencies). Elsewhere
  * psp_window_start() returns -1. */
 #ifndef PSPRECOMP_WINDOW_H
 #define PSPRECOMP_WINDOW_H
