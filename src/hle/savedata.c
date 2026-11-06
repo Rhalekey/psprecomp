@@ -197,7 +197,8 @@ static uint32_t do_load(uint32_t param, const char *save) {
     const int got = file[0] ? read_file(dir, file, psp_read32(param + P_DATA), psp_read32(param + P_DATA_CAP)) : 0;
     if (got < 0) {
         fprintf(stderr, "savedata: nothing to load in %s\n", dir);
-        report_event(PSP_SAVEDATA_NO_DATA);
+        /* A save that is there and cannot be read is not the same as having none. */
+        report_event(slot_exists(param, save) ? PSP_SAVEDATA_UNREADABLE : PSP_SAVEDATA_NO_DATA);
         return ERROR_LOAD_NO_DATA;
     }
     psp_write32(param + P_DATA_SIZE, (uint32_t)got);

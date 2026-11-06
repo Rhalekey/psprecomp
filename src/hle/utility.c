@@ -38,6 +38,8 @@ static int g_state[DIALOG_KINDS];
 
 void psp_utility_init(void) { memset(g_state, 0, sizeof g_state); }
 
+int psp_utility_savedata_open(void) { return g_state[KIND_SAVEDATA] != 0; }
+
 static void dialog_init(int kind, const char *name) {
     const uint32_t param = psp_arg(0);
     uint32_t result = 0;

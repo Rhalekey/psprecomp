@@ -210,10 +210,12 @@ uint64_t psp_io_bytes_read(void);
  * screens for this are not drawn. Runs on a guest thread, so keep it short. */
 enum {
     PSP_SAVEDATA_SAVED, PSP_SAVEDATA_LOADED, PSP_SAVEDATA_NO_DATA,
-    PSP_SAVEDATA_DELETED, PSP_SAVEDATA_FAILED
+    PSP_SAVEDATA_DELETED, PSP_SAVEDATA_FAILED, PSP_SAVEDATA_UNREADABLE
 };
 typedef void (*psp_savedata_event_fn)(int event);
 void psp_savedata_set_event_handler(psp_savedata_event_fn fn);
+/* Whether the system's save screen is open, during which a game may draw nothing. */
+int psp_utility_savedata_open(void);
 
 void psp_utility_init(void);
 void psp_utility_register(void);

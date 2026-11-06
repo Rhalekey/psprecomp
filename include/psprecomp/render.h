@@ -146,10 +146,9 @@ extern const psp_render_backend psp_render_gl;
 void psp_render_gl_set_scale(int scale);
 /* Before the first frame: draws on a larger canvas, so the image can follow the window's shape. */
 void psp_render_gl_set_wide(int on);
-/* At any time: mipmaps and anisotropic filtering for what the game samples smoothly. On by default. */
-void psp_render_gl_set_clearer_textures(int on);
-/* At any time: a folder of larger textures for those nothing else stands in for, or NULL for none. */
-void psp_render_gl_set_upscale_dir(const char *dir);
+/* A message that stays until psp_render_gl_clear_held_message. */
+void psp_render_gl_show_held_message(const char *utf8);
+void psp_render_gl_clear_held_message(void);
 /* At any time: 0 keeps the PSP's screen with bars, 1 enlarges the 3D scene in a taller window, 2 shows more of it. */
 void psp_render_gl_set_wide_view(int view);
 /* Writes each draw of the next whole frame to stderr. */

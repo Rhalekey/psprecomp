@@ -83,7 +83,6 @@
     X(PFNGLGETPROGRAMINFOLOGPROC, glGetProgramInfoLog) \
     X(PFNGLUSEPROGRAMPROC, glUseProgram) \
     X(PFNGLGETUNIFORMLOCATIONPROC, glGetUniformLocation) \
-    X(PFNGLGENERATEMIPMAPPROC, glGenerateMipmap) \
     X(PFNGLUNIFORM1FPROC, glUniform1f) \
     X(PFNGLUNIFORM1IPROC, glUniform1i) \
     X(PFNGLUNIFORM2FPROC, glUniform2f) \
@@ -216,7 +215,6 @@ typedef struct {
     GLuint tex;
     int min_linear, mag_linear, clamp_u, clamp_v;
     int replaced;    /* a larger file stands in for it */
-    int mips;        /* has smaller versions, for when it is seen small or from the side */
     int use_logged;
 } gl_texture;
 
@@ -276,9 +274,6 @@ void psp_render_gl_set_present_filter(int linear) { g_present_linear = linear; }
 
 static char g_replace_dir[1024];
 static char g_dump_dir[1024];
-/* Larger textures of the size the player chose, for those nothing else stands in for. */
-static char g_upscale_dir[1024];
-static void *volatile g_upscale_asked;
 
 /* Pictures in the language being played, tried first. Asked for from any thread, and taken
  * up by the one that draws, which then has to forget what it has made. */
@@ -306,15 +301,6 @@ void psp_render_gl_set_language_dir(const char *dir) {
     if (!copy) return;
     strcpy(copy, text);
     void *before = InterlockedExchangePointer((void *volatile *)&g_language_asked, copy);
-    free(before);
-}
-
-void psp_render_gl_set_upscale_dir(const char *dir) {
-    const char *text = dir ? dir : "";
-    char *copy = (char *)malloc(strlen(text) + 1);
-    if (!copy) return;
-    strcpy(copy, text);
-    void *before = InterlockedExchangePointer((void *volatile *)&g_upscale_asked, copy);
     free(before);
 }
 
@@ -617,10 +603,6 @@ static FILE *open_replacement(uint32_t hash, const char *kind, uint32_t size[2])
         snprintf(path, sizeof path, "%s\\%08X.%s", g_replace_dir, hash, kind);
         f = fopen(path, "rb");
     }
-    if (!f && g_upscale_dir[0] && !strcmp(kind, "rgba")) {
-        snprintf(path, sizeof path, "%s\\%08X.%s", g_upscale_dir, hash, kind);
-        f = fopen(path, "rb");
-    }
     if (!f) return NULL;
     if (fread(size, 4, 2, f) == 2 && size[0] && size[0] <= REPLACE_MAX_SIDE && size[1] && size[1] <= REPLACE_MAX_SIDE) {
         fprintf(stderr, "gl: texture replaced by %s\n", path);
@@ -786,32 +768,9 @@ static void dump_texture(uint32_t colours, int w, int h) {
     free(raw);
 }
 
-/* Each texture this run has used, once, beside those saved: what larger ones get made for. */
-static void note_texture_used(uint32_t colours, int w, int h) {
-    static uint32_t seen[16384];
-    static FILE *list;
-    static int tried;
-    for (uint32_t i = colours % 16384, tries = 0; tries < 16384; i = (i + 1) % 16384, tries++) {
-        if (seen[i] == colours) return;
-        if (!seen[i]) {
-            seen[i] = colours;
-            break;
-        }
-    }
-    if (!tried) {
-        tried = 1;
-        char path[1200];
-        snprintf(path, sizeof path, "%s\\..\\textures_used.txt", g_dump_dir);
-        list = fopen(path, "w");
-    }
-    if (!list) return;
-    fprintf(list, "%08X %d %d\n", colours, w, h);
-    fflush(list);
-}
-
 /* The file standing in for what is in g_decode, or NULL. */
 static const uint32_t *replacement_for(int w, int h, int *out_w, int *out_h) {
-    if ((!g_replace_dir[0] && !g_language_dir[0] && !g_dump_dir[0] && !g_upscale_dir[0]) || w < REPLACE_MIN_SIDE || h < REPLACE_MIN_SIDE) return NULL;
+    if ((!g_replace_dir[0] && !g_language_dir[0] && !g_dump_dir[0]) || w < REPLACE_MIN_SIDE || h < REPLACE_MIN_SIDE) return NULL;
 
     /* A picture is known by its colours, and letters by their shape alone. */
     uint32_t colours = 2166136261u, shape = 2166136261u;
@@ -823,11 +782,8 @@ static const uint32_t *replacement_for(int w, int h, int *out_w, int *out_h) {
         shape = (shape ^ solid) * 16777619u;
     }
     /* Saved as the game has it, whether or not a file stands in for it on the screen. */
-    if (g_dump_dir[0]) {
-        dump_texture(colours, w, h);
-        note_texture_used(colours, w, h);
-    }
-    if (!g_replace_dir[0] && !g_language_dir[0] && !g_upscale_dir[0]) return NULL;
+    if (g_dump_dir[0]) dump_texture(colours, w, h);
+    if (!g_replace_dir[0] && !g_language_dir[0]) return NULL;
 
     for (int i = 0; i < g_replace_cached; i++) {
         const replacement *r = &g_replace_cache[i];
@@ -868,8 +824,6 @@ static void decode_texture(gl_texture *e, const psp_draw_state *st) {
     glBindTexture(GL_TEXTURE_2D, e->tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, up_w, up_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-    e->mips = st->tex_min_linear;
-    if (e->mips) p_glGenerateMipmap(GL_TEXTURE_2D);
     const uint64_t took = gl_now_us() - began;
     g_decoded++;
     g_decode_us += took;
@@ -901,7 +855,6 @@ static void take_up_dir(void *volatile *where, char *dir, size_t size) {
 static void take_up_language(void) {
     take_up_dir(&g_language_asked, g_language_dir, sizeof g_language_dir);
     take_up_dir(&g_vector_asked, g_vector_dir, sizeof g_vector_dir);
-    take_up_dir(&g_upscale_asked, g_upscale_dir, sizeof g_upscale_dir);
 }
 
 static gl_texture *get_texture(const psp_draw_state *st) {
@@ -949,36 +902,13 @@ static gl_texture *get_texture(const psp_draw_state *st) {
     return e;
 }
 
-/* What the game samples smoothly, its models and scenes, is seen better small and from the side
- * with these. What it samples sharply is the interface, which stays as it is. */
-#define GL_TEXTURE_MAX_ANISOTROPY_ANY 0x84FE
-#define GL_MAX_TEXTURE_MAX_ANISOTROPY_ANY 0x84FF
-#define MOST_ANISOTROPY 16.0f
-static volatile int g_clearer_textures = 1;
-
-void psp_render_gl_set_clearer_textures(int on) { g_clearer_textures = on; }
-
-static float most_anisotropy(void) {
-    static float most;
-    if (most == 0.0f) {
-        glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_ANY, &most);
-        /* A driver without it leaves an error and the number untouched. */
-        if (glGetError() != GL_NO_ERROR || most < 1.0f) most = 1.0f;
-        if (most > MOST_ANISOTROPY) most = MOST_ANISOTROPY;
-        fprintf(stderr, "gl: anisotropy up to %.0f\n", most);
-    }
-    return most;
-}
-
 static void bind_sampler(GLuint tex, int *min_seen, int *mag_seen, int *u_seen, int *v_seen,
-                         const psp_draw_state *st, int smooth, int mips) {
+                         const psp_draw_state *st, int smooth) {
     glBindTexture(GL_TEXTURE_2D, tex);
-    const int clearer = mips && st->tex_min_linear && g_clearer_textures;
-    const int min_linear = clearer ? 2 : st->tex_min_linear || smooth, mag_linear = st->tex_mag_linear || smooth;
+    const int min_linear = st->tex_min_linear || smooth, mag_linear = st->tex_mag_linear || smooth;
     if (*min_seen != min_linear) {
         *min_seen = min_linear;
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min_linear == 2 ? GL_LINEAR_MIPMAP_LINEAR : min_linear ? GL_LINEAR : GL_NEAREST);
-        if (mips) glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_ANY, clearer ? most_anisotropy() : 1.0f);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min_linear ? GL_LINEAR : GL_NEAREST);
     }
     if (*mag_seen != mag_linear) {
         *mag_seen = mag_linear;
@@ -1002,7 +932,7 @@ static int setup_texture(const psp_draw_state *st) {
         gl_target *t = find_target(st->tex_addr);
         if (t && t != g_bound) {
             int unknown_min = -1, unknown_mag = -1, unknown_u = -1, unknown_v = -1;
-            bind_sampler(t->color, &unknown_min, &unknown_mag, &unknown_u, &unknown_v, st, 0, 0);
+            bind_sampler(t->color, &unknown_min, &unknown_mag, &unknown_u, &unknown_v, st, 0);
             p_glUniform2f(U.uvscale, 1.0f / (float)g_canvas_w, 1.0f / (float)g_canvas_h);
             p_glUniform2f(U.uvat, (float)g_canvas_x / (float)g_canvas_w, (float)g_canvas_y / (float)g_canvas_h);
             return 1;
@@ -1010,7 +940,7 @@ static int setup_texture(const psp_draw_state *st) {
     }
     gl_texture *e = get_texture(st);
     if (!e) return 0;
-    bind_sampler(e->tex, &e->min_linear, &e->mag_linear, &e->clamp_u, &e->clamp_v, st, e->replaced, e->mips);
+    bind_sampler(e->tex, &e->min_linear, &e->mag_linear, &e->clamp_u, &e->clamp_v, st, e->replaced);
     /* How a replaced texture is used, once: its look depends on this as much as on the file. */
     if (e->replaced && !e->use_logged) {
         e->use_logged = 1;
@@ -1534,12 +1464,15 @@ static void draw_overlay(int image_x, int image_top, int image_h) {
  * screens would have said. Windows draws the text, so any language works, and the
  * result is kept as a little framebuffer to blit. */
 
-#define MESSAGE_MS 3000u
+#define MESSAGE_MS 2000u
+#define MESSAGE_FOREVER (~0ULL)
+#define MESSAGE_LINE 2
 
 static char g_message[256];
 static volatile LONG g_message_serial;
 static CRITICAL_SECTION g_message_lock;
 static volatile LONG g_message_lock_ready;
+static volatile int g_message_held;
 
 void psp_render_gl_show_message(const char *utf8) {
     if (InterlockedCompareExchange(&g_message_lock_ready, 1, 0) == 0)
@@ -1549,6 +1482,13 @@ void psp_render_gl_show_message(const char *utf8) {
     LeaveCriticalSection(&g_message_lock);
     InterlockedIncrement(&g_message_serial);
 }
+
+void psp_render_gl_show_held_message(const char *utf8) {
+    g_message_held = 1;
+    psp_render_gl_show_message(utf8);
+}
+
+void psp_render_gl_clear_held_message(void) { g_message_held = 0; }
 
 static GLuint g_message_fbo, g_message_tex;
 static int g_message_w, g_message_h, g_message_for_h;
@@ -1564,7 +1504,7 @@ static void build_message(int image_h) {
     if (len <= 1) return;
 
     HDC dc = CreateCompatibleDC(NULL);
-    const int font_h = image_h / 18 > 12 ? image_h / 18 : 12;
+    const int font_h = image_h / 24 > 12 ? image_h / 24 : 12;
     HFONT font = CreateFontA(-font_h, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY,
                              0, "Segoe UI");
     HGDIOBJ old_font = SelectObject(dc, font);
@@ -1584,7 +1524,12 @@ static void build_message(int image_h) {
     HBITMAP bitmap = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
     if (bitmap && bits) {
         HGDIOBJ old_bitmap = SelectObject(dc, bitmap);
-        memset(bits, 0, (size_t)w * (size_t)h * 4u);
+        /* A dark plate between two lines of the game's teal, as its own windows have. */
+        for (int row = 0; row < h; row++) {
+            const uint32_t colour = row < MESSAGE_LINE || row >= h - MESSAGE_LINE ? 0x001CD8C9u : 0x001A1E22u;
+            uint32_t *line = (uint32_t *)bits + (size_t)row * (size_t)w;
+            for (int col = 0; col < w; col++) line[col] = colour;
+        }
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(255, 255, 255));
         TextOutW(dc, margin, margin / 2, text, len - 1);
@@ -1608,9 +1553,10 @@ static void draw_message(int image_x, int image_y, int image_w, int image_h) {
     const LONG serial = g_message_serial;
     if (serial != g_message_drawn) {
         g_message_drawn = serial;
-        g_message_until = GetTickCount64() + MESSAGE_MS;
+        g_message_until = g_message_held ? MESSAGE_FOREVER : GetTickCount64() + MESSAGE_MS;
         g_message_for_h = 0;
     }
+    if (g_message_until == MESSAGE_FOREVER && !g_message_held) g_message_until = 0;
     if (!g_message_until || GetTickCount64() >= g_message_until) return;
     if (g_message_for_h != image_h) {
         g_message_for_h = image_h;
@@ -1619,7 +1565,8 @@ static void draw_message(int image_x, int image_y, int image_w, int image_h) {
     if (!g_message_fbo) return;
 
     const int x = image_x + (image_w - g_message_w) / 2;
-    const int y = image_y + image_h / 12;
+    /* Above the bottom band, where nothing is read while it is there. */
+    const int y = image_y + image_h / 6;
     p_glBindFramebuffer(GL_READ_FRAMEBUFFER, g_message_fbo);
     p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);     /* creating it may have moved this */
     p_glBlitFramebuffer(0, 0, g_message_w, g_message_h, x, y + g_message_h, x + g_message_w, y,
@@ -1644,6 +1591,8 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
     int source_x = 0, source_y = 0, source_w, source_h;
     GLenum filter;
 
+    /* The game draws nothing while the save screen is open, so the last frame stays. */
+    if (psp_utility_savedata_open()) return;
     gl_target *t = find_target(addr);
     if (g_trace_draws == 1) {
         g_trace_draws = 0;
