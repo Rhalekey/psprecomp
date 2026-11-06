@@ -29,15 +29,46 @@ static int g_scale;
 static const char *g_title = "psprecomp";
 static uint32_t g_px[W * H];
 
+/* In the order of PSP_BIND_*. */
+static const uint32_t BUTTON_BIT[PSP_BIND_COUNT] = {
+    B_UP, B_RIGHT, B_DOWN, B_LEFT, B_CROSS, B_CIRCLE, B_SQUARE, B_TRIANGLE, B_L, B_R, B_START, B_SELECT,
+};
+static const int DEFAULT_KEYS[PSP_BIND_COUNT] = {
+    VK_UP, VK_RIGHT, VK_DOWN, VK_LEFT, 'Z', 'X', 'A', 'S', 'Q', 'W', VK_RETURN, VK_BACK,
+};
+#define PAD_BIT(id) ((uint32_t)1 << (id))
+static const uint32_t DEFAULT_PADS[PSP_BIND_COUNT] = {
+    PAD_BIT(11), PAD_BIT(14), PAD_BIT(12), PAD_BIT(13), PAD_BIT(0), PAD_BIT(1), PAD_BIT(2), PAD_BIT(3),
+    PAD_BIT(9) | PAD_BIT(PSP_PAD_LT), PAD_BIT(10) | PAD_BIT(PSP_PAD_RT), PAD_BIT(6), PAD_BIT(4),
+};
+static volatile int g_keys[PSP_BIND_COUNT] = {
+    VK_UP, VK_RIGHT, VK_DOWN, VK_LEFT, 'Z', 'X', 'A', 'S', 'Q', 'W', VK_RETURN, VK_BACK,
+};
+static volatile uint32_t g_pads[PSP_BIND_COUNT] = {
+    PAD_BIT(11), PAD_BIT(14), PAD_BIT(12), PAD_BIT(13), PAD_BIT(0), PAD_BIT(1), PAD_BIT(2), PAD_BIT(3),
+    PAD_BIT(9) | PAD_BIT(PSP_PAD_LT), PAD_BIT(10) | PAD_BIT(PSP_PAD_RT), PAD_BIT(6), PAD_BIT(4),
+};
+static volatile uint32_t g_pad_raw;
+
+void psp_window_set_key(int button, int vk) { g_keys[button] = vk; }
+int psp_window_get_key(int button) { return g_keys[button]; }
+void psp_window_set_pad(int button, uint32_t mask) { g_pads[button] = mask; }
+uint32_t psp_window_get_pad(int button) { return g_pads[button]; }
+uint32_t psp_window_pad_raw(void) { return g_pad_raw; }
+
+void psp_window_reset_buttons(void) {
+    for (int i = 0; i < PSP_BIND_COUNT; i++) {
+        g_keys[i] = DEFAULT_KEYS[i];
+        g_pads[i] = DEFAULT_PADS[i];
+    }
+}
+
 static uint32_t keyboard(void) {
-    static const struct { int vk; uint32_t bit; } K[] = {
-        { VK_UP, B_UP }, { VK_RIGHT, B_RIGHT }, { VK_DOWN, B_DOWN }, { VK_LEFT, B_LEFT },
-        { 'Z', B_CROSS }, { 'X', B_CIRCLE }, { 'A', B_SQUARE }, { 'S', B_TRIANGLE },
-        { 'Q', B_L }, { 'W', B_R }, { VK_RETURN, B_START }, { VK_BACK, B_SELECT },
-    };
     uint32_t b = 0;
-    for (size_t i = 0; i < sizeof K / sizeof K[0]; i++)
-        if (GetAsyncKeyState(K[i].vk) & 0x8000) b |= K[i].bit;
+    /* Alt and the Windows key go with shortcuts: Alt+Enter is not Start, Win+Shift+S not Triangle. */
+    if ((GetAsyncKeyState(VK_MENU) | GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) return 0;
+    for (int i = 0; i < PSP_BIND_COUNT; i++)
+        if (g_keys[i] && (GetAsyncKeyState(g_keys[i]) & 0x8000)) b |= BUTTON_BIT[i];
     return b;
 }
 
@@ -72,25 +103,26 @@ static void stick(int x, int y, uint8_t *ax, uint8_t *ay) {
     *ay = (uint8_t)((y + 32768) >> 8);
 }
 
-/* The first XInput controller connected, if any. */
+/* The first XInput controller connected, if any. Its buttons get SDL's numbers. */
 static uint32_t xinput_pad(uint8_t *ax, uint8_t *ay) {
-    static const struct { WORD x; uint32_t bit; } P[] = {
-        { XINPUT_GAMEPAD_DPAD_UP, B_UP }, { XINPUT_GAMEPAD_DPAD_RIGHT, B_RIGHT },
-        { XINPUT_GAMEPAD_DPAD_DOWN, B_DOWN }, { XINPUT_GAMEPAD_DPAD_LEFT, B_LEFT },
-        { XINPUT_GAMEPAD_A, B_CROSS }, { XINPUT_GAMEPAD_B, B_CIRCLE },
-        { XINPUT_GAMEPAD_X, B_SQUARE }, { XINPUT_GAMEPAD_Y, B_TRIANGLE },
-        { XINPUT_GAMEPAD_LEFT_SHOULDER, B_L }, { XINPUT_GAMEPAD_RIGHT_SHOULDER, B_R },
-        { XINPUT_GAMEPAD_START, B_START }, { XINPUT_GAMEPAD_BACK, B_SELECT },
+    static const struct { WORD x; int id; } P[] = {
+        { XINPUT_GAMEPAD_DPAD_UP, 11 }, { XINPUT_GAMEPAD_DPAD_RIGHT, 14 },
+        { XINPUT_GAMEPAD_DPAD_DOWN, 12 }, { XINPUT_GAMEPAD_DPAD_LEFT, 13 },
+        { XINPUT_GAMEPAD_A, 0 }, { XINPUT_GAMEPAD_B, 1 },
+        { XINPUT_GAMEPAD_X, 2 }, { XINPUT_GAMEPAD_Y, 3 },
+        { XINPUT_GAMEPAD_LEFT_SHOULDER, 9 }, { XINPUT_GAMEPAD_RIGHT_SHOULDER, 10 },
+        { XINPUT_GAMEPAD_START, 6 }, { XINPUT_GAMEPAD_BACK, 4 },
+        { XINPUT_GAMEPAD_LEFT_THUMB, 7 }, { XINPUT_GAMEPAD_RIGHT_THUMB, 8 },
     };
     XINPUT_STATE s;
     if (!read_pad(&s)) return 0;
-    uint32_t b = 0;
+    uint32_t raw = 0;
     for (size_t i = 0; i < sizeof P / sizeof P[0]; i++)
-        if (s.Gamepad.wButtons & P[i].x) b |= P[i].bit;
-    if (s.Gamepad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) b |= B_L;
-    if (s.Gamepad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) b |= B_R;
+        if (s.Gamepad.wButtons & P[i].x) raw |= PAD_BIT(P[i].id);
+    if (s.Gamepad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) raw |= PAD_BIT(PSP_PAD_LT);
+    if (s.Gamepad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) raw |= PAD_BIT(PSP_PAD_RT);
     stick(s.Gamepad.sThumbLX, -1 - s.Gamepad.sThumbLY, ax, ay);
-    return b;
+    return raw;
 }
 
 /* SDL3 knows the other controllers: PlayStation, Nintendo and many more. It is an optional
@@ -98,9 +130,7 @@ static uint32_t xinput_pad(uint8_t *ax, uint8_t *ay) {
  * below comes from SDL3's stable interface. */
 enum {
     SDL_INIT_GAMEPAD_ = 0x2000,
-    SDL_SOUTH = 0, SDL_EAST = 1, SDL_WEST = 2, SDL_NORTH = 3, SDL_BACK = 4, SDL_START = 6,
-    SDL_LEFT_SHOULDER = 9, SDL_RIGHT_SHOULDER = 10,
-    SDL_DPAD_UP = 11, SDL_DPAD_DOWN = 12, SDL_DPAD_LEFT = 13, SDL_DPAD_RIGHT = 14,
+    SDL_BUTTONS = 21,
     SDL_AXIS_LEFTX = 0, SDL_AXIS_LEFTY = 1, SDL_AXIS_LEFT_TRIGGER = 4, SDL_AXIS_RIGHT_TRIGGER = 5,
     SDL_TRIGGER_DOWN = 30 * 128,        /* XInput's threshold, on SDL's scale */
     SDL_MAX_PADS = 8
@@ -159,14 +189,6 @@ static int sdl_ready(void) {
 /* Every controller SDL can see, all playing as one. Buttons go by where they sit and not by
  * what is printed on them, so the bottom one is Cross everywhere, B on a Nintendo controller. */
 static uint32_t sdl_pad(uint8_t *ax, uint8_t *ay) {
-    static const struct { int button; uint32_t bit; } P[] = {
-        { SDL_DPAD_UP, B_UP }, { SDL_DPAD_RIGHT, B_RIGHT },
-        { SDL_DPAD_DOWN, B_DOWN }, { SDL_DPAD_LEFT, B_LEFT },
-        { SDL_SOUTH, B_CROSS }, { SDL_EAST, B_CIRCLE },
-        { SDL_WEST, B_SQUARE }, { SDL_NORTH, B_TRIANGLE },
-        { SDL_LEFT_SHOULDER, B_L }, { SDL_RIGHT_SHOULDER, B_R },
-        { SDL_START, B_START }, { SDL_BACK, B_SELECT },
-    };
     static struct { void *gamepad; uint32_t id; } open[SDL_MAX_PADS];
     static int open_count, wait;
     sdl.PumpEvents();
@@ -193,20 +215,25 @@ static uint32_t sdl_pad(uint8_t *ax, uint8_t *ay) {
         }
         if (ids) sdl.free(ids);
     }
-    uint32_t b = 0;
+    uint32_t raw = 0;
     for (int n = 0; n < open_count; n++) {
         void *gamepad = open[n].gamepad;
-        for (size_t i = 0; i < sizeof P / sizeof P[0]; i++)
-            if (sdl.GetGamepadButton(gamepad, P[i].button)) b |= P[i].bit;
-        if (sdl.GetGamepadAxis(gamepad, SDL_AXIS_LEFT_TRIGGER) > SDL_TRIGGER_DOWN) b |= B_L;
-        if (sdl.GetGamepadAxis(gamepad, SDL_AXIS_RIGHT_TRIGGER) > SDL_TRIGGER_DOWN) b |= B_R;
+        for (int id = 0; id < SDL_BUTTONS; id++)
+            if (sdl.GetGamepadButton(gamepad, id)) raw |= PAD_BIT(id);
+        if (sdl.GetGamepadAxis(gamepad, SDL_AXIS_LEFT_TRIGGER) > SDL_TRIGGER_DOWN) raw |= PAD_BIT(PSP_PAD_LT);
+        if (sdl.GetGamepadAxis(gamepad, SDL_AXIS_RIGHT_TRIGGER) > SDL_TRIGGER_DOWN) raw |= PAD_BIT(PSP_PAD_RT);
         stick(sdl.GetGamepadAxis(gamepad, SDL_AXIS_LEFTX), sdl.GetGamepadAxis(gamepad, SDL_AXIS_LEFTY), ax, ay);
     }
-    return b;
+    return raw;
 }
 
 static uint32_t pad(uint8_t *ax, uint8_t *ay) {
-    return sdl_ready() ? sdl_pad(ax, ay) : xinput_pad(ax, ay);
+    const uint32_t raw = sdl_ready() ? sdl_pad(ax, ay) : xinput_pad(ax, ay);
+    g_pad_raw = raw;
+    uint32_t b = 0;
+    for (int i = 0; i < PSP_BIND_COUNT; i++)
+        if (raw & g_pads[i]) b |= BUTTON_BIT[i];
+    return b;
 }
 
 static void paint(HWND h) {
@@ -246,9 +273,42 @@ static void paint(HWND h) {
     EndPaint(h, &ps);
 }
 
+/* The whole of the window's monitor with no borders, and back to the window as it was. */
+static void toggle_full_screen(HWND h) {
+    static WINDOWPLACEMENT before;
+    static int full;
+    if (!full) {
+        before.length = sizeof before;
+        GetWindowPlacement(h, &before);
+        MONITORINFO info;
+        info.cbSize = sizeof info;
+        if (!GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &info)) return;
+        const RECT m = info.rcMonitor;
+        SetWindowLongPtrA(h, GWL_STYLE, (GetWindowLongPtrA(h, GWL_STYLE) & ~(LONG_PTR)WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        SetWindowPos(h, HWND_TOP, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+        full = 1;
+    } else {
+        SetWindowLongPtrA(h, GWL_STYLE, (GetWindowLongPtrA(h, GWL_STYLE) & ~(LONG_PTR)WS_POPUP) | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(h, &before);
+        SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        full = 0;
+    }
+}
+
+/* Looked for here, as a screen of the host's own can hold the keyboard's focus. */
+static void full_screen_keys(HWND h) {
+    static int was_down = 1;
+    const int focused = GetForegroundWindow() == h;
+    const int down = focused && ((GetAsyncKeyState(VK_F11) & 0x8000) ||
+                                 ((GetAsyncKeyState(VK_MENU) & 0x8000) && (GetAsyncKeyState(VK_RETURN) & 0x8000)));
+    if (down && !was_down) toggle_full_screen(h);
+    was_down = down;
+}
+
 static LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_TIMER: {
+        full_screen_keys(h);
         uint8_t ax = 128, ay = 128;
         uint32_t b = pad(&ax, &ay);
         if (GetForegroundWindow() == h) b |= keyboard();   /* keys only when focused */
@@ -259,6 +319,8 @@ static LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_PAINT:      paint(h); return 0;
     case WM_ERASEBKGND: return 1;
+    /* No beep for Alt+Enter. */
+    case WM_SYSCHAR:    if (wp == VK_RETURN) return 0; return DefWindowProcA(h, msg, wp, lp);
     case WM_DESTROY:    PostQuitMessage(0); return 0;
     default:            return DefWindowProcA(h, msg, wp, lp);
     }
@@ -330,5 +392,11 @@ int psp_window_closed(void) { return 0; }
 void *psp_window_handle(void) { return 0; }
 void psp_window_set_external(int on) { (void)on; }
 uint32_t psp_window_buttons(void) { return 0; }
+void psp_window_set_key(int button, int vk) { (void)button; (void)vk; }
+int psp_window_get_key(int button) { (void)button; return 0; }
+void psp_window_set_pad(int button, uint32_t mask) { (void)button; (void)mask; }
+uint32_t psp_window_get_pad(int button) { (void)button; return 0; }
+void psp_window_reset_buttons(void) {}
+uint32_t psp_window_pad_raw(void) { return 0; }
 
 #endif

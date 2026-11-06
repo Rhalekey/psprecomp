@@ -53,6 +53,7 @@ enum {
  * become. Filled by the interpreter from the state commands; read by the
  * backend. Field comments name the command each comes from. */
 typedef struct {
+    int      through;        /* VTYPE bit 23: positions are already screen pixels */
     int      clear;          /* CLEAR bit 0: write vertex colour, nothing else */
     int      clear_color;    /* CLEAR bit 8: ...to RGB */
     int      clear_alpha;    /* CLEAR bit 9: ...to alpha (stencil) */
@@ -143,6 +144,16 @@ extern const psp_render_backend psp_render_null;
 extern const psp_render_backend psp_render_gl;
 /* How many times the PSP's resolution targets are drawn at. Set it first. */
 void psp_render_gl_set_scale(int scale);
+/* Before the first frame: draws on a larger canvas, so the image can follow the window's shape. */
+void psp_render_gl_set_wide(int on);
+/* At any time: mipmaps and anisotropic filtering for what the game samples smoothly. On by default. */
+void psp_render_gl_set_clearer_textures(int on);
+/* At any time: a folder of larger textures for those nothing else stands in for, or NULL for none. */
+void psp_render_gl_set_upscale_dir(const char *dir);
+/* At any time: 0 keeps the PSP's screen with bars, 1 enlarges the 3D scene in a taller window, 2 shows more of it. */
+void psp_render_gl_set_wide_view(int view);
+/* Writes each draw of the next whole frame to stderr. */
+void psp_render_gl_trace_frame(void);
 /* Smooth the picture when fitting it to the window, or keep hard pixels. */
 void psp_render_gl_set_present_filter(int linear);
 /* Where larger versions of whole textures are kept. See render_gl.c. */
@@ -154,6 +165,9 @@ void psp_render_gl_set_overlay(int on);
 /* A folder of .rgba files, tried before the replacement folder, or NULL for none. Any thread
  * can call this while the game runs; textures already in use change to match. */
 void psp_render_gl_set_language_dir(const char *dir);
+
+/* Pictures drawn from vectors, tried before those of the language. NULL for none. */
+void psp_render_gl_set_vector_dir(const char *dir);
 /* Show a line of UTF-8 text over the picture for a few seconds. Any thread. */
 void psp_render_gl_show_message(const char *utf8);
 /* Textures decoded so far and the real time that took, in microseconds. */

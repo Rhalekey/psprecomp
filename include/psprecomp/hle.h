@@ -226,6 +226,9 @@ void psp_misc_register(void);
 void psp_misc_reset(void);
 int  psp_exit_requested(void);
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
+void psp_ctrl_force(uint32_t buttons);
+/* Sees the buttons as the game reads them, and can change them. NULL for none. */
+void psp_ctrl_set_filter(uint32_t (*filter)(uint32_t buttons));
 uint64_t psp_audio_blocks(void);
 /* Receives every block of PCM the game outputs, on whichever thread sent it. The
  * samples are only valid during the call; volumes are 0x8000 at full. */

@@ -817,6 +817,9 @@ static void emit_function(ectx *c, const a_func *fn) {
         a_decode(fetch(an, a), a, &in);
 
         if (c->is_label[i]) fprintf(f, "L_%08X: PSP_MARK(0x%08Xu);\n", a, a);
+        /* A hook inside a function runs before the instruction it names. It needs its
+         * function to have one at the entry too, for the declaration. */
+        if (a != fn->addr && is_hooked(a)) fprintf(f, "    psp_game_hook(0x%08Xu);\n", a);
         last_terminal = in.is_return || in.is_indirect ||
                         (in.is_jump && !in.is_call);
         comment(c, &in);

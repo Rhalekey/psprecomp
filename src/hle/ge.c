@@ -666,6 +666,7 @@ static int trace_frame(void) {
 /* GE_CULL 0 makes counter-clockwise triangles the front, so clockwise ones go, and
  * 1 the reverse. Through-mode drawing is flat screen art and is never culled. */
 static void draw_prim(uint32_t type, uint32_t count) {
+    g_ds.through = (int)VT_THROUGH(g_ge.vtype);
     g_ds.cull = (g_cull_on && !VT_THROUGH(g_ge.vtype) && !g_ds.clear)
                     ? (g_cull_face ? PSP_CULL_CCW : PSP_CULL_CW) : PSP_CULL_NONE;
     if (trace_frame())

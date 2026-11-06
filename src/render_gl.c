@@ -25,6 +25,7 @@
 #include <GL/glext.h>
 
 #include <stddef.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,34 @@
 #define LOGICAL 512
 #define PSP_W   480
 #define PSP_H   272
+
+/* With the wide canvas on, everything is drawn in the middle of a larger target, so that what
+ * the 3D scene has past the PSP's screen lands somewhere. These are what shapes it can reach. */
+#define WIDE_CANVAS_W 768
+#define WIDE_CANVAS_H 512
+/* In a taller window, flat pieces wholly above the first line or below the second go with the
+ * window's top or bottom. What is parked off the screen goes with them, out of sight. A piece as
+ * wide as the screen is a band, and goes by which part of the screen its middle is in. */
+#define PIN_TOP         50.0f
+#define PIN_BOTTOM      240.0f
+/* A song's meter, in its corner, reaches higher than a list's last line, which is further right. */
+#define METER_RIGHT     60.0f
+/* Just under the 218 a song's band starts at, as its position comes out a little under. */
+#define METER_TOP       216.0f
+#define METER_BOTTOM    235.0f
+/* In a wider window, what ends at the screen's right edge and is this wide runs on to the window's. */
+#define SIDE_BAND_WIDTH 200.0f
+#define BOTTOM_LEFT_END 100.0f
+#define DIALOG_WIDTH    150.0f
+#define DIALOG_OFF_MIDDLE 30.0f
+#define BAND_WIDTH      470.0f
+#define BAND_TOP        68.0f
+#define BAND_BOTTOM     204.0f
+/* A flat piece's w is 1 but for rounding, and it covers the screen give or take a little. */
+#define FLAT_W_NEAR     0.01f
+#define COVERS_NEAR     2.0f
+/* A covering piece showing fewer texels than this across is one texel or so stretched: a veil. */
+#define PICTURE_SPAN    64.0f
 
 #define MAX_TARGETS   16
 #define TEX_SLOTS     2048
@@ -54,6 +83,8 @@
     X(PFNGLGETPROGRAMINFOLOGPROC, glGetProgramInfoLog) \
     X(PFNGLUSEPROGRAMPROC, glUseProgram) \
     X(PFNGLGETUNIFORMLOCATIONPROC, glGetUniformLocation) \
+    X(PFNGLGENERATEMIPMAPPROC, glGenerateMipmap) \
+    X(PFNGLUNIFORM1FPROC, glUniform1f) \
     X(PFNGLUNIFORM1IPROC, glUniform1i) \
     X(PFNGLUNIFORM2FPROC, glUniform2f) \
     X(PFNGLUNIFORM3FPROC, glUniform3f) \
@@ -87,16 +118,25 @@ static const char VERTEX_SHADER[] =
     "layout(location = 1) in vec4 a_col;\n"
     "layout(location = 2) in vec2 a_uv;\n"
     "uniform vec2 u_uvscale;\n"
+    "uniform vec2 u_uvat;\n"
+    "uniform vec2 u_canvas_at;\n"
+    "uniform vec2 u_canvas_half;\n"
+    "uniform float u_zoom;\n"
     "out vec4 v_col;\n"
     "flat out vec4 v_flat;\n"
     "out vec2 v_uv;\n"
     "void main() {\n"
     /* Pixels (times w) to clip space. Depth 0..65535 becomes the window's 0..1. */
     "    float w = a_pos.w;\n"
-    "    gl_Position = vec4(a_pos.x / 256.0 - w, a_pos.y / 256.0 - w, a_pos.z / 32767.5 - w, w);\n"
+    /* The 3D scene can be enlarged about the middle of the screen. What is drawn in screen
+     * coordinates has a w of exactly 1, and stays. */
+    "    float zoom = abs(w - 1.0) < 0.01 ? 1.0 : u_zoom;\n"
+    "    float x = (a_pos.x - 240.0 * w) * zoom + (240.0 + u_canvas_at.x) * w;\n"
+    "    float y = (a_pos.y - 136.0 * w) * zoom + (136.0 + u_canvas_at.y) * w;\n"
+    "    gl_Position = vec4(x / u_canvas_half.x - w, y / u_canvas_half.y - w, a_pos.z / 32767.5 - w, w);\n"
     "    v_col = a_col;\n"
     "    v_flat = a_col;\n"
-    "    v_uv = a_uv * u_uvscale;\n"
+    "    v_uv = a_uv * u_uvscale + u_uvat;\n"
     "}\n";
 
 /* The texture functions and alpha test are those of tex_combine and alpha_pass in
@@ -110,11 +150,26 @@ static const char FRAGMENT_SHADER[] =
     "uniform int u_tex_on, u_func, u_talpha, u_double, u_gouraud;\n"
     "uniform int u_afunc, u_aref, u_amask;\n"
     "uniform vec3 u_env, u_sfix;\n"
+    "uniform float u_blur;\n"
     "out vec4 o_col;\n"
+    /* Samples spread over a disc, for the copy behind a picture that does not fill the window.
+     * The disc turns from pixel to pixel, which leaves fine grain where a fixed one leaves rings. */
+    "vec4 look(vec2 uv) {\n"
+    "    if (u_blur <= 0.0) return texture(u_tex, uv);\n"
+    "    float turn = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) * 6.283185;\n"
+    "    vec4 sum = texture(u_tex, uv);\n"
+    "    for (int i = 0; i < 48; i++) {\n"
+    "        float angle = float(i) * 2.399963 + turn;\n"
+    "        float r = u_blur * sqrt((float(i) + 1.0) / 48.0);\n"
+    "        sum += texture(u_tex, uv + r * vec2(cos(angle), sin(angle)));\n"
+    "    }\n"
+    "    return sum / 49.0;\n"
+    "}\n"
     "void main() {\n"
     "    vec4 c = u_gouraud != 0 ? v_col : v_flat;\n"
+    "    float fade = c.a;\n"
     "    if (u_tex_on != 0) {\n"
-    "        vec4 t = texture(u_tex, v_uv);\n"
+    "        vec4 t = look(v_uv);\n"
     "        float a = u_talpha != 0 ? t.a * c.a : c.a;\n"
     "        vec3 rgb;\n"
     "        if (u_func == 0) rgb = t.rgb * c.rgb;\n"
@@ -139,7 +194,7 @@ static const char FRAGMENT_SHADER[] =
     "        else if (u_afunc == 7) ok = a >= r;\n"
     "        if (!ok) discard;\n"
     "    }\n"
-    "    o_col = vec4(c.rgb * u_sfix, c.a);\n"
+    "    o_col = vec4(c.rgb * u_sfix, u_blur > 0.0 ? fade : c.a);\n"
     "}\n";
 
 typedef struct { float x, y, z, w; uint32_t rgba; float u, v; } gl_vertex;
@@ -149,6 +204,7 @@ typedef struct {
     uint32_t addr;
     GLuint fbo, color, depth;
     uint64_t last_used;
+    int shown;       /* has been on screen, so is the game's image and not a texture being made */
 } gl_target;
 
 typedef struct {
@@ -160,15 +216,36 @@ typedef struct {
     GLuint tex;
     int min_linear, mag_linear, clamp_u, clamp_v;
     int replaced;    /* a larger file stands in for it */
+    int mips;        /* has smaller versions, for when it is seen small or from the side */
     int use_logged;
 } gl_texture;
 
 static struct {
-    GLint tex_on, func, talpha, dbl, gouraud, afunc, aref, amask, env, sfix, uvscale;
+    GLint tex_on, func, talpha, dbl, gouraud, afunc, aref, amask, env, sfix, uvscale, uvat, canvas_at, canvas_half, zoom, blur;
 } U;
 
 static HDC    g_dc;
 static int    g_scale = 2;
+static int    g_wide;
+/* 0: the PSP's screen with bars around it. 1: a window taller than that screen enlarges the 3D
+ * scene to its height, cutting the scene's sides. 2: it shows more of the scene above and below. */
+static volatile int g_wide_view = 2;
+/* A flat picture covers the screen, this frame or the last: what is on it stays on it. */
+static int    g_flat_now, g_flat_last;
+/* A card's ground and its other pieces come from one sheet, while an illustration is alone on
+ * its own. Known from the frame before, so an illustration is never stretched. */
+static uint32_t g_flat_sheet;
+static int    g_card_now, g_card_last;
+/* The dimming behind a dialog was drawn this frame. */
+static int    g_veil_now;
+/* A window in the middle of the screen is on show, this frame or the last: what is in it stays. */
+static int    g_dialog_now, g_dialog_last;
+static float  g_zoom = 1.0f;
+/* How much of the canvas the window shows, in guest pixels, as of the last frame. */
+static int    g_show_w = PSP_W, g_show_h = PSP_H;
+static int    g_canvas_w = LOGICAL, g_canvas_h = LOGICAL;
+static int    g_canvas_x, g_canvas_y;
+static int    g_canvas_told;
 static GLuint g_program, g_vao, g_vbo;
 static GLuint g_vram_fbo, g_vram_tex, g_small_fbo, g_small_tex;
 
@@ -199,11 +276,20 @@ void psp_render_gl_set_present_filter(int linear) { g_present_linear = linear; }
 
 static char g_replace_dir[1024];
 static char g_dump_dir[1024];
+/* Larger textures of the size the player chose, for those nothing else stands in for. */
+static char g_upscale_dir[1024];
+static void *volatile g_upscale_asked;
 
 /* Pictures in the language being played, tried first. Asked for from any thread, and taken
  * up by the one that draws, which then has to forget what it has made. */
 static char g_language_dir[1024];
 static void *volatile g_language_asked;
+
+/* Pictures drawn from vectors, tried before those: one folder, or two with | between them.
+ * Asked for in the same way. With two, the second's swap_regions.txt lists pictures that have
+ * two regions change places. */
+static char g_vector_dir[1024];
+static void *volatile g_vector_asked;
 
 void psp_render_gl_set_dump_dir(const char *dir) {
     snprintf(g_dump_dir, sizeof g_dump_dir, "%s", dir ? dir : "");
@@ -223,7 +309,37 @@ void psp_render_gl_set_language_dir(const char *dir) {
     free(before);
 }
 
+void psp_render_gl_set_upscale_dir(const char *dir) {
+    const char *text = dir ? dir : "";
+    char *copy = (char *)malloc(strlen(text) + 1);
+    if (!copy) return;
+    strcpy(copy, text);
+    void *before = InterlockedExchangePointer((void *volatile *)&g_upscale_asked, copy);
+    free(before);
+}
+
+void psp_render_gl_set_vector_dir(const char *dir) {
+    const char *text = dir ? dir : "";
+    char *copy = (char *)malloc(strlen(text) + 1);
+    if (!copy) return;
+    strcpy(copy, text);
+    void *before = InterlockedExchangePointer((void *volatile *)&g_vector_asked, copy);
+    free(before);
+}
+
 void psp_render_gl_set_overlay(int on) { g_overlay = on; }
+
+void psp_render_gl_set_wide(int on) {
+    g_wide = on;
+    g_canvas_w = on ? WIDE_CANVAS_W : LOGICAL;
+    g_canvas_h = on ? WIDE_CANVAS_H : LOGICAL;
+    g_canvas_x = on ? (WIDE_CANVAS_W - PSP_W) / 2 : 0;
+    g_canvas_y = on ? (WIDE_CANVAS_H - PSP_H) / 2 : 0;
+}
+
+void psp_render_gl_set_wide_view(int view) { g_wide_view = view; }
+
+
 
 void psp_render_gl_set_scale(int scale) {
     if (scale >= 1 && scale <= 8) g_scale = scale;
@@ -280,6 +396,11 @@ static int build_program(void) {
     U.env     = p_glGetUniformLocation(g_program, "u_env");
     U.sfix    = p_glGetUniformLocation(g_program, "u_sfix");
     U.uvscale = p_glGetUniformLocation(g_program, "u_uvscale");
+    U.uvat = p_glGetUniformLocation(g_program, "u_uvat");
+    U.canvas_at = p_glGetUniformLocation(g_program, "u_canvas_at");
+    U.canvas_half = p_glGetUniformLocation(g_program, "u_canvas_half");
+    U.zoom = p_glGetUniformLocation(g_program, "u_zoom");
+    U.blur = p_glGetUniformLocation(g_program, "u_blur");
     return 0;
 }
 
@@ -385,16 +506,16 @@ static gl_target *get_target(uint32_t addr) {
         if (g_targets[i].last_used < t->last_used) t = &g_targets[i];
     }
     if (!t->used) {
-        const int side = LOGICAL * g_scale;
-        t->fbo = make_color_target(&t->color, side, side, GL_LINEAR);
+        t->fbo = make_color_target(&t->color, g_canvas_w * g_scale, g_canvas_h * g_scale, GL_LINEAR);
         p_glGenRenderbuffers(1, &t->depth);
         p_glBindRenderbuffer(GL_RENDERBUFFER, t->depth);
-        p_glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, side, side);
+        p_glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, g_canvas_w * g_scale, g_canvas_h * g_scale);
         p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, t->depth);
         if (p_glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
             fprintf(stderr, "gl: incomplete framebuffer\n");
     }
     t->used = 1;
+    t->shown = 0;
     t->addr = vram_offset(addr);
 
     p_glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
@@ -413,7 +534,7 @@ static void bind_target(void) {
     t->last_used = ++g_tick;
     if (g_bound == t) return;
     p_glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
-    glViewport(0, 0, LOGICAL * g_scale, LOGICAL * g_scale);
+    glViewport(0, 0, g_canvas_w * g_scale, g_canvas_h * g_scale);
     g_bound = t;
 }
 
@@ -464,7 +585,7 @@ static uint64_t gl_now_us(void) {
 
 /* What has been read from files, kept: a game reloads the same textures often, and a file
  * is too large to read again each time. A texture with no file is remembered as well. */
-#define REPLACE_CACHE 256
+#define REPLACE_CACHE 4096
 
 typedef struct {
     uint32_t colours, shape;
@@ -478,12 +599,26 @@ static int g_replace_cached;
 static FILE *open_replacement(uint32_t hash, const char *kind, uint32_t size[2]) {
     char path[1200];
     FILE *f = NULL;
-    if (g_language_dir[0] && !strcmp(kind, "rgba")) {
+    if (g_vector_dir[0] && !strcmp(kind, "rgba")) {
+        const char *second = strchr(g_vector_dir, '|');
+        const int first_len = second ? (int)(second - g_vector_dir) : (int)strlen(g_vector_dir);
+        snprintf(path, sizeof path, "%.*s\\%08X.%s", first_len, g_vector_dir, hash, kind);
+        f = fopen(path, "rb");
+        if (!f && second) {
+            snprintf(path, sizeof path, "%s\\%08X.%s", second + 1, hash, kind);
+            f = fopen(path, "rb");
+        }
+    }
+    if (!f && g_language_dir[0] && !strcmp(kind, "rgba")) {
         snprintf(path, sizeof path, "%s\\%08X.%s", g_language_dir, hash, kind);
         f = fopen(path, "rb");
     }
     if (!f && g_replace_dir[0]) {
         snprintf(path, sizeof path, "%s\\%08X.%s", g_replace_dir, hash, kind);
+        f = fopen(path, "rb");
+    }
+    if (!f && g_upscale_dir[0] && !strcmp(kind, "rgba")) {
+        snprintf(path, sizeof path, "%s\\%08X.%s", g_upscale_dir, hash, kind);
         f = fopen(path, "rb");
     }
     if (!f) return NULL;
@@ -493,6 +628,33 @@ static FILE *open_replacement(uint32_t hash, const char *kind, uint32_t size[2])
     }
     fclose(f);
     return NULL;
+}
+
+/* Two regions of a picture change places, if the list says so. Files are bottom row first. */
+static void swap_regions(uint32_t hash, uint32_t *pixels, int file_w, int file_h) {
+    const char *second = strchr(g_vector_dir, '|');
+    if (!second) return;
+    char path[1200];
+    snprintf(path, sizeof path, "%s\\swap_regions.txt", second + 1);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    unsigned listed;
+    int ax, ay, bx, by, w, h, original_w;
+    while (fscanf(f, "%x %d %d %d %d %d %d %d", &listed, &ax, &ay, &bx, &by, &w, &h, &original_w) == 8) {
+        if (listed != hash || original_w <= 0) continue;
+        const int scale = file_w / original_w;
+        for (int row = 0; row < h * scale; row++) {
+            uint32_t *a = pixels + (file_h - 1 - (ay * scale + row)) * file_w + ax * scale;
+            uint32_t *b = pixels + (file_h - 1 - (by * scale + row)) * file_w + bx * scale;
+            for (int col = 0; col < w * scale; col++) {
+                const uint32_t kept = a[col];
+                a[col] = b[col];
+                b[col] = kept;
+            }
+        }
+        break;
+    }
+    fclose(f);
 }
 
 static uint32_t *read_replacement(uint32_t colours, uint32_t shape, int *w, int *h) {
@@ -524,6 +686,7 @@ static uint32_t *read_replacement(uint32_t colours, uint32_t shape, int *w, int 
     }
     *w = (int)size[0];
     *h = (int)size[1];
+    if (whole) swap_regions(colours, pixels, *w, *h);
     return pixels;
 }
 
@@ -623,9 +786,32 @@ static void dump_texture(uint32_t colours, int w, int h) {
     free(raw);
 }
 
+/* Each texture this run has used, once, beside those saved: what larger ones get made for. */
+static void note_texture_used(uint32_t colours, int w, int h) {
+    static uint32_t seen[16384];
+    static FILE *list;
+    static int tried;
+    for (uint32_t i = colours % 16384, tries = 0; tries < 16384; i = (i + 1) % 16384, tries++) {
+        if (seen[i] == colours) return;
+        if (!seen[i]) {
+            seen[i] = colours;
+            break;
+        }
+    }
+    if (!tried) {
+        tried = 1;
+        char path[1200];
+        snprintf(path, sizeof path, "%s\\..\\textures_used.txt", g_dump_dir);
+        list = fopen(path, "w");
+    }
+    if (!list) return;
+    fprintf(list, "%08X %d %d\n", colours, w, h);
+    fflush(list);
+}
+
 /* The file standing in for what is in g_decode, or NULL. */
 static const uint32_t *replacement_for(int w, int h, int *out_w, int *out_h) {
-    if ((!g_replace_dir[0] && !g_language_dir[0] && !g_dump_dir[0]) || w < REPLACE_MIN_SIDE || h < REPLACE_MIN_SIDE) return NULL;
+    if ((!g_replace_dir[0] && !g_language_dir[0] && !g_dump_dir[0] && !g_upscale_dir[0]) || w < REPLACE_MIN_SIDE || h < REPLACE_MIN_SIDE) return NULL;
 
     /* A picture is known by its colours, and letters by their shape alone. */
     uint32_t colours = 2166136261u, shape = 2166136261u;
@@ -636,10 +822,12 @@ static const uint32_t *replacement_for(int w, int h, int *out_w, int *out_h) {
         colours = (colours ^ key) * 16777619u;
         shape = (shape ^ solid) * 16777619u;
     }
-    if (!g_replace_dir[0] && !g_language_dir[0]) {
-        if (g_dump_dir[0]) dump_texture(colours, w, h);
-        return NULL;
+    /* Saved as the game has it, whether or not a file stands in for it on the screen. */
+    if (g_dump_dir[0]) {
+        dump_texture(colours, w, h);
+        note_texture_used(colours, w, h);
     }
+    if (!g_replace_dir[0] && !g_language_dir[0] && !g_upscale_dir[0]) return NULL;
 
     for (int i = 0; i < g_replace_cached; i++) {
         const replacement *r = &g_replace_cache[i];
@@ -660,10 +848,7 @@ static const uint32_t *replacement_for(int w, int h, int *out_w, int *out_h) {
         r->h = file_h;
         r->pixels = pixels;
     }
-    if (!pixels) {
-        if (g_dump_dir[0]) dump_texture(colours, w, h);
-        return NULL;
-    }
+    if (!pixels) return NULL;
     *out_w = file_w;
     *out_h = file_h;
     return pixels;
@@ -683,6 +868,8 @@ static void decode_texture(gl_texture *e, const psp_draw_state *st) {
     glBindTexture(GL_TEXTURE_2D, e->tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, up_w, up_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    e->mips = st->tex_min_linear;
+    if (e->mips) p_glGenerateMipmap(GL_TEXTURE_2D);
     const uint64_t took = gl_now_us() - began;
     g_decoded++;
     g_decode_us += took;
@@ -698,17 +885,23 @@ static void forget_textures(void) {
 }
 
 /* Another language: what was read from files and made from them is for the last one. */
-static void take_up_language(void) {
-    if (!g_language_asked) return;
-    char *asked = (char *)InterlockedExchangePointer((void *volatile *)&g_language_asked, NULL);
+static void take_up_dir(void *volatile *where, char *dir, size_t size) {
+    if (!*where) return;
+    char *asked = (char *)InterlockedExchangePointer(where, NULL);
     if (!asked) return;
-    if (strcmp(asked, g_language_dir) != 0) {
-        snprintf(g_language_dir, sizeof g_language_dir, "%s", asked);
+    if (strcmp(asked, dir) != 0) {
+        snprintf(dir, size, "%s", asked);
         for (int i = 0; i < g_replace_cached; i++) free(g_replace_cache[i].pixels);
         g_replace_cached = 0;
         forget_textures();
     }
     free(asked);
+}
+
+static void take_up_language(void) {
+    take_up_dir(&g_language_asked, g_language_dir, sizeof g_language_dir);
+    take_up_dir(&g_vector_asked, g_vector_dir, sizeof g_vector_dir);
+    take_up_dir(&g_upscale_asked, g_upscale_dir, sizeof g_upscale_dir);
 }
 
 static gl_texture *get_texture(const psp_draw_state *st) {
@@ -756,13 +949,36 @@ static gl_texture *get_texture(const psp_draw_state *st) {
     return e;
 }
 
+/* What the game samples smoothly, its models and scenes, is seen better small and from the side
+ * with these. What it samples sharply is the interface, which stays as it is. */
+#define GL_TEXTURE_MAX_ANISOTROPY_ANY 0x84FE
+#define GL_MAX_TEXTURE_MAX_ANISOTROPY_ANY 0x84FF
+#define MOST_ANISOTROPY 16.0f
+static volatile int g_clearer_textures = 1;
+
+void psp_render_gl_set_clearer_textures(int on) { g_clearer_textures = on; }
+
+static float most_anisotropy(void) {
+    static float most;
+    if (most == 0.0f) {
+        glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_ANY, &most);
+        /* A driver without it leaves an error and the number untouched. */
+        if (glGetError() != GL_NO_ERROR || most < 1.0f) most = 1.0f;
+        if (most > MOST_ANISOTROPY) most = MOST_ANISOTROPY;
+        fprintf(stderr, "gl: anisotropy up to %.0f\n", most);
+    }
+    return most;
+}
+
 static void bind_sampler(GLuint tex, int *min_seen, int *mag_seen, int *u_seen, int *v_seen,
-                         const psp_draw_state *st, int smooth) {
+                         const psp_draw_state *st, int smooth, int mips) {
     glBindTexture(GL_TEXTURE_2D, tex);
-    const int min_linear = st->tex_min_linear || smooth, mag_linear = st->tex_mag_linear || smooth;
+    const int clearer = mips && st->tex_min_linear && g_clearer_textures;
+    const int min_linear = clearer ? 2 : st->tex_min_linear || smooth, mag_linear = st->tex_mag_linear || smooth;
     if (*min_seen != min_linear) {
         *min_seen = min_linear;
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min_linear ? GL_LINEAR : GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min_linear == 2 ? GL_LINEAR_MIPMAP_LINEAR : min_linear ? GL_LINEAR : GL_NEAREST);
+        if (mips) glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_ANY, clearer ? most_anisotropy() : 1.0f);
     }
     if (*mag_seen != mag_linear) {
         *mag_seen = mag_linear;
@@ -786,14 +1002,15 @@ static int setup_texture(const psp_draw_state *st) {
         gl_target *t = find_target(st->tex_addr);
         if (t && t != g_bound) {
             int unknown_min = -1, unknown_mag = -1, unknown_u = -1, unknown_v = -1;
-            bind_sampler(t->color, &unknown_min, &unknown_mag, &unknown_u, &unknown_v, st, 0);
-            p_glUniform2f(U.uvscale, 1.0f / (float)LOGICAL, 1.0f / (float)LOGICAL);
+            bind_sampler(t->color, &unknown_min, &unknown_mag, &unknown_u, &unknown_v, st, 0, 0);
+            p_glUniform2f(U.uvscale, 1.0f / (float)g_canvas_w, 1.0f / (float)g_canvas_h);
+            p_glUniform2f(U.uvat, (float)g_canvas_x / (float)g_canvas_w, (float)g_canvas_y / (float)g_canvas_h);
             return 1;
         }
     }
     gl_texture *e = get_texture(st);
     if (!e) return 0;
-    bind_sampler(e->tex, &e->min_linear, &e->mag_linear, &e->clamp_u, &e->clamp_v, st, e->replaced);
+    bind_sampler(e->tex, &e->min_linear, &e->mag_linear, &e->clamp_u, &e->clamp_v, st, e->replaced, e->mips);
     /* How a replaced texture is used, once: its look depends on this as much as on the file. */
     if (e->replaced && !e->use_logged) {
         e->use_logged = 1;
@@ -802,6 +1019,7 @@ static int setup_texture(const psp_draw_state *st) {
                 st->tex_mag_linear);
     }
     p_glUniform2f(U.uvscale, 1.0f / (float)st->tex_w, 1.0f / (float)st->tex_h);
+    p_glUniform2f(U.uvat, 0.0f, 0.0f);
     return 1;
 }
 
@@ -914,13 +1132,247 @@ static gl_vertex to_gl(const psp_vertex *v) {
     return o;
 }
 
+/* A fade is a few vertices with no texture over the whole screen, whatever its w: some are drawn
+ * in the 3D scene, close to the eye. It goes over the whole canvas. */
+static int stretch_fade(int n) {
+    float left = 1e9f, right = -1e9f, top = 1e9f, bottom = -1e9f;
+    for (int i = 0; i < n; i++) {
+        if (g_vb[i].w == 0.0f) return 0;
+        const float x = g_vb[i].x / g_vb[i].w, y = g_vb[i].y / g_vb[i].w;
+        if (x < left) left = x;
+        if (x > right) right = x;
+        if (y < top) top = y;
+        if (y > bottom) bottom = y;
+    }
+    if (left > COVERS_NEAR || top > COVERS_NEAR || right < PSP_W - COVERS_NEAR || bottom < PSP_H - COVERS_NEAR) return 0;
+    for (int i = 0; i < n; i++) {
+        const float w = g_vb[i].w;
+        g_vb[i].x = (g_vb[i].x / w < (float)PSP_W / 2.0f ? (float)-g_canvas_x : (float)(g_canvas_w - g_canvas_x)) * w;
+        g_vb[i].y = (g_vb[i].y / w < (float)PSP_H / 2.0f ? (float)-g_canvas_y : (float)(g_canvas_h - g_canvas_y)) * w;
+    }
+    return 1;
+}
+
+/* Beside a band that ends at the screen's edge, its last column repeated up to the window's edge.
+ * Gives back how many vertices there are now. */
+static int continue_band(int n, float from, float to, float u_at_edge) {
+    for (int i = 0; i < 6; i++) {
+        gl_vertex more = g_vb[i];
+        const int at_edge = fabsf(more.x - from) < 0.5f;
+        more.x = at_edge ? to : from;
+        more.u = u_at_edge;
+        g_vb[n + i] = more;
+    }
+    return n + 6;
+}
+
+/* The game's flat pieces have a w of 1, while its models, the notes among them, have other values.
+ * Most are two triangles; a few, as the meter's ring, are shapes of their own, which only move.
+ * Takes the n vertices just put in g_vb, and gives back how many there are now. */
+static int place_flat_piece(int prim, int n, const psp_draw_state *st) {
+    float left = g_vb[0].x, right = left, top = g_vb[0].y, bottom = top;
+    float u_low = g_vb[0].u, u_high = u_low, v_low = g_vb[0].v, v_high = v_low;
+    float u_left = g_vb[0].u, u_right = g_vb[0].u;
+    for (int i = 0; i < n; i++) {
+        if (fabsf(g_vb[i].w - 1.0f) > FLAT_W_NEAR) return n;
+        if (g_vb[i].u < u_low) u_low = g_vb[i].u;
+        if (g_vb[i].u > u_high) u_high = g_vb[i].u;
+        if (g_vb[i].v < v_low) v_low = g_vb[i].v;
+        if (g_vb[i].v > v_high) v_high = g_vb[i].v;
+        if (g_vb[i].x < left) { left = g_vb[i].x; u_left = g_vb[i].u; }
+        if (g_vb[i].x > right) { right = g_vb[i].x; u_right = g_vb[i].u; }
+        if (g_vb[i].y < top) top = g_vb[i].y;
+        if (g_vb[i].y > bottom) bottom = g_vb[i].y;
+    }
+    const int quad = prim == PSP_PRIM_TRIANGLES && n == 6;
+    const int covers = quad && left <= COVERS_NEAR && top <= COVERS_NEAR && right >= PSP_W - COVERS_NEAR && bottom >= PSP_H - COVERS_NEAR;
+    if (covers && (!st->tex_enable || u_high - u_low < PICTURE_SPAN || v_high - v_low < PICTURE_SPAN)) {
+        /* A veil over the whole screen is over the whole canvas. What comes after it is a dialog. */
+        for (int i = 0; i < n; i++) {
+            g_vb[i].x = g_vb[i].x < (float)PSP_W / 2.0f ? (float)-g_canvas_x : (float)(g_canvas_w - g_canvas_x);
+            g_vb[i].y = g_vb[i].y < (float)PSP_H / 2.0f ? (float)-g_canvas_y : (float)(g_canvas_h - g_canvas_y);
+        }
+        g_veil_now = 1;
+        return n;
+    }
+    if (covers) {
+        /* A picture has nothing past it, so a blurred copy fills the rest of the window, and hides
+         * whatever the game left there. */
+        g_flat_now = 1;
+        g_flat_sheet = st->tex_addr;
+        if (g_show_w <= PSP_W && g_show_h <= PSP_H) return n;
+        if (g_card_last && g_show_h > PSP_H) {
+            const float tall = (float)g_show_h / (float)PSP_H;
+            for (int i = 0; i < n; i++) g_vb[i].y = (float)PSP_H / 2.0f + (g_vb[i].y - (float)PSP_H / 2.0f) * tall;
+            return n;
+        }
+        const float across = (float)g_show_w / (float)PSP_W, down = (float)g_show_h / (float)PSP_H;
+        const float grow = across > down ? across : down;
+        gl_vertex copy[6];
+        for (int i = 0; i < 6; i++) {
+            copy[i] = g_vb[i];
+            copy[i].x = (float)PSP_W / 2.0f + (g_vb[i].x - (float)PSP_W / 2.0f) * grow;
+            copy[i].y = (float)PSP_H / 2.0f + (g_vb[i].y - (float)PSP_H / 2.0f) * grow;
+        }
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        p_glUniform1f(U.blur, 0.045f);
+        p_glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof copy, copy, GL_STREAM_DRAW);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        p_glUniform1f(U.blur, 0.0f);
+        setup_depth(st);
+        return n;
+    }
+    if (g_flat_now && st->tex_addr == g_flat_sheet) g_card_now = 1;
+    /* The combo and the points beside it follow the notes. They are told from the sheet that holds
+     * them, 512x256, and the rows they are on. */
+    if (st->tex_w == 512 && st->tex_h == 256 && ((v_low >= 0.0f && v_high <= 17.0f) || (v_low >= 57.0f && v_high <= 71.0f) || (v_low >= 77.0f && v_high <= 92.0f)))
+        return n;
+
+    const float extra_down = (float)(g_show_h - PSP_H) / 2.0f;
+    const float extra_side = (float)(g_show_w - PSP_W) / 2.0f;
+    const int flat = g_flat_now || g_flat_last;
+    const int band = right - left >= BAND_WIDTH;
+    const float across_middle = (left + right) / 2.0f;
+    if (!band && right - left >= DIALOG_WIDTH && fabsf(across_middle - (float)PSP_W / 2.0f) <= DIALOG_OFF_MIDDLE) g_dialog_now = 1;
+    const int in_dialog = (g_dialog_now || g_dialog_last) && bottom > PIN_TOP && top < PIN_BOTTOM;
+    /* The score's digits, on their own rows of the sheet the combo is on. */
+    const int score_digit = st->tex_w == 512 && st->tex_h == 256 && v_low >= 20.0f && v_high <= 40.0f;
+    float down = 0.0f, side = 0.0f;
+    if (g_show_h > PSP_H) {
+        const float middle = (top + bottom) / 2.0f;
+        /* What is parked off the screen leaves in any case. */
+        if (bottom <= 0.0f) down = -extra_down;
+        else if (top >= (float)PSP_H) down = extra_down;
+        else if (flat) {
+            /* Each piece keeps its size, and goes where the stretched ground has its place. */
+            if (g_card_last) down = (middle - (float)PSP_H / 2.0f) * ((float)g_show_h / (float)PSP_H - 1.0f);
+        } else if (band) {
+            /* The results' band has that screen's buttons drawn on it, so it stays with them. A
+             * song's reaches higher, and comes from a square sheet. */
+            if (middle < BAND_TOP) down = -extra_down;
+            else if (middle > BAND_BOTTOM && (top >= PIN_BOTTOM || (top >= METER_TOP && st->tex_h == 512))) down = extra_down;
+        } else if (bottom <= PIN_TOP) {
+            down = -extra_down;
+        } else if (top >= PIN_BOTTOM || (right <= METER_RIGHT && top >= METER_TOP && bottom >= METER_BOTTOM)) {
+            down = extra_down;
+        }
+    }
+    if (g_show_w > PSP_W && !flat && !g_veil_now && !in_dialog) {
+        const int to_right_edge = right >= PSP_W - 1.0f && right <= PSP_W + 1.0f;
+        const int from_left_edge = left >= -1.0f && left <= 1.0f;
+        if (quad && band && top >= METER_TOP && top < PIN_BOTTOM && st->tex_h == 512) {
+            /* A song's band has the meter's ring drawn on it, on the left. It goes there with the
+             * rest of the meter, and continues to the right. */
+            n = continue_band(n, right, right + 2.0f * extra_side, u_right);
+            side = -extra_side;
+        } else if (quad && band && top >= METER_TOP && top < PIN_BOTTOM) {
+            /* The results' band has the buttons drawn on it, on the right. It goes there with what
+             * is written on them, and continues to the left. */
+            n = continue_band(n, left, left - 2.0f * extra_side, u_left);
+            side = extra_side;
+        } else if (quad && band) {
+            /* A band runs on to the window's edges. What overruns the screen already does. */
+            if (from_left_edge) n = continue_band(n, left, left - extra_side, u_left);
+            if (to_right_edge) n = continue_band(n, right, right + extra_side, u_right);
+        } else if (quad && to_right_edge && right - left >= SIDE_BAND_WIDTH) {
+            /* A long piece of a band, from one thing to the screen's edge, has art up to its end
+             * that a repeated column would not continue. It takes up the room itself. */
+            for (int i = 0; i < n; i++) g_vb[i].x += g_vb[i].x < across_middle ? -extra_side : extra_side;
+        } else if (band) {
+            /* Too many vertices to continue, and wide enough to stay. */
+        } else if (top >= PIN_BOTTOM) {
+            /* Words at the bottom are lyrics, one draw to a word, and must stay together. The hints
+             * belong to the panel at the right, and only the very left stays at the left. */
+            if (n == 6) side = across_middle < BOTTOM_LEFT_END ? -extra_side : extra_side;
+        } else if (bottom <= PIN_TOP && across_middle >= (float)PSP_W / 2.0f && !score_digit) {
+            /* The frames around what is at the top right are drawn in the band, which stays. */
+        } else {
+            side = across_middle < (float)PSP_W / 2.0f ? -extra_side : extra_side;
+        }
+    }
+    if (down != 0.0f || side != 0.0f) {
+        for (int i = 0; i < n; i++) {
+            g_vb[i].x += side;
+            g_vb[i].y += down;
+        }
+    }
+    return n;
+}
+
+/* Writes down flat pieces large enough to be a transition, each different one once, as those go
+ * by too fast for F3. */
+static void note_big_piece(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
+    static uint32_t seen[1024];
+    static int seen_count;
+    /* A model is many vertices, and a fade is a few, whatever its w. */
+    if (seen_count == 1024 || count < 2 || v[0].pw == 0.0f || (count > 8 && fabsf(v[0].pw - 1.0f) > FLAT_W_NEAR)) return;
+    float left = v[0].px / v[0].pw, right = left, top = v[0].py / v[0].pw, bottom = top;
+    float u_low = v[0].u, u_high = u_low, v_low = v[0].v, v_high = v_low;
+    for (int i = 1; i < count; i++) {
+        const float w = v[i].pw != 0.0f ? v[i].pw : 1.0f;
+        const float x = v[i].px / w, y = v[i].py / w;
+        if (x < left) left = x;
+        if (x > right) right = x;
+        if (y < top) top = y;
+        if (y > bottom) bottom = y;
+        if (v[i].u < u_low) u_low = v[i].u;
+        if (v[i].u > u_high) u_high = v[i].u;
+        if (v[i].v < v_low) v_low = v[i].v;
+        if (v[i].v > v_high) v_high = v[i].v;
+    }
+    if (right - left < BAND_WIDTH && bottom - top < 200.0f) return;
+    /* The alpha is left out of what makes it different, as a fade would fill the list. */
+    uint32_t key = (st->tex_addr ^ (v[0].rgba & 0xFFFFFFu) ^ ((uint32_t)prim << 24)) * 16777619u;
+    key = (key ^ (uint32_t)(int)left) * 16777619u;
+    key = (key ^ (uint32_t)(int)top) * 16777619u;
+    key = (key ^ (uint32_t)(int)right) * 16777619u;
+    key = (key ^ (uint32_t)(int)bottom) * 16777619u;
+    key = (key ^ (uint32_t)st->tex_enable) * 16777619u;
+    for (int i = 0; i < seen_count; i++) {
+        if (seen[i] == key) return;
+    }
+    seen[seen_count++] = key;
+    fprintf(stderr, "gl: big w %.3f prim %d n %d through %d box %.1f,%.1f %.1f,%.1f tex %d %08X %dx%d span %.0f %.0f colour %08X blend %d %d %d scissor %d,%d %d,%d shown %d\n",
+            v[0].pw, prim, count, st->through, left, top, right, bottom, st->tex_enable, st->tex_addr, st->tex_w, st->tex_h, u_high - u_low, v_high - v_low,
+            v[0].rgba, st->blend, st->blend_src, st->blend_dst, st->sc_x0, st->sc_y0, st->sc_x1, st->sc_y1, g_bound && g_bound->shown);
+}
+
+/* 2 asks for a frame to be written down, and 1 is that frame. */
+static volatile int g_trace_draws;
+static int g_traces;
+
+void psp_render_gl_trace_frame(void) { g_trace_draws = 2; }
+
+static void trace_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
+    float left = 1e9f, top = 1e9f, right = -1e9f, bottom = -1e9f;
+    for (int i = 0; i < count; i++) {
+        const float w = v[i].pw != 0.0f ? v[i].pw : 1.0f;
+        const float x = v[i].px / w, y = v[i].py / w;
+        if (x < left) left = x;
+        if (x > right) right = x;
+        if (y < top) top = y;
+        if (y > bottom) bottom = y;
+    }
+    fprintf(stderr, "gl: draw prim %d n %d through %d w %.5f box %.0f,%.0f %.0f,%.0f scissor %d,%d %d,%d target %08X tex %d %08X %dx%d blend %d %d %d\n",
+            prim, count, st->through, v[0].pw, left, top, right, bottom, st->sc_x0, st->sc_y0, st->sc_x1, st->sc_y1, g_target_addr,
+            st->tex_enable, st->tex_addr, st->tex_w, st->tex_h, st->blend, st->blend_src, st->blend_dst);
+}
+
 static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
+    if (g_trace_draws == 1 && count > 0) trace_draw(prim, v, count, st);
+    if (g_wide) note_big_piece(prim, v, count, st);
     if (count <= 0 || st->sc_x1 < st->sc_x0 || st->sc_y1 < st->sc_y0) return;
 
     bind_target();
     glEnable(GL_SCISSOR_TEST);
-    glScissor(st->sc_x0 * g_scale, st->sc_y0 * g_scale, (st->sc_x1 - st->sc_x0 + 1) * g_scale,
-              (st->sc_y1 - st->sc_y0 + 1) * g_scale);
+    /* A scissor of the whole screen means the whole canvas, or nothing past it would show. */
+    const int whole_screen = st->sc_x0 <= 0 && st->sc_y0 <= 0 && st->sc_x1 >= PSP_W - 1 && st->sc_y1 >= PSP_H - 1;
+    if (g_wide && whole_screen)
+        glScissor(0, 0, g_canvas_w * g_scale, g_canvas_h * g_scale);
+    else
+        glScissor((st->sc_x0 + g_canvas_x) * g_scale, (st->sc_y0 + g_canvas_y) * g_scale, (st->sc_x1 - st->sc_x0 + 1) * g_scale,
+                  (st->sc_y1 - st->sc_y0 + 1) * g_scale);
 
     if (st->clear)
         glColorMask(st->clear_color ? GL_TRUE : GL_FALSE, st->clear_color ? GL_TRUE : GL_FALSE,
@@ -931,6 +1383,13 @@ static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
     setup_blend(st);
     setup_depth(st);
     setup_shader(st, setup_texture(st));
+    if (!g_canvas_told) {
+        g_canvas_told = 1;
+        p_glUniform2f(U.canvas_at, (float)g_canvas_x, (float)g_canvas_y);
+        p_glUniform2f(U.canvas_half, (float)g_canvas_w / 2.0f, (float)g_canvas_h / 2.0f);
+    }
+    /* Textures the game makes keep their own framing. */
+    p_glUniform1f(U.zoom, g_bound && g_bound->shown ? g_zoom : 1.0f);
 
     /* Targets are stored with row 0 at GL's y = 0, so the PSP's clockwise on screen
      * is counter-clockwise here. Strips alternate as GL expects. */
@@ -960,11 +1419,25 @@ static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
             tl.x = a.x; tl.y = a.y; tl.u = a.u; tl.v = a.v;
             tr.y = a.y; tr.v = a.v;
             bl.x = a.x; bl.u = a.u;
+            /* What clears the whole screen clears the whole canvas. */
+            if (g_wide && !st->tex_enable && a.x <= 0 && a.y <= 0 && b.x >= PSP_W && b.y >= PSP_H) {
+                const float left = (float)-g_canvas_x, top = (float)-g_canvas_y;
+                const float right = (float)(g_canvas_w - g_canvas_x), bottom = (float)(g_canvas_h - g_canvas_y);
+                tl.x = left; tl.y = top; tr.x = right; tr.y = top;
+                bl.x = left; bl.y = bottom; br.x = right; br.y = bottom;
+            }
             g_vb[n++] = tl; g_vb[n++] = tr; g_vb[n++] = bl;
             g_vb[n++] = tr; g_vb[n++] = br; g_vb[n++] = bl;
         }
     } else {
         for (int i = 0; i < count; i++) g_vb[n++] = to_gl(&v[i]);
+        if (g_wide && !st->clear && whole_screen && g_bound && g_bound->shown) {
+            if (!st->tex_enable && n <= 8 && stretch_fade(n)) {
+                /* Done. */
+            } else if (prim != PSP_PRIM_POINTS && prim != PSP_PRIM_LINES && prim != PSP_PRIM_LINE_STRIP) {
+                n = place_flat_piece(prim, n, st);
+            }
+        }
     }
     if (!n) return;
 
@@ -1153,10 +1626,10 @@ static void draw_message(int image_x, int image_y, int image_w, int image_h) {
                         GL_COLOR_BUFFER_BIT, GL_NEAREST);
 }
 
-static void keep_snapshot(GLuint source_fbo, int source_w, int source_h) {
+static void keep_snapshot(GLuint source_fbo, int source_x, int source_y, int source_w, int source_h) {
     p_glBindFramebuffer(GL_READ_FRAMEBUFFER, source_fbo);
     p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_small_fbo);
-    p_glBlitFramebuffer(0, 0, source_w, source_h, 0, 0, PSP_W, PSP_H, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    p_glBlitFramebuffer(source_x, source_y, source_x + source_w, source_y + source_h, 0, 0, PSP_W, PSP_H, GL_COLOR_BUFFER_BIT, GL_NEAREST);
     p_glBindFramebuffer(GL_READ_FRAMEBUFFER, g_small_fbo);
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     glReadPixels(0, 0, PSP_W, PSP_H, GL_RGBA, GL_UNSIGNED_BYTE, g_snapshot);
@@ -1168,15 +1641,32 @@ static void keep_snapshot(GLuint source_fbo, int source_w, int source_h) {
 static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
     static uint32_t presents;
     GLuint source;
-    int source_w, source_h;
+    int source_x = 0, source_y = 0, source_w, source_h;
     GLenum filter;
 
     gl_target *t = find_target(addr);
+    if (g_trace_draws == 1) {
+        g_trace_draws = 0;
+        fprintf(stderr, "gl: end of trace %d, shown from %08X\n", g_traces, addr);
+    } else if (g_trace_draws == 2) {
+        g_trace_draws = 1;
+        fprintf(stderr, "gl: trace %d\n", ++g_traces);
+    }
+    g_flat_last = g_flat_now;
+    g_flat_now = 0;
+    g_card_last = g_card_now;
+    g_card_now = 0;
+    g_veil_now = 0;
+    g_dialog_last = g_dialog_now;
+    g_dialog_now = 0;
     glDisable(GL_SCISSOR_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
     if (t) {
         source = t->fbo;
+        t->shown = 1;
+        source_x = g_canvas_x * g_scale;
+        source_y = g_canvas_y * g_scale;
         source_w = PSP_W * g_scale;
         source_h = PSP_H * g_scale;
         filter = g_present_linear ? GL_LINEAR : GL_NEAREST;
@@ -1198,15 +1688,39 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
         filter = GL_NEAREST;
     }
 
-    if (++presents % SNAPSHOT_EVERY == 0) keep_snapshot(source, source_w, source_h);
+    if (++presents % SNAPSHOT_EVERY == 0) keep_snapshot(source, source_x, source_y, source_w, source_h);
 
     /* Fit the window, keeping the PSP's shape. Rows are stored top first, and the
      * window's y runs upwards, hence the swapped destination. */
     RECT r;
     GetClientRect(WindowFromDC(g_dc), &r);
     const int cw = r.right, ch = r.bottom;
-    int w = cw, h = cw * PSP_H / PSP_W;
-    if (h > ch) { h = ch; w = ch * PSP_W / PSP_H; }
+    /* How much of the canvas the window's shape calls for, as far as the canvas goes. A shape
+     * close to the screen's, as 16:9 is, loses a row or two rather than showing bars. What the
+     * game filled in memory has no more than the screen, and keeps its bars. */
+    const int view = g_wide_view;
+    g_zoom = 1.0f;
+    g_show_w = PSP_W;
+    g_show_h = PSP_H;
+    if (g_wide && view && t && cw > 0 && ch > 0) {
+        int show_w = PSP_W, show_h = PSP_H;
+        if (cw * 5 >= ch * 9) {
+            show_w = PSP_H * cw / ch;
+            if (show_w > g_canvas_w) show_w = g_canvas_w;
+        } else {
+            show_h = PSP_W * ch / cw;
+            if (show_h > g_canvas_h) show_h = g_canvas_h;
+        }
+        if (view == 1 && show_h > PSP_H) g_zoom = (float)show_h / (float)PSP_H;
+        g_show_w = show_w;
+        g_show_h = show_h;
+        source_x = (g_canvas_w - show_w) / 2 * g_scale;
+        source_y = (g_canvas_h - show_h) / 2 * g_scale;
+        source_w = show_w * g_scale;
+        source_h = show_h * g_scale;
+    }
+    int w = cw, h = (int)((long long)cw * source_h / source_w);
+    if (h > ch) { h = ch; w = (int)((long long)ch * source_w / source_h); }
     const int x0 = (cw - w) / 2, y0 = (ch - h) / 2;
 
     p_glBindFramebuffer(GL_READ_FRAMEBUFFER, source);
@@ -1214,7 +1728,7 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
     glViewport(0, 0, cw, ch);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
-    p_glBlitFramebuffer(0, 0, source_w, source_h, x0, y0 + h, x0 + w, y0, GL_COLOR_BUFFER_BIT, filter);
+    p_glBlitFramebuffer(source_x, source_y, source_x + source_w, source_y + source_h, x0, y0 + h, x0 + w, y0, GL_COLOR_BUFFER_BIT, filter);
     p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     draw_message(x0, y0, w, h);
     if (g_overlay) draw_overlay(x0, y0 + h, h);

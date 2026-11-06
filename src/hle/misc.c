@@ -124,10 +124,25 @@ static uint32_t g_buttons;
 static uint8_t  g_analog_x = 128, g_analog_y = 128;
 static uint32_t g_ctrl_frame;
 
+/* Once something else is playing, the window no longer has a say. */
+static volatile int g_ctrl_forced;
+
+void psp_ctrl_force(uint32_t buttons) {
+    g_ctrl_forced = 1;
+    g_buttons = buttons;
+}
+
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay) {
+    if (g_ctrl_forced) return;
     g_buttons = buttons;
     g_analog_x = ax;
     g_analog_y = ay;
+}
+
+static uint32_t (*g_ctrl_filter)(uint32_t);
+
+void psp_ctrl_set_filter(uint32_t (*filter)(uint32_t buttons)) {
+    g_ctrl_filter = filter;
 }
 
 static void hle_CtrlSet(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
@@ -136,10 +151,11 @@ static void hle_CtrlSet(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 static void hle_ReadBufferPositive(void) {
     uint32_t buf = psp_arg(0), count = psp_arg(1);
     if (!count) count = 1;
+    const uint32_t buttons = g_ctrl_filter ? g_ctrl_filter(g_buttons) : g_buttons;
     for (uint32_t i = 0; i < count; i++) {
         uint32_t at = buf + i * 16;
         psp_write32(at, g_ctrl_frame++);
-        psp_write32(at + 4, g_buttons);
+        psp_write32(at + 4, buttons);
         psp_write8(at + 8, g_analog_x);
         psp_write8(at + 9, g_analog_y);
         for (int k = 10; k < 16; k++) psp_write8(at + (uint32_t)k, 0);
