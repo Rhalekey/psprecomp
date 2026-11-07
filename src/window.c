@@ -274,25 +274,42 @@ static void paint(HWND h) {
 }
 
 /* The whole of the window's monitor with no borders, and back to the window as it was. */
-static void toggle_full_screen(HWND h) {
+/* Asked from any thread, and done on the window's own. */
+static volatile LONG g_mode_asked = PSP_WINDOW_NORMAL;
+static int g_mode = PSP_WINDOW_NORMAL;
+static int g_last_covering = PSP_WINDOW_FULL_SCREEN;
+
+void psp_window_set_mode(int mode) {
+    if (mode >= 0 && mode < PSP_WINDOW_MODE_COUNT) InterlockedExchange(&g_mode_asked, mode);
+}
+
+int psp_window_get_mode(void) { return (int)g_mode_asked; }
+
+static void take_up_mode(HWND h) {
     static WINDOWPLACEMENT before;
-    static int full;
-    if (!full) {
+    const int mode = (int)g_mode_asked;
+    if (mode == g_mode) return;
+    if (g_mode == PSP_WINDOW_NORMAL) {
         before.length = sizeof before;
         GetWindowPlacement(h, &before);
+    }
+    if (mode == PSP_WINDOW_NORMAL) {
+        SetWindowLongPtrA(h, GWL_STYLE, (GetWindowLongPtrA(h, GWL_STYLE) & ~(LONG_PTR)WS_POPUP) | WS_OVERLAPPEDWINDOW);
+        if (before.length) SetWindowPlacement(h, &before);
+        SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    } else {
         MONITORINFO info;
         info.cbSize = sizeof info;
         if (!GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &info)) return;
         const RECT m = info.rcMonitor;
+        /* A window that covers the screen exactly is what drivers take for a full screen game.
+         * One row past it, out of sight, it stays a window of the desktop. */
+        const int extra = mode == PSP_WINDOW_BORDERLESS ? 1 : 0;
+        g_last_covering = mode;
         SetWindowLongPtrA(h, GWL_STYLE, (GetWindowLongPtrA(h, GWL_STYLE) & ~(LONG_PTR)WS_OVERLAPPEDWINDOW) | WS_POPUP);
-        SetWindowPos(h, HWND_TOP, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
-        full = 1;
-    } else {
-        SetWindowLongPtrA(h, GWL_STYLE, (GetWindowLongPtrA(h, GWL_STYLE) & ~(LONG_PTR)WS_POPUP) | WS_OVERLAPPEDWINDOW);
-        SetWindowPlacement(h, &before);
-        SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-        full = 0;
+        SetWindowPos(h, HWND_TOP, m.left, m.top, m.right - m.left, m.bottom - m.top + extra, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
     }
+    g_mode = mode;
 }
 
 /* Looked for here, as a screen of the host's own can hold the keyboard's focus. */
@@ -301,8 +318,9 @@ static void full_screen_keys(HWND h) {
     const int focused = GetForegroundWindow() == h;
     const int down = focused && ((GetAsyncKeyState(VK_F11) & 0x8000) ||
                                  ((GetAsyncKeyState(VK_MENU) & 0x8000) && (GetAsyncKeyState(VK_RETURN) & 0x8000)));
-    if (down && !was_down) toggle_full_screen(h);
+    if (down && !was_down) psp_window_set_mode(g_mode == PSP_WINDOW_NORMAL ? g_last_covering : PSP_WINDOW_NORMAL);
     was_down = down;
+    take_up_mode(h);
 }
 
 static LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {

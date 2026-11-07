@@ -100,6 +100,8 @@
     X(PFNGLFRAMEBUFFERRENDERBUFFERPROC, glFramebufferRenderbuffer) \
     X(PFNGLGENRENDERBUFFERSPROC, glGenRenderbuffers) \
     X(PFNGLBINDRENDERBUFFERPROC, glBindRenderbuffer) \
+    X(PFNGLDELETEFRAMEBUFFERSPROC, glDeleteFramebuffers) \
+    X(PFNGLDELETERENDERBUFFERSPROC, glDeleteRenderbuffers) \
     X(PFNGLRENDERBUFFERSTORAGEPROC, glRenderbufferStorage) \
     X(PFNGLCHECKFRAMEBUFFERSTATUSPROC, glCheckFramebufferStatus) \
     X(PFNGLBLITFRAMEBUFFERPROC, glBlitFramebuffer) \
@@ -224,6 +226,8 @@ static struct {
 
 static HDC    g_dc;
 static int    g_scale = 2;
+static volatile int g_scale_asked = 2;
+static int    g_scale_taken_up;
 static int    g_wide;
 /* 0: the PSP's screen with bars around it. 1: a window taller than that screen enlarges the 3D
  * scene to its height, cutting the scene's sides. 2: it shows more of the scene above and below. */
@@ -328,7 +332,10 @@ void psp_render_gl_set_wide_view(int view) { g_wide_view = view; }
 
 
 void psp_render_gl_set_scale(int scale) {
-    if (scale >= 1 && scale <= 8) g_scale = scale;
+    if (scale < 1 || scale > 8) return;
+    g_scale_asked = scale;
+    /* Once there is something to draw on, it changes between frames. */
+    if (!g_scale_taken_up) g_scale = scale;
 }
 
 /* Addresses compare within VRAM, whichever mirror a game names them through. */
@@ -480,6 +487,22 @@ static gl_target *find_target(uint32_t addr) {
     for (int i = 0; i < MAX_TARGETS; i++)
         if (g_targets[i].used && g_targets[i].addr == off) return &g_targets[i];
     return NULL;
+}
+
+/* Every target goes, to be made again at the new size as the game next draws on it. */
+static void take_up_scale(void) {
+    const int scale = g_scale_asked;
+    if (scale == g_scale) return;
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        gl_target *t = &g_targets[i];
+        if (!t->used) continue;
+        p_glDeleteFramebuffers(1, &t->fbo);
+        glDeleteTextures(1, &t->color);
+        p_glDeleteRenderbuffers(1, &t->depth);
+        memset(t, 0, sizeof *t);
+    }
+    g_scale = scale;
+    fprintf(stderr, "gl: render scale %d\n", scale);
 }
 
 static gl_target *get_target(uint32_t addr) {
@@ -1685,6 +1708,8 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
 
     g_bound = NULL;
     g_frame++;
+    g_scale_taken_up = 1;
+    take_up_scale();
 }
 
 static int gl_read_frame(uint32_t *out) {

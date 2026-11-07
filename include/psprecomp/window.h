@@ -41,6 +41,14 @@ int psp_window_closed(void);
 void *psp_window_handle(void);
 void psp_window_set_external(int on);
 
+/* How the window takes up the screen. Without borders it covers the monitor as a window of the
+ * desktop, which others can come over at once. In full screen it covers it exactly, and the
+ * graphics driver may give it the screen to itself. F11 and Alt+Enter go between the window and
+ * whichever of the two was last used. It can be asked at any time, even before it has opened. */
+enum { PSP_WINDOW_NORMAL, PSP_WINDOW_BORDERLESS, PSP_WINDOW_FULL_SCREEN, PSP_WINDOW_MODE_COUNT };
+void psp_window_set_mode(int mode);
+int psp_window_get_mode(void);
+
 /* The PSP buttons held right now, for a screen shown before the game runs. */
 uint32_t psp_window_buttons(void);
 
