@@ -49,6 +49,8 @@
 /* Just under the 218 a song's band starts at, as its position comes out a little under. */
 #define METER_TOP       216.0f
 #define METER_BOTTOM    235.0f
+/* The results' words about the song, as NOT CLEAR, sit just above that screen's band. */
+#define RESULT_WORDS_TOP 185.0f
 /* In a wider window, what ends at the screen's right edge and is this wide runs on to the window's. */
 #define SIDE_BAND_WIDTH 200.0f
 #define BOTTOM_LEFT_END 100.0f
@@ -1204,9 +1206,9 @@ static int place_flat_piece(int prim, int n, const psp_draw_state *st) {
             down = -extra_down;
         } else if (top >= PIN_BOTTOM || (right <= METER_RIGHT && top >= METER_TOP && bottom >= METER_BOTTOM)) {
             down = extra_down;
-        } else if ((g_results_now || g_results_last) && !in_dialog && top >= METER_TOP && across_middle >= (float)PSP_W / 2.0f) {
+        } else if ((g_results_now || g_results_last) && !in_dialog && top >= RESULT_WORDS_TOP && across_middle >= (float)PSP_W / 2.0f) {
             /* The results' band has that screen's buttons drawn on it, and these are what goes on
-             * them. The score, on the left, is not on the band. */
+             * them, with the words above them. The score, on the left, is not on the band. */
             down = extra_down;
         }
     }
