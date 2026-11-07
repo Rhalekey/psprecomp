@@ -155,6 +155,8 @@ void psp_render_gl_set_wide_view(int view);
 void psp_render_gl_trace_frame(void);
 /* Smooth the picture when fitting it to the window, or keep hard pixels. */
 void psp_render_gl_set_present_filter(int linear);
+/* The most frames a second that reach the window, 0 for all. The game's own pace does not change. */
+void psp_render_gl_set_frame_limit(int fps);
 /* Where larger versions of whole textures are kept. See render_gl.c. */
 void psp_render_gl_set_replacement_dir(const char *dir);
 /* Save each texture with no larger version to this folder as a PNG named for its hash. */

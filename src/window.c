@@ -33,21 +33,15 @@ static uint32_t g_px[W * H];
 static const uint32_t BUTTON_BIT[PSP_BIND_COUNT] = {
     B_UP, B_RIGHT, B_DOWN, B_LEFT, B_CROSS, B_CIRCLE, B_SQUARE, B_TRIANGLE, B_L, B_R, B_START, B_SELECT,
 };
-static const int DEFAULT_KEYS[PSP_BIND_COUNT] = {
-    VK_UP, VK_RIGHT, VK_DOWN, VK_LEFT, 'Z', 'X', 'A', 'S', 'Q', 'W', VK_RETURN, VK_BACK,
-};
 #define PAD_BIT(id) ((uint32_t)1 << (id))
-static const uint32_t DEFAULT_PADS[PSP_BIND_COUNT] = {
-    PAD_BIT(11), PAD_BIT(14), PAD_BIT(12), PAD_BIT(13), PAD_BIT(0), PAD_BIT(1), PAD_BIT(2), PAD_BIT(3),
-    PAD_BIT(9) | PAD_BIT(PSP_PAD_LT), PAD_BIT(10) | PAD_BIT(PSP_PAD_RT), PAD_BIT(6), PAD_BIT(4),
-};
-static volatile int g_keys[PSP_BIND_COUNT] = {
-    VK_UP, VK_RIGHT, VK_DOWN, VK_LEFT, 'Z', 'X', 'A', 'S', 'Q', 'W', VK_RETURN, VK_BACK,
-};
-static volatile uint32_t g_pads[PSP_BIND_COUNT] = {
-    PAD_BIT(11), PAD_BIT(14), PAD_BIT(12), PAD_BIT(13), PAD_BIT(0), PAD_BIT(1), PAD_BIT(2), PAD_BIT(3),
-    PAD_BIT(9) | PAD_BIT(PSP_PAD_LT), PAD_BIT(10) | PAD_BIT(PSP_PAD_RT), PAD_BIT(6), PAD_BIT(4),
-};
+#define DEFAULT_KEY_LIST { VK_UP, VK_RIGHT, VK_DOWN, VK_LEFT, 'Z', 'X', 'A', 'S', 'Q', 'W', VK_RETURN, VK_BACK }
+#define DEFAULT_PAD_LIST { \
+    PAD_BIT(11), PAD_BIT(14), PAD_BIT(12), PAD_BIT(13), PAD_BIT(0), PAD_BIT(1), PAD_BIT(2), PAD_BIT(3), \
+    PAD_BIT(9) | PAD_BIT(PSP_PAD_LT), PAD_BIT(10) | PAD_BIT(PSP_PAD_RT), PAD_BIT(6), PAD_BIT(4) }
+static const int DEFAULT_KEYS[PSP_BIND_COUNT] = DEFAULT_KEY_LIST;
+static const uint32_t DEFAULT_PADS[PSP_BIND_COUNT] = DEFAULT_PAD_LIST;
+static volatile int g_keys[PSP_BIND_COUNT] = DEFAULT_KEY_LIST;
+static volatile uint32_t g_pads[PSP_BIND_COUNT] = DEFAULT_PAD_LIST;
 static volatile uint32_t g_pad_raw;
 
 void psp_window_set_key(int button, int vk) { g_keys[button] = vk; }
@@ -273,8 +267,8 @@ static void paint(HWND h) {
     EndPaint(h, &ps);
 }
 
-/* The whole of the window's monitor with no borders, and back to the window as it was. */
-/* Asked from any thread, and done on the window's own. */
+/* The whole of the window's monitor with no borders, and back to the window as it was. Asked
+ * from any thread, and done on the window's own. */
 static volatile LONG g_mode_asked = PSP_WINDOW_NORMAL;
 static int g_mode = PSP_WINDOW_NORMAL;
 static int g_last_covering = PSP_WINDOW_FULL_SCREEN;

@@ -68,7 +68,7 @@
 #define TEX_MAX_LIVE  1024
 #define TEX_MAX_SIDE  1024
 #define HASH_SAMPLES  4096       /* words of a texture checked for changes per frame */
-#define SNAPSHOT_EVERY 15        /* presents between copies kept for capture */
+#define SNAPSHOT_WAIT_MS 500     /* how long a capture waits for a present */
 
 #define GL_FUNCS(X) \
     X(PFNGLCREATESHADERPROC, glCreateShader) \
@@ -238,6 +238,8 @@ static int    g_flat_now, g_flat_last;
  * its own. Known from the frame before, so an illustration is never stretched. */
 static uint32_t g_flat_sheet;
 static int    g_card_now, g_card_last;
+/* The results' band is on show, this frame or the last. */
+static int    g_results_now, g_results_last;
 /* The dimming behind a dialog was drawn this frame. */
 static int    g_veil_now;
 /* A window in the middle of the screen is on show, this frame or the last: what is in it stays. */
@@ -262,12 +264,21 @@ static gl_vertex  g_vb[65536 * 3];
 static uint32_t   g_decode[TEX_MAX_SIDE * TEX_MAX_SIDE];
 static uint32_t   g_upload[PSP_W * PSP_H];
 static uint32_t   g_snapshot[PSP_W * PSP_H];
+/* Made only when asked for: a copy waits for the GPU to finish, which can cost a whole frame. */
+static volatile LONG g_snapshot_asked;
 static volatile int g_have_snapshot;
 
 static int g_overlay;
 static int g_present_linear = 1;
 
 void psp_render_gl_set_present_filter(int linear) { g_present_linear = linear; }
+
+/* The game keeps its pace, which its speed depends on: only what reaches the window is less. A
+ * frame is let through once most of the time has gone, so one due at the next refresh is not
+ * put off to the one after. */
+static volatile uint32_t g_present_every_us;
+
+void psp_render_gl_set_frame_limit(int fps) { g_present_every_us = fps > 0 ? 1000000u / (uint32_t)fps * 3u / 4u : 0u; }
 
 /* Larger versions of whole textures, made outside the game, and named for a hash of the
  * original that survives the way the game stores colours. An .rgba file replaces a picture.
@@ -298,24 +309,17 @@ void psp_render_gl_set_replacement_dir(const char *dir) {
     snprintf(g_replace_dir, sizeof g_replace_dir, "%s", dir ? dir : "");
 }
 
-void psp_render_gl_set_language_dir(const char *dir) {
-    /* Only ever replaced whole, so that the thread that draws never reads half of one. */
+/* Only ever replaced whole, so that the thread that draws never reads half of one. */
+static void ask_for_dir(void *volatile *asked, const char *dir) {
     const char *text = dir ? dir : "";
     char *copy = (char *)malloc(strlen(text) + 1);
     if (!copy) return;
     strcpy(copy, text);
-    void *before = InterlockedExchangePointer((void *volatile *)&g_language_asked, copy);
-    free(before);
+    free(InterlockedExchangePointer((void *volatile *)asked, copy));
 }
 
-void psp_render_gl_set_vector_dir(const char *dir) {
-    const char *text = dir ? dir : "";
-    char *copy = (char *)malloc(strlen(text) + 1);
-    if (!copy) return;
-    strcpy(copy, text);
-    void *before = InterlockedExchangePointer((void *volatile *)&g_vector_asked, copy);
-    free(before);
-}
+void psp_render_gl_set_language_dir(const char *dir) { ask_for_dir(&g_language_asked, dir); }
+void psp_render_gl_set_vector_dir(const char *dir) { ask_for_dir(&g_vector_asked, dir); }
 
 void psp_render_gl_set_overlay(int on) { g_overlay = on; }
 
@@ -328,8 +332,6 @@ void psp_render_gl_set_wide(int on) {
 }
 
 void psp_render_gl_set_wide_view(int view) { g_wide_view = view; }
-
-
 
 void psp_render_gl_set_scale(int scale) {
     if (scale < 1 || scale > 8) return;
@@ -1191,6 +1193,7 @@ static int place_flat_piece(int prim, int n, const psp_draw_state *st) {
     const int in_dialog = (g_dialog_now || g_dialog_last) && bottom > PIN_TOP && top < PIN_BOTTOM;
     /* The score's digits, on their own rows of the sheet the combo is on. */
     const int score_digit = st->tex_w == 512 && st->tex_h == 256 && v_low >= 20.0f && v_high <= 40.0f;
+    if (quad && band && top >= METER_TOP && top < PIN_BOTTOM && st->tex_h != 512) g_results_now = 1;
     float down = 0.0f, side = 0.0f;
     if (g_show_h > PSP_H) {
         const float middle = (top + bottom) / 2.0f;
@@ -1201,13 +1204,16 @@ static int place_flat_piece(int prim, int n, const psp_draw_state *st) {
             /* Each piece keeps its size, and goes where the stretched ground has its place. */
             if (g_card_last) down = (middle - (float)PSP_H / 2.0f) * ((float)g_show_h / (float)PSP_H - 1.0f);
         } else if (band) {
-            /* The results' band has that screen's buttons drawn on it, so it stays with them. A
-             * song's reaches higher, and comes from a square sheet. */
+            /* A song's and the results' reach higher than the others. */
             if (middle < BAND_TOP) down = -extra_down;
-            else if (middle > BAND_BOTTOM && (top >= PIN_BOTTOM || (top >= METER_TOP && st->tex_h == 512))) down = extra_down;
+            else if (middle > BAND_BOTTOM && top >= METER_TOP) down = extra_down;
         } else if (bottom <= PIN_TOP) {
             down = -extra_down;
         } else if (top >= PIN_BOTTOM || (right <= METER_RIGHT && top >= METER_TOP && bottom >= METER_BOTTOM)) {
+            down = extra_down;
+        } else if ((g_results_now || g_results_last) && !in_dialog && top >= METER_TOP && across_middle >= (float)PSP_W / 2.0f) {
+            /* The results' band has that screen's buttons drawn on it, and these are what goes on
+             * them. The score, on the left, is not on the band. */
             down = extra_down;
         }
     }
@@ -1253,44 +1259,6 @@ static int place_flat_piece(int prim, int n, const psp_draw_state *st) {
     return n;
 }
 
-/* Writes down flat pieces large enough to be a transition, each different one once, as those go
- * by too fast for F3. */
-static void note_big_piece(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
-    static uint32_t seen[1024];
-    static int seen_count;
-    /* A model is many vertices, and a fade is a few, whatever its w. */
-    if (seen_count == 1024 || count < 2 || v[0].pw == 0.0f || (count > 8 && fabsf(v[0].pw - 1.0f) > FLAT_W_NEAR)) return;
-    float left = v[0].px / v[0].pw, right = left, top = v[0].py / v[0].pw, bottom = top;
-    float u_low = v[0].u, u_high = u_low, v_low = v[0].v, v_high = v_low;
-    for (int i = 1; i < count; i++) {
-        const float w = v[i].pw != 0.0f ? v[i].pw : 1.0f;
-        const float x = v[i].px / w, y = v[i].py / w;
-        if (x < left) left = x;
-        if (x > right) right = x;
-        if (y < top) top = y;
-        if (y > bottom) bottom = y;
-        if (v[i].u < u_low) u_low = v[i].u;
-        if (v[i].u > u_high) u_high = v[i].u;
-        if (v[i].v < v_low) v_low = v[i].v;
-        if (v[i].v > v_high) v_high = v[i].v;
-    }
-    if (right - left < BAND_WIDTH && bottom - top < 200.0f) return;
-    /* The alpha is left out of what makes it different, as a fade would fill the list. */
-    uint32_t key = (st->tex_addr ^ (v[0].rgba & 0xFFFFFFu) ^ ((uint32_t)prim << 24)) * 16777619u;
-    key = (key ^ (uint32_t)(int)left) * 16777619u;
-    key = (key ^ (uint32_t)(int)top) * 16777619u;
-    key = (key ^ (uint32_t)(int)right) * 16777619u;
-    key = (key ^ (uint32_t)(int)bottom) * 16777619u;
-    key = (key ^ (uint32_t)st->tex_enable) * 16777619u;
-    for (int i = 0; i < seen_count; i++) {
-        if (seen[i] == key) return;
-    }
-    seen[seen_count++] = key;
-    fprintf(stderr, "gl: big w %.3f prim %d n %d through %d box %.1f,%.1f %.1f,%.1f tex %d %08X %dx%d span %.0f %.0f colour %08X blend %d %d %d scissor %d,%d %d,%d shown %d\n",
-            v[0].pw, prim, count, st->through, left, top, right, bottom, st->tex_enable, st->tex_addr, st->tex_w, st->tex_h, u_high - u_low, v_high - v_low,
-            v[0].rgba, st->blend, st->blend_src, st->blend_dst, st->sc_x0, st->sc_y0, st->sc_x1, st->sc_y1, g_bound && g_bound->shown);
-}
-
 /* 2 asks for a frame to be written down, and 1 is that frame. */
 static volatile int g_trace_draws;
 static int g_traces;
@@ -1314,7 +1282,6 @@ static void trace_draw(int prim, const psp_vertex *v, int count, const psp_draw_
 
 static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
     if (g_trace_draws == 1 && count > 0) trace_draw(prim, v, count, st);
-    if (g_wide) note_big_piece(prim, v, count, st);
     if (count <= 0 || st->sc_x1 < st->sc_x0 || st->sc_y1 < st->sc_y0) return;
 
     bind_target();
@@ -1609,7 +1576,6 @@ static void keep_snapshot(GLuint source_fbo, int source_x, int source_y, int sou
 /* Show the buffer at `addr`. The game may have filled it with the CPU rather than
  * by drawing, and then it is only in guest memory. */
 static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
-    static uint32_t presents;
     GLuint source;
     int source_x = 0, source_y = 0, source_w, source_h;
     GLenum filter;
@@ -1631,6 +1597,8 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
     g_veil_now = 0;
     g_dialog_last = g_dialog_now;
     g_dialog_now = 0;
+    g_results_last = g_results_now;
+    g_results_now = 0;
     glDisable(GL_SCISSOR_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
@@ -1660,7 +1628,7 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
         filter = GL_NEAREST;
     }
 
-    if (++presents % SNAPSHOT_EVERY == 0) keep_snapshot(source, source_x, source_y, source_w, source_h);
+    if (InterlockedExchange(&g_snapshot_asked, 0)) keep_snapshot(source, source_x, source_y, source_w, source_h);
 
     /* Fit the window, keeping the PSP's shape. Rows are stored top first, and the
      * window's y runs upwards, hence the swapped destination. */
@@ -1695,16 +1663,21 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
     if (h > ch) { h = ch; w = (int)((long long)ch * source_w / source_h); }
     const int x0 = (cw - w) / 2, y0 = (ch - h) / 2;
 
-    p_glBindFramebuffer(GL_READ_FRAMEBUFFER, source);
-    p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-    glViewport(0, 0, cw, ch);
-    glClearColor(0, 0, 0, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
-    p_glBlitFramebuffer(source_x, source_y, source_x + source_w, source_y + source_h, x0, y0 + h, x0 + w, y0, GL_COLOR_BUFFER_BIT, filter);
-    p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-    draw_message(x0, y0, w, h);
-    if (g_overlay) draw_overlay(x0, y0 + h, h);
-    SwapBuffers(g_dc);
+    static uint64_t last_present_us;
+    const uint64_t now_us = gl_now_us();
+    if (now_us - last_present_us >= g_present_every_us) {
+        last_present_us = now_us;
+        p_glBindFramebuffer(GL_READ_FRAMEBUFFER, source);
+        p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        glViewport(0, 0, cw, ch);
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        p_glBlitFramebuffer(source_x, source_y, source_x + source_w, source_y + source_h, x0, y0 + h, x0 + w, y0, GL_COLOR_BUFFER_BIT, filter);
+        p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        draw_message(x0, y0, w, h);
+        if (g_overlay) draw_overlay(x0, y0 + h, h);
+        SwapBuffers(g_dc);
+    }
 
     g_bound = NULL;
     g_frame++;
@@ -1712,7 +1685,12 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
     take_up_scale();
 }
 
+/* From any thread. The next present makes the copy, if one comes: a game on the save screen or
+ * stuck shows none, and there is then no frame to give. */
 static int gl_read_frame(uint32_t *out) {
+    g_have_snapshot = 0;
+    InterlockedExchange(&g_snapshot_asked, 1);
+    for (int waited = 0; !g_have_snapshot && waited < SNAPSHOT_WAIT_MS; waited += 5) Sleep(5);
     if (!g_have_snapshot) return -1;
     memcpy(out, g_snapshot, sizeof g_snapshot);
     return 0;
