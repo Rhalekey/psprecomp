@@ -273,13 +273,13 @@ static volatile int g_have_snapshot;
 /* A song's scene is drawn first, then its notes with no depth test, then its flat HUD, so a veil
  * goes in before the first of those two. It is on for a few frames after the host last said a
  * song is on, as its word may come after the frame has begun. */
-#define DIM_FRAMES 3
+#define SONG_FRAMES 3
 static volatile int g_dim_percent;
-static volatile int g_dim_frames;
+static volatile int g_song_frames;
 static int g_dim_done;
 
 void psp_render_gl_set_background_dim(int percent) { g_dim_percent = percent; }
-void psp_render_gl_song_frame(void) { g_dim_frames = DIM_FRAMES; }
+void psp_render_gl_song_frame(void) { g_song_frames = SONG_FRAMES; }
 
 static int g_overlay;
 static int g_present_linear = 1;
@@ -1158,10 +1158,18 @@ static int place_flat_piece(int prim, int n, const psp_draw_state *st) {
     }
     if (covers) {
         /* A picture has nothing past it, so a blurred copy fills the rest of the window, and hides
-         * whatever the game left there. */
-        g_flat_now = 1;
-        g_flat_sheet = st->tex_addr;
+         * whatever the game left there. In a song it is only the background, which can come and go
+         * from frame to frame, so the HUD does not change its place for it. */
+        const int in_song = g_song_frames > 0;
+        if (!in_song) {
+            g_flat_now = 1;
+            g_flat_sheet = st->tex_addr;
+        }
         if (g_show_w <= PSP_W && g_show_h <= PSP_H) return n;
+        /* One larger than the screen may need no copy, if it fills the window by itself. */
+        const float past_side = (float)(g_show_w - PSP_W) / 2.0f, past_down = (float)(g_show_h - PSP_H) / 2.0f;
+        if (in_song && left <= COVERS_NEAR - past_side && right >= PSP_W + past_side - COVERS_NEAR &&
+            top <= COVERS_NEAR - past_down && bottom >= PSP_H + past_down - COVERS_NEAR) return n;
         if (g_card_last && g_show_h > PSP_H) {
             const float tall = (float)g_show_h / (float)PSP_H;
             for (int i = 0; i < n; i++) g_vb[i].y = (float)PSP_H / 2.0f + (g_vb[i].y - (float)PSP_H / 2.0f) * tall;
@@ -1337,7 +1345,7 @@ static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
     if (count <= 0 || st->sc_x1 < st->sc_x0 || st->sc_y1 < st->sc_y0) return;
 
     bind_target();
-    if (g_dim_percent && g_dim_frames && !g_dim_done && !st->clear && prim != PSP_PRIM_SPRITES && g_bound && g_bound->shown &&
+    if (g_dim_percent && g_song_frames && !g_dim_done && !st->clear && prim != PSP_PRIM_SPRITES && g_bound && g_bound->shown &&
         /* Notes are models. A flat piece with no depth test, as some songs lay over their whole
          * scene, belongs to the background; the HUD's pieces are single quads. */
         (fabsf(v[0].pw - 1.0f) > FLAT_W_NEAR ? !st->ztest : prim == PSP_PRIM_TRIANGLES && count == 6 && fabsf(v[5].pw - 1.0f) <= FLAT_W_NEAR && !covers_screen(v, count))) {
@@ -1655,7 +1663,7 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
     g_results_last = g_results_now;
     g_results_now = 0;
     g_dim_done = 0;
-    if (g_dim_frames > 0) g_dim_frames--;
+    if (g_song_frames > 0) g_song_frames--;
     glDisable(GL_SCISSOR_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
