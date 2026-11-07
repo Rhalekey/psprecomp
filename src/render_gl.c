@@ -270,6 +270,17 @@ static uint32_t   g_snapshot[PSP_W * PSP_H];
 static volatile LONG g_snapshot_asked;
 static volatile int g_have_snapshot;
 
+/* A song's scene is drawn first, then its notes with no depth test, then its flat HUD, so a veil
+ * goes in before the first of those two. It is on for a few frames after the host last said a
+ * song is on, as its word may come after the frame has begun. */
+#define DIM_FRAMES 3
+static volatile int g_dim_percent;
+static volatile int g_dim_frames;
+static int g_dim_done;
+
+void psp_render_gl_set_background_dim(int percent) { g_dim_percent = percent; }
+void psp_render_gl_song_frame(void) { g_dim_frames = DIM_FRAMES; }
+
 static int g_overlay;
 static int g_present_linear = 1;
 
@@ -1270,9 +1281,55 @@ static void trace_draw(int prim, const psp_vertex *v, int count, const psp_draw_
         if (y < top) top = y;
         if (y > bottom) bottom = y;
     }
-    fprintf(stderr, "gl: draw prim %d n %d through %d w %.5f box %.0f,%.0f %.0f,%.0f scissor %d,%d %d,%d target %08X tex %d %08X %dx%d blend %d %d %d\n",
+    fprintf(stderr, "gl: draw prim %d n %d through %d w %.5f box %.0f,%.0f %.0f,%.0f scissor %d,%d %d,%d target %08X tex %d %08X %dx%d blend %d %d %d ztest %d zwrite %d func %d alpha %d shown %d colour %08X\n",
             prim, count, st->through, v[0].pw, left, top, right, bottom, st->sc_x0, st->sc_y0, st->sc_x1, st->sc_y1, g_target_addr,
-            st->tex_enable, st->tex_addr, st->tex_w, st->tex_h, st->blend, st->blend_src, st->blend_dst);
+            st->tex_enable, st->tex_addr, st->tex_w, st->tex_h, st->blend, st->blend_src, st->blend_dst,
+            st->ztest, st->zwrite, st->tex_func, st->atest, g_bound && g_bound->shown, v[0].rgba);
+}
+
+/* Some songs have a flat picture for their whole background, larger than the screen. */
+static int covers_screen(const psp_vertex *v, int count) {
+    float left = v[0].px, right = left, top = v[0].py, bottom = top;
+    for (int i = 1; i < count; i++) {
+        if (v[i].px < left) left = v[i].px;
+        if (v[i].px > right) right = v[i].px;
+        if (v[i].py < top) top = v[i].py;
+        if (v[i].py > bottom) bottom = v[i].py;
+    }
+    return left <= COVERS_NEAR && top <= COVERS_NEAR && right >= PSP_W - COVERS_NEAR && bottom >= PSP_H - COVERS_NEAR;
+}
+
+static void tell_canvas(void) {
+    if (g_canvas_told) return;
+    g_canvas_told = 1;
+    p_glUniform2f(U.canvas_at, (float)g_canvas_x, (float)g_canvas_y);
+    p_glUniform2f(U.canvas_half, (float)g_canvas_w / 2.0f, (float)g_canvas_h / 2.0f);
+}
+
+/* Black over the whole canvas. What is drawn next sets again all the state this changes. */
+static void draw_dim_veil(void) {
+    const float left = (float)-g_canvas_x, top = (float)-g_canvas_y;
+    const float right = (float)(g_canvas_w - g_canvas_x), bottom = (float)(g_canvas_h - g_canvas_y);
+    const uint32_t colour = (uint32_t)(g_dim_percent * 255 / 100) << 24;
+    const gl_vertex quad[6] = {
+        {left, top, 0, 1, colour, 0, 0}, {right, top, 0, 1, colour, 0, 0}, {left, bottom, 0, 1, colour, 0, 0},
+        {right, top, 0, 1, colour, 0, 0}, {right, bottom, 0, 1, colour, 0, 0}, {left, bottom, 0, 1, colour, 0, 0},
+    };
+    tell_canvas();
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glEnable(GL_BLEND);
+    p_glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    p_glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+    p_glUniform1i(U.tex_on, 0);
+    p_glUniform1i(U.gouraud, 0);
+    p_glUniform1i(U.afunc, -1);
+    p_glUniform1f(U.zoom, 1.0f);
+    p_glUniform3f(U.sfix, 1, 1, 1);
+    p_glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof quad, quad, GL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
 static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
@@ -1280,6 +1337,13 @@ static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
     if (count <= 0 || st->sc_x1 < st->sc_x0 || st->sc_y1 < st->sc_y0) return;
 
     bind_target();
+    if (g_dim_percent && g_dim_frames && !g_dim_done && !st->clear && prim != PSP_PRIM_SPRITES && g_bound && g_bound->shown &&
+        /* Notes are models. A flat piece with no depth test, as some songs lay over their whole
+         * scene, belongs to the background; the HUD's pieces are single quads. */
+        (fabsf(v[0].pw - 1.0f) > FLAT_W_NEAR ? !st->ztest : prim == PSP_PRIM_TRIANGLES && count == 6 && fabsf(v[5].pw - 1.0f) <= FLAT_W_NEAR && !covers_screen(v, count))) {
+        g_dim_done = 1;
+        draw_dim_veil();
+    }
     glEnable(GL_SCISSOR_TEST);
     /* A scissor of the whole screen means the whole canvas, or nothing past it would show. */
     const int whole_screen = st->sc_x0 <= 0 && st->sc_y0 <= 0 && st->sc_x1 >= PSP_W - 1 && st->sc_y1 >= PSP_H - 1;
@@ -1298,11 +1362,7 @@ static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
     setup_blend(st);
     setup_depth(st);
     setup_shader(st, setup_texture(st));
-    if (!g_canvas_told) {
-        g_canvas_told = 1;
-        p_glUniform2f(U.canvas_at, (float)g_canvas_x, (float)g_canvas_y);
-        p_glUniform2f(U.canvas_half, (float)g_canvas_w / 2.0f, (float)g_canvas_h / 2.0f);
-    }
+    tell_canvas();
     /* Textures the game makes keep their own framing. */
     p_glUniform1f(U.zoom, g_bound && g_bound->shown ? g_zoom : 1.0f);
 
@@ -1594,6 +1654,8 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
     g_dialog_now = 0;
     g_results_last = g_results_now;
     g_results_now = 0;
+    g_dim_done = 0;
+    if (g_dim_frames > 0) g_dim_frames--;
     glDisable(GL_SCISSOR_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 

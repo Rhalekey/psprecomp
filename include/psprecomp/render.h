@@ -155,6 +155,9 @@ void psp_render_gl_set_wide_view(int view);
 void psp_render_gl_trace_frame(void);
 /* Smooth the picture when fitting it to the window, or keep hard pixels. */
 void psp_render_gl_set_present_filter(int linear);
+/* How dark the background of a song is, from 0 to 100, and a song being on for this frame. */
+void psp_render_gl_set_background_dim(int percent);
+void psp_render_gl_song_frame(void);
 /* Where larger versions of whole textures are kept. See render_gl.c. */
 void psp_render_gl_set_replacement_dir(const char *dir);
 /* Save each texture with no larger version to this folder as a PNG named for its hash. */
