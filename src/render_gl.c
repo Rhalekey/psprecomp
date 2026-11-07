@@ -273,13 +273,6 @@ static int g_present_linear = 1;
 
 void psp_render_gl_set_present_filter(int linear) { g_present_linear = linear; }
 
-/* The game keeps its pace, which its speed depends on: only what reaches the window is less. A
- * frame is let through once most of the time has gone, so one due at the next refresh is not
- * put off to the one after. */
-static volatile uint32_t g_present_every_us;
-
-void psp_render_gl_set_frame_limit(int fps) { g_present_every_us = fps > 0 ? 1000000u / (uint32_t)fps * 3u / 4u : 0u; }
-
 /* Larger versions of whole textures, made outside the game, and named for a hash of the
  * original that survives the way the game stores colours. An .rgba file replaces a picture.
  * An .alpha file holds one byte of coverage over white per pixel, for a font. */
@@ -1663,21 +1656,16 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
     if (h > ch) { h = ch; w = (int)((long long)ch * source_w / source_h); }
     const int x0 = (cw - w) / 2, y0 = (ch - h) / 2;
 
-    static uint64_t last_present_us;
-    const uint64_t now_us = gl_now_us();
-    if (now_us - last_present_us >= g_present_every_us) {
-        last_present_us = now_us;
-        p_glBindFramebuffer(GL_READ_FRAMEBUFFER, source);
-        p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-        glViewport(0, 0, cw, ch);
-        glClearColor(0, 0, 0, 1);
-        glClear(GL_COLOR_BUFFER_BIT);
-        p_glBlitFramebuffer(source_x, source_y, source_x + source_w, source_y + source_h, x0, y0 + h, x0 + w, y0, GL_COLOR_BUFFER_BIT, filter);
-        p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-        draw_message(x0, y0, w, h);
-        if (g_overlay) draw_overlay(x0, y0 + h, h);
-        SwapBuffers(g_dc);
-    }
+    p_glBindFramebuffer(GL_READ_FRAMEBUFFER, source);
+    p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glViewport(0, 0, cw, ch);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    p_glBlitFramebuffer(source_x, source_y, source_x + source_w, source_y + source_h, x0, y0 + h, x0 + w, y0, GL_COLOR_BUFFER_BIT, filter);
+    p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    draw_message(x0, y0, w, h);
+    if (g_overlay) draw_overlay(x0, y0 + h, h);
+    SwapBuffers(g_dc);
 
     g_bound = NULL;
     g_frame++;
