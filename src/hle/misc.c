@@ -127,6 +127,10 @@ static uint32_t g_ctrl_frame;
 /* Once something else is playing, the window no longer has a say. */
 static volatile int g_ctrl_forced;
 
+/* All that has been down since the game last read, so that a press between two of its reads is
+ * still there for the second. */
+static volatile uint32_t g_ctrl_seen;
+
 void psp_ctrl_force(uint32_t buttons) {
     g_ctrl_forced = 1;
     g_buttons = buttons;
@@ -135,6 +139,7 @@ void psp_ctrl_force(uint32_t buttons) {
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay) {
     if (g_ctrl_forced) return;
     g_buttons = buttons;
+    __atomic_fetch_or(&g_ctrl_seen, buttons, __ATOMIC_RELAXED);
     g_analog_x = ax;
     g_analog_y = ay;
 }
@@ -151,7 +156,8 @@ static void hle_CtrlSet(void) { psp_ret(SCE_KERNEL_ERROR_OK); }
 static void hle_ReadBufferPositive(void) {
     uint32_t buf = psp_arg(0), count = psp_arg(1);
     if (!count) count = 1;
-    const uint32_t buttons = g_ctrl_filter ? g_ctrl_filter(g_buttons) : g_buttons;
+    const uint32_t down = g_buttons | __atomic_exchange_n(&g_ctrl_seen, 0, __ATOMIC_RELAXED);
+    const uint32_t buttons = g_ctrl_filter ? g_ctrl_filter(down) : down;
     for (uint32_t i = 0; i < count; i++) {
         uint32_t at = buf + i * 16;
         psp_write32(at, g_ctrl_frame++);
@@ -413,6 +419,7 @@ void psp_misc_reset(void) {
      * here cannot reach another thread's bracket, and should not. */
     g_exit_requested = 0;
     g_buttons = 0;
+    g_ctrl_seen = 0;
     g_analog_x = g_analog_y = 128;
     g_ctrl_frame = 0;
     memset(g_audio, 0, sizeof g_audio);

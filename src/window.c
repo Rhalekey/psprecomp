@@ -73,7 +73,7 @@ static uint32_t keyboard(void) {
 /* Asking an empty slot is slow enough to hurt if done every frame, so while nothing
  * is connected the slots are tried in turn, one a second or so. */
 #define PAD_SLOTS 4
-#define PAD_RETRY_TICKS 60
+#define PAD_RETRY_TICKS 1000
 
 static int read_pad(XINPUT_STATE *s) {
     static int slot = -1, next_slot, wait;
@@ -323,16 +323,10 @@ static void full_screen_keys(HWND h) {
 
 static LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-    case WM_TIMER: {
+    case WM_TIMER:
         full_screen_keys(h);
-        uint8_t ax = 128, ay = 128;
-        uint32_t b = pad(&ax, &ay);
-        if (GetForegroundWindow() == h) b |= keyboard();   /* keys only when focused */
-        psp_ctrl_set(b, ax, ay);
-        InterlockedExchange(&g_buttons, (LONG)b);
         if (!g_external) InvalidateRect(h, NULL, FALSE);
         return 0;
-    }
     case WM_PAINT:      paint(h); return 0;
     case WM_ERASEBKGND: return 1;
     /* No beep for Alt+Enter. */
@@ -340,6 +334,28 @@ static LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:    PostQuitMessage(0); return 0;
     default:            return DefWindowProcA(h, msg, wp, lp);
     }
+}
+
+/* The buttons, about once a millisecond. A window's timer comes every 16 at best and later when
+ * the window is busy, which a rhythm game feels. Whatever SDL may have made on this thread gets
+ * its messages here. */
+static DWORD WINAPI input_main(LPVOID arg) {
+    HWND h = (HWND)arg;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    while (!g_closed) {
+        MSG m;
+        while (PeekMessageA(&m, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&m);
+            DispatchMessageA(&m);
+        }
+        uint8_t ax = 128, ay = 128;
+        uint32_t b = pad(&ax, &ay);
+        if (GetForegroundWindow() == h) b |= keyboard();   /* keys only when focused */
+        psp_ctrl_set(b, ax, ay);
+        InterlockedExchange(&g_buttons, (LONG)b);
+        Sleep(1);
+    }
+    return 0;
 }
 
 static DWORD WINAPI window_main(LPVOID arg) {
@@ -371,6 +387,9 @@ static DWORD WINAPI window_main(LPVOID arg) {
     if (!h) { InterlockedExchange(&g_closed, 1); SetEvent(ready); return 1; }
     g_hwnd = h;
     SetTimer(h, 1, 16, NULL);
+    HANDLE input = CreateThread(NULL, 0, input_main, h, 0, NULL);
+    if (input) CloseHandle(input);
+    else fprintf(stderr, "window: no thread for the buttons\n");
     SetEvent(ready);
 
     MSG m;
