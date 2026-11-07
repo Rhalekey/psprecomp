@@ -64,6 +64,9 @@ enum { PSP_PAD_LT = 21, PSP_PAD_RT = 22 };
 
 void psp_window_set_key(int button, int vk);
 int psp_window_get_key(int button);
+/* A second key for the same button, which is 0 if it has none. */
+void psp_window_set_key2(int button, int vk);
+int psp_window_get_key2(int button);
 void psp_window_set_pad(int button, uint32_t mask);
 uint32_t psp_window_get_pad(int button);
 void psp_window_reset_buttons(void);

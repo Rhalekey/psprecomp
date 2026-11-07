@@ -41,11 +41,14 @@ static const uint32_t BUTTON_BIT[PSP_BIND_COUNT] = {
 static const int DEFAULT_KEYS[PSP_BIND_COUNT] = DEFAULT_KEY_LIST;
 static const uint32_t DEFAULT_PADS[PSP_BIND_COUNT] = DEFAULT_PAD_LIST;
 static volatile int g_keys[PSP_BIND_COUNT] = DEFAULT_KEY_LIST;
+static volatile int g_keys2[PSP_BIND_COUNT];
 static volatile uint32_t g_pads[PSP_BIND_COUNT] = DEFAULT_PAD_LIST;
 static volatile uint32_t g_pad_raw;
 
 void psp_window_set_key(int button, int vk) { g_keys[button] = vk; }
 int psp_window_get_key(int button) { return g_keys[button]; }
+void psp_window_set_key2(int button, int vk) { g_keys2[button] = vk; }
+int psp_window_get_key2(int button) { return g_keys2[button]; }
 void psp_window_set_pad(int button, uint32_t mask) { g_pads[button] = mask; }
 uint32_t psp_window_get_pad(int button) { return g_pads[button]; }
 uint32_t psp_window_pad_raw(void) { return g_pad_raw; }
@@ -53,6 +56,7 @@ uint32_t psp_window_pad_raw(void) { return g_pad_raw; }
 void psp_window_reset_buttons(void) {
     for (int i = 0; i < PSP_BIND_COUNT; i++) {
         g_keys[i] = DEFAULT_KEYS[i];
+        g_keys2[i] = 0;
         g_pads[i] = DEFAULT_PADS[i];
     }
 }
@@ -62,7 +66,7 @@ static uint32_t keyboard(void) {
     /* Alt and the Windows key go with shortcuts: Alt+Enter is not Start, Win+Shift+S not Triangle. */
     if ((GetAsyncKeyState(VK_MENU) | GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) return 0;
     for (int i = 0; i < PSP_BIND_COUNT; i++)
-        if (g_keys[i] && (GetAsyncKeyState(g_keys[i]) & 0x8000)) b |= BUTTON_BIT[i];
+        if ((g_keys[i] && (GetAsyncKeyState(g_keys[i]) & 0x8000)) || (g_keys2[i] && (GetAsyncKeyState(g_keys2[i]) & 0x8000))) b |= BUTTON_BIT[i];
     return b;
 }
 
@@ -406,6 +410,8 @@ void psp_window_set_external(int on) { (void)on; }
 uint32_t psp_window_buttons(void) { return 0; }
 void psp_window_set_key(int button, int vk) { (void)button; (void)vk; }
 int psp_window_get_key(int button) { (void)button; return 0; }
+void psp_window_set_key2(int button, int vk) { (void)button; (void)vk; }
+int psp_window_get_key2(int button) { (void)button; return 0; }
 void psp_window_set_pad(int button, uint32_t mask) { (void)button; (void)mask; }
 uint32_t psp_window_get_pad(int button) { (void)button; return 0; }
 void psp_window_reset_buttons(void) {}
