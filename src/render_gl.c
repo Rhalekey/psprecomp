@@ -1127,6 +1127,28 @@ static int continue_band(int n, float from, float to, float u_at_edge) {
     return n + 6;
 }
 
+static int clamp_int(int v, int low, int high) { return v < low ? low : v > high ? high : v; }
+
+/* Draws the six vertices in the buffer only outside a rectangle of the screen. The blur looks at many
+ * points for each pixel, so at a high resolution it must not be spent under the picture that covers
+ * it. All of this runs with the scissor over the whole canvas, and leaves it so. */
+static void draw_around(float left, float top, float right, float bottom) {
+    const int w = g_canvas_w * g_scale, h = g_canvas_h * g_scale;
+    const int x0 = clamp_int((int)ceilf((left + (float)g_canvas_x) * (float)g_scale), 0, w);
+    const int x1 = clamp_int((int)floorf((right + (float)g_canvas_x) * (float)g_scale), x0, w);
+    const int y0 = clamp_int((int)ceilf((top + (float)g_canvas_y) * (float)g_scale), 0, h);
+    const int y1 = clamp_int((int)floorf((bottom + (float)g_canvas_y) * (float)g_scale), y0, h);
+    const int part[4][4] = {
+        {0, 0, w, y0}, {0, y1, w, h - y1}, {0, y0, x0, y1 - y0}, {x1, y0, w - x1, y1 - y0},
+    };
+    for (int i = 0; i < 4; i++) {
+        if (part[i][2] <= 0 || part[i][3] <= 0) continue;
+        glScissor(part[i][0], part[i][1], part[i][2], part[i][3]);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
+    glScissor(0, 0, w, h);
+}
+
 /* The game's flat pieces have a w of 1, while its models, the notes among them, have other values.
  * Most are two triangles; a few, as the meter's ring, are shapes of their own, which only move.
  * Takes the n vertices just put in g_vb, and gives back how many there are now. */
@@ -1187,7 +1209,7 @@ static int place_flat_piece(int prim, int n, const psp_draw_state *st) {
         glDepthMask(GL_FALSE);
         p_glUniform1f(U.blur, 0.045f);
         p_glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof copy, copy, GL_STREAM_DRAW);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
+        draw_around(left, top, right, bottom);
         p_glUniform1f(U.blur, 0.0f);
         setup_depth(st);
         return n;
