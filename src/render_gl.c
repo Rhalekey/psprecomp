@@ -799,6 +799,39 @@ static void dump_texture(uint32_t colours, int w, int h) {
     free(raw);
 }
 
+/* Clear texels keep a colour of their own, often white, and linear filtering blends it into the
+ * edge of whatever they border: a dark line on a clear ground shows a light rim. Each clear texel
+ * next to a coloured one takes the average colour of its coloured neighbours, still clear, and the
+ * pass is repeated so the colour reaches a little further. */
+#define BLEED_PASSES 2
+static void bleed_into_clear(uint32_t *pixels, int w, int h) {
+    unsigned char *coloured = malloc((size_t)w * h);
+    if (!coloured) return;
+    for (int i = 0; i < w * h; i++) coloured[i] = (pixels[i] >> 24) != 0;
+    for (int pass = 1; pass <= BLEED_PASSES; pass++) {
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                const int at = y * w + x;
+                if (coloured[at]) continue;
+                unsigned r = 0, g = 0, b = 0, n = 0;
+                const int around[4][2] = {{x - 1, y}, {x + 1, y}, {x, y - 1}, {x, y + 1}};
+                for (int k = 0; k < 4; k++) {
+                    const int ax = around[k][0], ay = around[k][1];
+                    if (ax < 0 || ay < 0 || ax >= w || ay >= h) continue;
+                    const int from = ay * w + ax;
+                    if (!coloured[from] || coloured[from] == pass + 1) continue;
+                    const uint32_t p = pixels[from];
+                    r += p & 0xFF; g += (p >> 8) & 0xFF; b += (p >> 16) & 0xFF; n++;
+                }
+                if (!n) continue;
+                pixels[at] = (r / n) | (g / n) << 8 | (b / n) << 16;
+                coloured[at] = (unsigned char)(pass + 1);  /* a source only from the next pass on */
+            }
+        }
+    }
+    free(coloured);
+}
+
 /* The file standing in for what is in g_decode, or NULL. */
 static const uint32_t *replacement_for(int w, int h, int *out_w, int *out_h) {
     if ((!g_replace_dir[0] && !g_language_dir[0] && !g_dump_dir[0]) || w < REPLACE_MIN_SIDE || h < REPLACE_MIN_SIDE) return NULL;
@@ -827,6 +860,7 @@ static const uint32_t *replacement_for(int w, int h, int *out_w, int *out_h) {
     }
     int file_w = 0, file_h = 0;
     uint32_t *pixels = read_replacement(colours, shape, &file_w, &file_h);
+    if (pixels) bleed_into_clear(pixels, file_w, file_h);
     if (g_replace_cached < REPLACE_CACHE) {
         replacement *r = &g_replace_cache[g_replace_cached++];
         r->colours = colours;
