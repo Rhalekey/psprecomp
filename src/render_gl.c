@@ -219,6 +219,7 @@ typedef struct {
     GLuint tex;
     int min_linear, mag_linear, clamp_u, clamp_v;
     int replaced;    /* a larger file stands in for it */
+    uint32_t colours;  /* what it is known by, or 0 if that was not worked out */
     int use_logged;
 } gl_texture;
 
@@ -381,6 +382,199 @@ static void widen_frame_piece(int kind, int n, float left, float right, float to
         const int on_left = across ? g_vb[i].x < middle : right <= middle + 0.5f;
         g_vb[i].x += on_left ? -grow / 2.0f : grow / 2.0f;
     }
+}
+
+/* ---- the footer, laid out for its words ----------------------------------- *
+ *
+ * A menu's footer is a band with the buttons' hints on it, each a piece of fixed width on one sheet,
+ * whose words had to fit those widths. pieces.txt, beside the pictures drawn from vectors, names
+ * that sheet by its colours and lists each hint's place on it with the width its words really
+ * take, and a place in the sheet's spare rows for one that did not fit:
+ *
+ *     sheet <colours in hex>
+ *     hint <u> <v> <w> <h> <new u> <new v> <new w> <new h>
+ *     band <u> <v> <w> <h>
+ *
+ * The hints at the bottom of the screen are then put side by side at those widths, from the right
+ * end of the last one, and the band and its line art move by as much as the first hint did, so
+ * that the band always just holds them. Where they go is worked out from the frame before, as the
+ * band is drawn first; only screens with the band are laid out again, so the editor keeps its own. */
+#define FOOTER_PIECES 160
+#define FOOTER_HINTS 24
+#define FOOTER_TOP 230.0f     /* hints this low on the screen are the footer's */
+#define FOOTER_GAP 10.0f      /* between one hint's words and the next one's sign */
+#define FOOTER_UV_NEAR 1.0f
+#define FOOTER_EDGE 6.0f       /* the last hint's words end at least this far from the screen's edge */
+
+typedef struct {
+    float u, v, w, h, nu, nv, nw, nh;
+    int band;
+} footer_piece;
+
+typedef struct {
+    int piece;
+    float left, new_left;
+} footer_hint;
+
+static footer_piece g_footer_pieces[FOOTER_PIECES];
+static int g_footer_piece_count;
+static uint32_t g_footer_sheet;
+static char g_footer_read_for[1024] = "\x01";
+static uint32_t g_tex_colours;   /* the bound texture's, set by setup_texture */
+static footer_hint g_footer_now[FOOTER_HINTS], g_footer_last[FOOTER_HINTS];
+static int g_footer_now_n, g_footer_last_n;
+static int g_footer_band_now;
+static float g_footer_shift;
+
+static void read_footer_pieces(void) {
+    if (!strcmp(g_footer_read_for, g_vector_dir)) return;
+    snprintf(g_footer_read_for, sizeof g_footer_read_for, "%s", g_vector_dir);
+    g_footer_piece_count = 0;
+    g_footer_sheet = 0;
+    g_footer_last_n = 0;
+    g_footer_shift = 0.0f;
+    if (!g_vector_dir[0]) return;
+    const char *second = strchr(g_vector_dir, '|');
+    const int first_len = second ? (int)(second - g_vector_dir) : (int)strlen(g_vector_dir);
+    char path[1200];
+    snprintf(path, sizeof path, "%.*s\\pieces.txt", first_len, g_vector_dir);
+    FILE *f = fopen(path, "r");
+    if (!f && second) {
+        snprintf(path, sizeof path, "%s\\pieces.txt", second + 1);
+        f = fopen(path, "r");
+    }
+    if (!f) return;
+    char line[160];
+    while (fgets(line, sizeof line, f)) {
+        footer_piece p;
+        unsigned sheet;
+        memset(&p, 0, sizeof p);
+        if (sscanf(line, "sheet %x", &sheet) == 1) {
+            g_footer_sheet = sheet;
+        } else if (g_footer_piece_count < FOOTER_PIECES &&
+                   sscanf(line, "hint %f %f %f %f %f %f %f %f", &p.u, &p.v, &p.w, &p.h, &p.nu, &p.nv, &p.nw, &p.nh) == 8) {
+            g_footer_pieces[g_footer_piece_count++] = p;
+        } else if (g_footer_piece_count < FOOTER_PIECES && sscanf(line, "band %f %f %f %f", &p.u, &p.v, &p.w, &p.h) == 4) {
+            p.band = 1;
+            g_footer_pieces[g_footer_piece_count++] = p;
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "gl: footer pieces from %s: %d, sheet %08X\n", path, g_footer_piece_count, g_footer_sheet);
+}
+
+/* A quad just put in g_vb from the footer's sheet. */
+/* `sheet_h` turns the list's rows, counted from the top, into the game's, counted from the bottom. */
+static void footer_piece_drawn(gl_vertex *q, float sheet_h) {
+    float left = q[0].x, right = left, top = q[0].y, bottom = top;
+    float u_low = q[0].u, u_high = u_low, v_low = q[0].v, v_high = v_low;
+    for (int i = 0; i < 6; i++) {
+        left = fminf(left, q[i].x);
+        right = fmaxf(right, q[i].x);
+        top = fminf(top, q[i].y);
+        bottom = fmaxf(bottom, q[i].y);
+        u_low = fminf(u_low, q[i].u);
+        u_high = fmaxf(u_high, q[i].u);
+        v_low = fminf(v_low, q[i].v);
+        v_high = fmaxf(v_high, q[i].v);
+    }
+    int found = -1;
+    for (int i = 0; i < g_footer_piece_count && found < 0; i++) {
+        const footer_piece *p = &g_footer_pieces[i];
+        if (fabsf(u_low - p->u) <= FOOTER_UV_NEAR && fabsf(v_low - (sheet_h - p->v - p->h)) <= FOOTER_UV_NEAR &&
+            fabsf(u_high - (p->u + p->w)) <= FOOTER_UV_NEAR && fabsf(v_high - (sheet_h - p->v)) <= FOOTER_UV_NEAR)
+            found = i;
+    }
+    if (found < 0) {
+        static int unknown;
+        if (unknown < 40) {
+            unknown++;
+            fprintf(stderr, "gl: footer sheet piece not listed: uv %.1f,%.1f %.1f,%.1f at %.1f,%.1f %.1f,%.1f w %.3f\n", u_low, v_low, u_high,
+                    v_high, left, top, right, bottom, q[0].w);
+        }
+        return;
+    }
+    const footer_piece *p = &g_footer_pieces[found];
+    if (p->band) {
+        /* The band and its line art, unless they run from the screen's left edge. */
+        if (p->w >= 500.0f && p->h >= 20.0f) g_footer_band_now = 1;
+        if (left > 1.0f && g_footer_shift != 0.0f)
+            for (int i = 0; i < 6; i++) q[i].x += g_footer_shift;
+        return;
+    }
+    if (top < FOOTER_TOP) return;
+    if (g_footer_now_n < FOOTER_HINTS) g_footer_now[g_footer_now_n++] = (footer_hint){found, left, left};
+    float new_left = left;
+    for (int i = 0; i < g_footer_last_n; i++) {
+        if (g_footer_last[i].piece == found && fabsf(g_footer_last[i].left - left) < 0.5f) new_left = g_footer_last[i].new_left;
+    }
+    const float scale = (right - left) / p->w, scale_down = (bottom - top) / p->h, middle_x = (left + right) / 2.0f;
+    const float middle_u = (u_low + u_high) / 2.0f;
+    for (int i = 0; i < 6; i++) {
+        /* The sheet's rows are the game's counted from the bottom. One with more room under it
+         * grows down on the screen too. */
+        const int lower_row = sheet_h - q[i].v > p->v + p->h / 2.0f;
+        q[i].x = q[i].x < middle_x ? new_left : new_left + p->nw * scale;
+        q[i].u = q[i].u < middle_u ? p->nu : p->nu + p->nw;
+        q[i].v = sheet_h - (lower_row ? p->nv + p->nh : p->nv);
+        if (lower_row) q[i].y += (p->nh - p->h) * scale_down;
+    }
+}
+
+/* Each quad of a draw from the footer's sheet. Logs each new way of drawing from it, once. */
+static void footer_draw(int prim, int n, float sheet_h) {
+    static int logged[8][4];
+    const int slot = n / 6 > 3 ? 3 : n / 6;
+    if (!logged[prim & 7][slot]) {
+        logged[prim & 7][slot] = 1;
+        fprintf(stderr, "gl: footer sheet drawn as prim %d with %d vertices\n", prim, n);
+    }
+    for (int i = 0; i + 6 <= n; i += 6) footer_piece_drawn(g_vb + i, sheet_h);
+}
+
+/* At the end of a frame: where the footer's hints go in the next one. */
+static void plan_footer(void) {
+    footer_hint *h = g_footer_now;
+    const int n = g_footer_band_now ? g_footer_now_n : 0;
+    /* In order across the screen. */
+    for (int i = 1; i < n; i++) {
+        for (int j = i; j > 0 && h[j].left < h[j - 1].left; j--) {
+            const footer_hint kept = h[j];
+            h[j] = h[j - 1];
+            h[j - 1] = kept;
+        }
+    }
+    float shift = 0.0f;
+    if (n > 0) {
+        /* The last hint ends where its place on the sheet did, or where its words do if longer, but
+         * not past the screen. */
+        const footer_piece *last = &g_footer_pieces[h[n - 1].piece];
+        float cursor = fminf(h[n - 1].left + fmaxf(last->w, last->nw), (float)PSP_W - FOOTER_EDGE);
+        for (int i = n - 1; i >= 0; i--) {
+            h[i].new_left = cursor - g_footer_pieces[h[i].piece].nw;
+            cursor = h[i].new_left - FOOTER_GAP;
+        }
+        shift = h[0].new_left - h[0].left;
+    }
+    static int logged_n = -1;
+    static float logged_shift;
+    if (n != logged_n || fabsf(shift - logged_shift) > 0.5f) {
+        if (n || logged_n > 0) {
+            fprintf(stderr, "gl: footer %d hints, band moved %.1f:", n, shift);
+            for (int i = 0; i < n; i++) {
+                const footer_piece *p = &g_footer_pieces[h[i].piece];
+                fprintf(stderr, " [%.0f,%.0f %.0f->%.0f at %.1f->%.1f]", p->u, p->v, p->w, p->nw, h[i].left, h[i].new_left);
+            }
+            fprintf(stderr, "\n");
+        }
+        logged_n = n;
+        logged_shift = shift;
+    }
+    memcpy(g_footer_last, h, sizeof(footer_hint) * (size_t)n);
+    g_footer_last_n = n;
+    g_footer_shift = shift;
+    g_footer_now_n = 0;
+    g_footer_band_now = 0;
 }
 
 /* A screenshot asked for, taken at the next present from what is shown, at full size. */
@@ -909,7 +1103,7 @@ static void bleed_into_clear(uint32_t *pixels, int w, int h) {
 }
 
 /* The file standing in for what is in g_decode, or NULL. */
-static const uint32_t *replacement_for(int w, int h, int *out_w, int *out_h) {
+static const uint32_t *replacement_for(int w, int h, int *out_w, int *out_h, uint32_t *out_colours) {
     if ((!g_replace_dir[0] && !g_language_dir[0] && !g_dump_dir[0]) || w < REPLACE_MIN_SIDE || h < REPLACE_MIN_SIDE) return NULL;
 
     /* A picture is known by its colours, and letters by their shape alone. */
@@ -921,6 +1115,7 @@ static const uint32_t *replacement_for(int w, int h, int *out_w, int *out_h) {
         colours = (colours ^ key) * 16777619u;
         shape = (shape ^ solid) * 16777619u;
     }
+    *out_colours = colours;
     /* Saved as the game has it, whether or not a file stands in for it on the screen. */
     if (g_dump_dir[0]) dump_texture(colours, w, h);
     if (!g_replace_dir[0] && !g_language_dir[0]) return NULL;
@@ -959,7 +1154,8 @@ static void decode_texture(gl_texture *e, const psp_draw_state *st) {
         for (int x = 0; x < w; x++)
             g_decode[y * w + x] = psp_tex_fetch(st, x, y);
     int up_w = w, up_h = h;
-    const uint32_t *pixels = replacement_for(w, h, &up_w, &up_h);
+    e->colours = 0;
+    const uint32_t *pixels = replacement_for(w, h, &up_w, &up_h, &e->colours);
     e->replaced = pixels != NULL;
     if (!pixels) pixels = g_decode;
     glBindTexture(GL_TEXTURE_2D, e->tex);
@@ -996,6 +1192,7 @@ static void take_up_dir(void *volatile *where, char *dir, size_t size) {
 static void take_up_language(void) {
     take_up_dir(&g_language_asked, g_language_dir, sizeof g_language_dir);
     take_up_dir(&g_vector_asked, g_vector_dir, sizeof g_vector_dir);
+    read_footer_pieces();
 }
 
 static gl_texture *get_texture(const psp_draw_state *st) {
@@ -1068,6 +1265,7 @@ static void bind_sampler(GLuint tex, int *min_seen, int *mag_seen, int *u_seen, 
 /* Returns whether a texture is bound. A buffer the game drew into is used directly;
  * its coordinates are texels of the whole logical target. */
 static int setup_texture(const psp_draw_state *st) {
+    g_tex_colours = 0;
     if (!st->tex_enable || st->clear || st->tex_w <= 0 || st->tex_h <= 0) return 0;
     if (in_vram(st->tex_addr)) {
         gl_target *t = find_target(st->tex_addr);
@@ -1081,6 +1279,7 @@ static int setup_texture(const psp_draw_state *st) {
     }
     gl_texture *e = get_texture(st);
     if (!e) return 0;
+    g_tex_colours = e->colours;
     bind_sampler(e->tex, &e->min_linear, &e->mag_linear, &e->clamp_u, &e->clamp_v, st, e->replaced);
     /* How a replaced texture is used, once: its look depends on this as much as on the file. */
     if (e->replaced && !e->use_logged) {
@@ -1559,6 +1758,9 @@ static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
         }
     }
     if (!n) return;
+    if ((prim == PSP_PRIM_TRIANGLES || prim == PSP_PRIM_SPRITES) && n % 6 == 0 && st->tex_enable && g_tex_colours &&
+        g_tex_colours == g_footer_sheet)
+        footer_draw(prim, n, (float)st->tex_h);
 
     p_glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)n * sizeof(gl_vertex)), g_vb, GL_STREAM_DRAW);
     glDrawArrays(mode, 0, n);
@@ -1819,6 +2021,7 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
     g_frame_bottom_now = -1e9f;
     g_results_last = g_results_now;
     g_results_now = 0;
+    plan_footer();
     g_dim_done = 0;
     if (g_song_frames > 0) g_song_frames--;
     glDisable(GL_SCISSOR_TEST);
