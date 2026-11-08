@@ -6,7 +6,7 @@
  * when a game has asked for something the player never saw. A message answers yes
  * to whatever it asked.
  *
- * Saves do their work for real, in savedata.c.
+ * Saves do their work for real, in savedata.c, and screenshots through the host's handler.
  */
 
 #include "psprecomp/hle.h"
@@ -25,6 +25,7 @@
 #define DIALOG_KINDS 5
 #define KIND_MSGDIALOG 0
 #define KIND_SAVEDATA 1
+#define KIND_SCREENSHOT 4
 
 /* pspUtilityMsgDialogParams */
 #define MSG_TEXT 0x3Cu
@@ -35,6 +36,9 @@
 #define PARAM_RESULT 0x1Cu
 
 static int g_state[DIALOG_KINDS];
+static void (*g_take_screenshot)(void);
+
+void psp_utility_set_screenshot_handler(void (*take)(void)) { g_take_screenshot = take; }
 
 void psp_utility_init(void) { memset(g_state, 0, sizeof g_state); }
 
@@ -50,6 +54,10 @@ static void dialog_init(int kind, const char *name) {
         psp_str(param + MSG_TEXT, text, sizeof text);
         fprintf(stderr, "utility: message not shown, answering yes: %s\n", text);
         psp_write32(param + MSG_BUTTON, MSG_BUTTON_YES);
+    } else if (kind == KIND_SCREENSHOT && g_take_screenshot) {
+        /* The picture is the host's to keep, on the player's computer; the game sees it taken. */
+        fprintf(stderr, "utility: screenshot asked for\n");
+        g_take_screenshot();
     } else {
         fprintf(stderr, "utility: %s opened (nothing is shown)\n", name);
     }

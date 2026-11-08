@@ -246,6 +246,16 @@ static int    g_results_now, g_results_last;
 static int    g_veil_now;
 /* A window in the middle of the screen is on show, this frame or the last: what is in it stays. */
 static int    g_dialog_now, g_dialog_last;
+/* A message window is sized by the game for its Japanese, before its lines are known. A wider
+ * translated line is told here, and the window's frame is drawn wider to hold it: its pieces
+ * left of the middle move left, those right of it move right, and those across it stretch. Its
+ * edges and the widest line are known from the frame before, as the frame is drawn first. */
+static float  g_dialog_line_now, g_dialog_line_last;
+static float  g_frame_left_now = 1e9f, g_frame_right_now = -1e9f, g_frame_left_last = 1e9f, g_frame_right_last = -1e9f;
+static float  g_frame_top_now = 1e9f, g_frame_bottom_now = -1e9f, g_frame_top_last = 1e9f, g_frame_bottom_last = -1e9f;
+#define FRAME_BAR_NEAR 8.0f      /* the teal bars sit this close above or below the frame */
+#define FRAME_GROUND_SHARE 0.8f  /* and the ground is at least this much of its width */
+#define DIALOG_TEXT_MARGINS 32.0f   /* the game's own: 16 on each side of the text */
 static float  g_zoom = 1.0f;
 /* How much of the canvas the window shows, in guest pixels, as of the last frame. */
 static int    g_show_w = PSP_W, g_show_h = PSP_H;
@@ -328,6 +338,70 @@ void psp_render_gl_set_language_dir(const char *dir) { ask_for_dir(&g_language_a
 void psp_render_gl_set_vector_dir(const char *dir) { ask_for_dir(&g_vector_asked, dir); }
 
 void psp_render_gl_set_overlay(int on) { g_overlay = on; }
+
+void psp_render_gl_dialog_line(float width) {
+    if (width > g_dialog_line_now) g_dialog_line_now = width;
+}
+
+/* The pieces of a message window's frame, by where they are on their sheets, both 256 square:
+ * the frame with its corner marks and its ground on the interface's sheet, and the teal bars
+ * above and below it on the glow sheet. */
+enum { NOT_FRAME, FRAME_EDGE, FRAME_FILL };
+/* A message window comes after the dimming that covers the screen, and is drawn from the interface's
+ * 256 square sheet: its frame with the corner marks from the columns 150 to 210, which give the
+ * window's edges, and its ground and teal bars from the rest. Words and button signs are on other
+ * sheets, and stay where they are. */
+static int frame_piece(const psp_draw_state *st, float u_low, float u_high, float v_low, float v_high) {
+    (void)v_low;
+    (void)v_high;
+    if (!g_veil_now || !st->tex_enable || st->tex_w != 256 || st->tex_h != 256) return NOT_FRAME;
+    return u_low >= 150.0f && u_high <= 210.0f ? FRAME_EDGE : FRAME_FILL;
+}
+
+/* Widens a frame piece just put in g_vb for the line it has to hold. The frame's own pieces and
+ * the bars above and below it go out, and the ground stretches; buttons and the like inside the
+ * window, which come from the same sheet, stay where the game put them. */
+static void widen_frame_piece(int kind, int n, float left, float right, float top, float bottom) {
+    if (kind == FRAME_EDGE) {
+        if (left < g_frame_left_now) g_frame_left_now = left;
+        if (right > g_frame_right_now) g_frame_right_now = right;
+        if (top < g_frame_top_now) g_frame_top_now = top;
+        if (bottom > g_frame_bottom_now) g_frame_bottom_now = bottom;
+    } else {
+        const int bar = bottom <= g_frame_top_last + FRAME_BAR_NEAR || top >= g_frame_bottom_last - FRAME_BAR_NEAR;
+        const int ground = right - left >= (g_frame_right_last - g_frame_left_last) * FRAME_GROUND_SHARE;
+        if (!bar && !ground) return;
+    }
+    if (g_dialog_line_last <= 0.0f || g_frame_right_last <= g_frame_left_last) return;
+    const float grow = g_dialog_line_last + DIALOG_TEXT_MARGINS - (g_frame_right_last - g_frame_left_last);
+    if (grow <= 0.0f) return;
+    const float middle = (g_frame_left_last + g_frame_right_last) / 2.0f;
+    const int across = left < middle - 0.5f && right > middle + 0.5f;
+    for (int i = 0; i < n; i++) {
+        const int on_left = across ? g_vb[i].x < middle : right <= middle + 0.5f;
+        g_vb[i].x += on_left ? -grow / 2.0f : grow / 2.0f;
+    }
+}
+
+/* A screenshot asked for, taken at the next present from what is shown, at full size. */
+static psp_screenshot_fn volatile g_screenshot_fn;
+static volatile LONG g_screenshot_asked;
+void psp_render_gl_take_screenshot(psp_screenshot_fn fn) {
+    g_screenshot_fn = fn;
+    InterlockedExchange(&g_screenshot_asked, 1);
+}
+
+static void take_screenshot(GLuint source_fbo, int x, int y, int w, int h) {
+    const psp_screenshot_fn fn = g_screenshot_fn;
+    uint8_t *pixels = fn && w > 0 && h > 0 ? malloc((size_t)w * h * 4) : NULL;
+    if (!pixels) return;
+    p_glBindFramebuffer(GL_READ_FRAMEBUFFER, source_fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    /* Rows are kept top first, so they come out in the order a picture file wants. */
+    glReadPixels(x, y, w, h, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
+    fn(pixels, w, h);
+    free(pixels);
+}
 
 void psp_render_gl_set_wide(int on) {
     g_wide = on;
@@ -802,24 +876,26 @@ static void dump_texture(uint32_t colours, int w, int h) {
 /* Clear texels keep a colour of their own, often white, and linear filtering blends it into the
  * edge of whatever they border: a dark line on a clear ground shows a light rim. Each clear texel
  * next to a coloured one takes the average colour of its coloured neighbours, still clear, and the
- * pass is repeated so the colour reaches a little further. */
+ * pass is repeated so the colour reaches a little further. Black clear texels are left: they make
+ * no rim, and a piece the game adds to the screen, alpha or not, must add nothing there. */
 #define BLEED_PASSES 2
 static void bleed_into_clear(uint32_t *pixels, int w, int h) {
     unsigned char *coloured = malloc((size_t)w * h);
     if (!coloured) return;
-    for (int i = 0; i < w * h; i++) coloured[i] = (pixels[i] >> 24) != 0;
+    /* 1: coloured, a source. 0: clear with a colour, to be given its neighbours'. 255: black and clear, kept. */
+    for (int i = 0; i < w * h; i++) coloured[i] = (pixels[i] >> 24) != 0 ? 1 : (pixels[i] & 0xFFFFFFu) ? 0 : 255;
     for (int pass = 1; pass <= BLEED_PASSES; pass++) {
         for (int y = 0; y < h; y++) {
             for (int x = 0; x < w; x++) {
                 const int at = y * w + x;
-                if (coloured[at]) continue;
+                if (coloured[at]) continue;   /* a source, done, or black and kept */
                 unsigned r = 0, g = 0, b = 0, n = 0;
                 const int around[4][2] = {{x - 1, y}, {x + 1, y}, {x, y - 1}, {x, y + 1}};
                 for (int k = 0; k < 4; k++) {
                     const int ax = around[k][0], ay = around[k][1];
                     if (ax < 0 || ay < 0 || ax >= w || ay >= h) continue;
                     const int from = ay * w + ax;
-                    if (!coloured[from] || coloured[from] == pass + 1) continue;
+                    if (!coloured[from] || coloured[from] == 255 || coloured[from] == pass + 1) continue;
                     const uint32_t p = pixels[from];
                     r += p & 0xFF; g += (p >> 8) & 0xFF; b += (p >> 16) & 0xFF; n++;
                 }
@@ -1201,6 +1277,8 @@ static int place_flat_piece(int prim, int n, const psp_draw_state *st) {
         if (g_vb[i].y < top) top = g_vb[i].y;
         if (g_vb[i].y > bottom) bottom = g_vb[i].y;
     }
+    const int frame_kind = frame_piece(st, u_low, u_high, v_low, v_high);
+    if (frame_kind != NOT_FRAME) widen_frame_piece(frame_kind, n, left, right, top, bottom);
     const int quad = prim == PSP_PRIM_TRIANGLES && n == 6;
     const int covers = quad && left <= COVERS_NEAR && top <= COVERS_NEAR && right >= PSP_W - COVERS_NEAR && bottom >= PSP_H - COVERS_NEAR;
     if (covers && (!st->tex_enable || u_high - u_low < PICTURE_SPAN || v_high - v_low < PICTURE_SPAN)) {
@@ -1243,7 +1321,9 @@ static int place_flat_piece(int prim, int n, const psp_draw_state *st) {
         glDepthMask(GL_FALSE);
         p_glUniform1f(U.blur, 0.045f);
         p_glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof copy, copy, GL_STREAM_DRAW);
-        draw_around(left, top, right, bottom);
+        /* The hole goes no further than the screen: a picture's quad can be wider than it, with
+         * its sides clear, and those must show the blur, not nothing. */
+        draw_around(fmaxf(left, 0.0f), fmaxf(top, 0.0f), fminf(right, (float)PSP_W), fminf(bottom, (float)PSP_H));
         p_glUniform1f(U.blur, 0.0f);
         setup_depth(st);
         return n;
@@ -1716,6 +1796,27 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
     g_veil_now = 0;
     g_dialog_last = g_dialog_now;
     g_dialog_now = 0;
+    /* Each change is logged, to see what a window was given against what it needed. */
+    {
+        static float logged_line = -1.0f, logged_width = -1.0f;
+        const float width = g_frame_right_now > g_frame_left_now ? g_frame_right_now - g_frame_left_now : 0.0f;
+        if (fabsf(g_dialog_line_now - logged_line) > 0.5f || fabsf(width - logged_width) > 0.5f) {
+            if (g_dialog_line_now > 0.0f || width > 0.0f)
+                fprintf(stderr, "gl: message window %.1f wide, widest line %.1f\n", width, g_dialog_line_now);
+            logged_line = g_dialog_line_now;
+            logged_width = width;
+        }
+    }
+    g_dialog_line_last = g_dialog_line_now;
+    g_dialog_line_now = 0.0f;
+    g_frame_left_last = g_frame_left_now;
+    g_frame_right_last = g_frame_right_now;
+    g_frame_left_now = 1e9f;
+    g_frame_right_now = -1e9f;
+    g_frame_top_last = g_frame_top_now;
+    g_frame_bottom_last = g_frame_bottom_now;
+    g_frame_top_now = 1e9f;
+    g_frame_bottom_now = -1e9f;
     g_results_last = g_results_now;
     g_results_now = 0;
     g_dim_done = 0;
@@ -1780,6 +1881,7 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
         source_w = show_w * g_scale;
         source_h = show_h * g_scale;
     }
+    if (InterlockedExchange(&g_screenshot_asked, 0)) take_screenshot(source, source_x, source_y, source_w, source_h);
     int w = cw, h = (int)((long long)cw * source_h / source_w);
     if (h > ch) { h = ch; w = (int)((long long)ch * source_w / source_h); }
     const int x0 = (cw - w) / 2, y0 = (ch - h) / 2;

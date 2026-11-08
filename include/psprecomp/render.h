@@ -164,6 +164,14 @@ void psp_render_gl_set_replacement_dir(const char *dir);
 void psp_render_gl_set_dump_dir(const char *dir);
 /* Show frames per second and the slowest frame in a corner of the window. */
 void psp_render_gl_set_overlay(int on);
+/* The width of a line a message window holds, centred, this frame: a narrower window is drawn wider. */
+void psp_render_gl_dialog_line(float width);
+/* A picture of the screen as the player sees it, at the size it is drawn: rows top first, four
+ * bytes a pixel in the order blue, green, red, unused. Called on the drawing thread: copy what
+ * is to be kept, and return soon. */
+typedef void (*psp_screenshot_fn)(const uint8_t *bgra, int w, int h);
+/* Any thread: the next frame shown is handed to `fn`. */
+void psp_render_gl_take_screenshot(psp_screenshot_fn fn);
 /* A folder of .rgba files, tried before the replacement folder, or NULL for none. Any thread
  * can call this while the game runs; textures already in use change to match. */
 void psp_render_gl_set_language_dir(const char *dir);

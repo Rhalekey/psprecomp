@@ -216,6 +216,9 @@ typedef void (*psp_savedata_event_fn)(int event);
 void psp_savedata_set_event_handler(psp_savedata_event_fn fn);
 /* Whether the system's save screen is open, during which a game may draw nothing. */
 int psp_utility_savedata_open(void);
+/* What the system's screenshot dialog does when a game opens it: the host takes the picture and
+ * keeps it. With none set, the dialog only walks through its states. */
+void psp_utility_set_screenshot_handler(void (*take)(void));
 
 void psp_utility_init(void);
 void psp_utility_register(void);
