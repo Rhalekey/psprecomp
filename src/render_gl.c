@@ -2544,10 +2544,20 @@ static int note_target_drawn(int n, const psp_draw_state *st) {
     const float per_u = (right - left) / (u_high - u_low), per_r = (bottom - top) / (r_high - r_low);
     const float x0 = left + (qu0 - u_low) * per_u, x1 = left + (qu0 + half - u_low) * per_u;
     const float y0 = top + (qr0 - r_low) * per_r, y1 = top + (qr0 + half - r_low) * per_r;
+    /* The game draws each shape at a scale of its own, so that the four look alike in size: the
+     * square, smallest on the sheet, about 1.28 times the circle. The style's shapes are all of
+     * one size on their sheet, so each quarter is brought to one scale, around its middle: the
+     * triangle's, at which a sign's target sits around its note as the game's own targets do.
+     * Measured in songs: texels to the screen 0.504, 0.599, 0.645 and 0.574. */
+    static const float GAME_SCALE[4] = {1.0f, 1.188f, 1.280f, 1.139f};
+    const float shrink = GAME_SCALE[1] / GAME_SCALE[row * 2 + col];
+    const float mid_x = (x0 + x1) / 2.0f, mid_y = (y0 + y1) / 2.0f;
+    const float half_x = (x1 - x0) / 2.0f * shrink, half_y = (y1 - y0) / 2.0f * shrink;
     /* The same quarter of the style's sheet, whose rows also count from its bottom. */
     const float side = g_note_targets_side, q = side / 2.0f;
     const float tu0 = col * q, tu1 = tu0 + q, tv0 = side - row * q, tv1 = tv0 - q;
-    const float corner[4][4] = {{x0, y0, tu0, tv0}, {x1, y0, tu1, tv0}, {x0, y1, tu0, tv1}, {x1, y1, tu1, tv1}};
+    const float sx0 = mid_x - half_x, sx1 = mid_x + half_x, sy0 = mid_y - half_y, sy1 = mid_y + half_y;
+    const float corner[4][4] = {{sx0, sy0, tu0, tv0}, {sx1, sy0, tu1, tv0}, {sx0, sy1, tu0, tv1}, {sx1, sy1, tu1, tv1}};
     static const int ORDER[6] = {0, 1, 2, 1, 3, 2};
     const gl_vertex like = g_vb[0];
     for (int i = 0; i < 6; i++) {
