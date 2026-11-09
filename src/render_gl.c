@@ -417,7 +417,12 @@ static void widen_frame_piece(int kind, int n, float left, float right, float to
  *     sheet <colours in hex>
  *     hint <u> <v> <w> <h> <new u> <new v> <new w> <new h>
  *     band <u> <v> <w> <h>
+ *     extra <number> <u> <v> <w> <h>
+ *     extra_with <number> <u> <v>
  *
+ * An extra is a hint the game does not have, for something added to it: while a screen asks for it
+ * (psp_render_gl_footer_extras), or while the game's hint at <u> <v> on the sheet is, it is drawn
+ * before the game's first hint, as one more of them.
  * The hints at the bottom of the screen are put side by side at those widths, ending where the last
  * one did, and the band starts FOOTER_BAND_LEAD before the first, so that it always just holds them.
  * Only screens with the band are laid out again, so the editor keeps its own layout.
@@ -430,7 +435,7 @@ static void widen_frame_piece(int kind, int n, float left, float right, float to
 #define FOOTER_PIECES 160
 #define FOOTER_HINTS 24
 #define FOOTER_BANDS 4
-#define FOOTER_PLACES 48
+#define FOOTER_PLACES 160
 #define FOOTER_TOP 230.0f       /* hints this low on the screen are the footer's */
 #define FOOTER_GAP 10.0f        /* between one hint's words and the next one's sign */
 #define FOOTER_BAND_LEAD 32.0f  /* the band's slanted end starts this far before the first hint, as in the game */
@@ -442,12 +447,36 @@ static void widen_frame_piece(int kind, int n, float left, float right, float to
 typedef struct {
     float u, v, w, h, nu, nv, nw, nh;
     int band;
+    int extra;   /* its number and one, for an extra hint; it is only at nu, nv, nw, nh */
 } footer_piece;
 
-/* A piece drawn at `left` by the game, and where it goes. */
+#define FOOTER_EXTRAS 8
+#define FOOTER_EXTRA_LEFT -1000.0f   /* where an extra counts as drawn, before any of the game's */
+static volatile unsigned g_footer_extras_asked;
+static volatile uint64_t g_footer_extras_frame;
+static uint64_t g_footer_extras_done;
+static float g_footer_hint_scale = 1.0f;   /* of the game's last hint drawn */
+static int g_footer_hint_piece = -1;       /* the same, and where the game drew it */
+static float g_footer_hint_left;
+/* How far each extra's place was from a hint of the game's, once learnt, to follow it as it slides. */
+static int g_footer_extra_from[FOOTER_EXTRAS];
+static float g_footer_extra_dx[FOOTER_EXTRAS];
+/* The game's hint each extra comes with, by its place on the sheet, if any; and those that came last frame. */
+static int g_footer_extra_with[FOOTER_EXTRAS];
+static float g_footer_extra_with_u[FOOTER_EXTRAS], g_footer_extra_with_v[FOOTER_EXTRAS];
+static unsigned g_footer_extras_with;
+void psp_render_gl_footer_extras(unsigned mask) {
+    g_footer_extras_asked = mask;
+    g_footer_extras_frame = g_frame;
+}
+
+/* A piece drawn at `left` by the game, and where it goes, with the other hints drawn with it: the
+ * same hint at the same place goes elsewhere when another is beside it, as on a screen whose hints
+ * change with the row chosen. */
 typedef struct {
     int piece;
     float left, to;
+    uint32_t set;
 } footer_place;
 
 static footer_piece g_footer_pieces[FOOTER_PIECES];
@@ -477,6 +506,8 @@ static float g_footer_shift;   /* the band's last move, for a place not learnt y
 static float g_footer_shown, g_footer_lag;
 static uint64_t g_footer_shown_frame, g_footer_slide_frame;
 
+static void footer_places_load(void);
+
 static void read_footer_pieces(void) {
     if (!strcmp(g_footer_read_for, g_vector_dir)) return;
     snprintf(g_footer_read_for, sizeof g_footer_read_for, "%s", g_vector_dir);
@@ -484,6 +515,8 @@ static void read_footer_pieces(void) {
     g_footer_sheet = 0;
     g_footer_places_n = 0;
     g_footer_shift = 0.0f;
+    memset(g_footer_extra_with, 0, sizeof g_footer_extra_with);
+    g_footer_extras_with = 0;
     if (!g_vector_dir[0]) return;
     const char *second = strchr(g_vector_dir, '|');
     const int first_len = second ? (int)(second - g_vector_dir) : (int)strlen(g_vector_dir);
@@ -505,6 +538,17 @@ static void read_footer_pieces(void) {
         } else if (g_footer_piece_count < FOOTER_PIECES &&
                    sscanf(line, "hint %f %f %f %f %f %f %f %f", &p.u, &p.v, &p.w, &p.h, &p.nu, &p.nv, &p.nw, &p.nh) == 8) {
             g_footer_pieces[g_footer_piece_count++] = p;
+        } else if (sscanf(line, "extra_with %d %f %f", &p.extra, &p.u, &p.v) == 3) {
+            if (p.extra >= 0 && p.extra < FOOTER_EXTRAS) {
+                g_footer_extra_with[p.extra] = 1;
+                g_footer_extra_with_u[p.extra] = p.u;
+                g_footer_extra_with_v[p.extra] = p.v;
+            }
+        } else if (g_footer_piece_count < FOOTER_PIECES &&
+                   sscanf(line, "extra %d %f %f %f %f", &p.extra, &p.nu, &p.nv, &p.nw, &p.nh) == 5) {
+            p.extra++;
+            p.u = p.v = -1e6f;   /* never matches what the game draws */
+            g_footer_pieces[g_footer_piece_count++] = p;
         } else if (g_footer_piece_count < FOOTER_PIECES && sscanf(line, "band %f %f %f %f", &p.u, &p.v, &p.w, &p.h) == 4) {
             p.band = 1;
             g_footer_pieces[g_footer_piece_count++] = p;
@@ -512,24 +556,140 @@ static void read_footer_pieces(void) {
     }
     fclose(f);
     fprintf(stderr, "gl: footer pieces from %s: %d, sheet %08X\n", path, g_footer_piece_count, g_footer_sheet);
+    footer_places_load();
 }
 
-static footer_place *footer_place_of(int piece, float left) {
+static uint32_t g_footer_set;   /* the hints of the last frame, as footer_set_of makes it */
+
+static footer_place *footer_place_in(int piece, float left, uint32_t set) {
     for (int i = 0; i < g_footer_places_n; i++) {
-        if (g_footer_places[i].piece == piece && fabsf(g_footer_places[i].left - left) < FOOTER_SAME) return &g_footer_places[i];
+        if (g_footer_places[i].piece == piece && fabsf(g_footer_places[i].left - left) < FOOTER_SAME && g_footer_places[i].set == set)
+            return &g_footer_places[i];
     }
     return NULL;
 }
 
+/* Where a piece goes with the hints of the last frame, or, while they change, with any others. */
+static footer_place *footer_place_of(int piece, float left) {
+    footer_place *found = footer_place_in(piece, left, g_footer_set);
+    for (int i = 0; i < g_footer_places_n && !found; i++) {
+        if (g_footer_places[i].piece == piece && fabsf(g_footer_places[i].left - left) < FOOTER_SAME) found = &g_footer_places[i];
+    }
+    return found;
+}
+
+static uint32_t footer_set_of(const footer_place *h, int n) {
+    uint32_t set = 2166136261u;
+    for (int i = 0; i < n; i++) {
+        set = (set ^ (uint32_t)h[i].piece) * 16777619u;
+        set = (set ^ (uint32_t)(int32_t)lrintf(h[i].left)) * 16777619u;
+    }
+    return set;
+}
+
+/* What has been learnt is kept in a file, footer_places.txt in the folder psp_render_gl_set_state_dir
+ * names, so that a screen seen once, in a game before, comes out right from its first frame: its band
+ * slides in to its place instead of jumping there once the game's slide has stopped. Each line is
+ *     <pictures> <window width> <piece> <left> <to> <set>
+ * where <pictures> stands for the folder of pictures and its pieces, whose numbering it goes by. */
+#define FOOTER_STORE 2048
+typedef struct {
+    uint32_t pictures;
+    int w;
+    footer_place place;
+} footer_stored;
+static footer_stored g_footer_store[FOOTER_STORE];
+static int g_footer_store_n, g_footer_store_read, g_footer_store_dirty;
+static char g_state_dir[1024];
+
+void psp_render_gl_set_state_dir(const char *dir) { snprintf(g_state_dir, sizeof g_state_dir, "%s", dir ? dir : ""); }
+
+static uint32_t footer_pictures(void) {
+    uint32_t key = 2166136261u;
+    for (const char *c = g_vector_dir; *c; c++) key = (key ^ (uint8_t)*c) * 16777619u;
+    return (key ^ (uint32_t)g_footer_piece_count) * 16777619u;
+}
+
+static void footer_store_path(char *path, size_t size) { snprintf(path, size, "%s\\footer_places.txt", g_state_dir); }
+
+static void footer_store_read(void) {
+    if (g_footer_store_read || !g_state_dir[0]) return;
+    g_footer_store_read = 1;
+    char path[1100], line[160];
+    footer_store_path(path, sizeof path);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    while (fgets(line, sizeof line, f) && g_footer_store_n < FOOTER_STORE) {
+        footer_stored e;
+        unsigned pictures, set;
+        if (sscanf(line, "%x %d %d %f %f %x", &pictures, &e.w, &e.place.piece, &e.place.left, &e.place.to, &set) != 6) continue;
+        e.pictures = pictures;
+        e.place.set = set;
+        g_footer_store[g_footer_store_n++] = e;
+    }
+    fclose(f);
+}
+
+static void footer_store_write(void) {
+    g_footer_store_dirty = 0;
+    if (!g_state_dir[0]) return;
+    char path[1100];
+    footer_store_path(path, sizeof path);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    for (int i = 0; i < g_footer_store_n; i++) {
+        const footer_stored *e = &g_footer_store[i];
+        fprintf(f, "%08X %d %d %.2f %.2f %08X\n", e->pictures, e->w, e->place.piece, e->place.left, e->place.to, e->place.set);
+    }
+    fclose(f);
+}
+
+static void footer_store_put(const footer_place *place) {
+    footer_store_read();
+    const uint32_t pictures = footer_pictures();
+    for (int i = 0; i < g_footer_store_n; i++) {
+        footer_stored *e = &g_footer_store[i];
+        if (e->pictures == pictures && e->w == g_show_w && e->place.piece == place->piece && e->place.set == place->set &&
+            fabsf(e->place.left - place->left) < FOOTER_SAME) {
+            if (fabsf(e->place.to - place->to) >= 0.01f) g_footer_store_dirty = 1;
+            e->place.to = place->to;
+            return;
+        }
+    }
+    /* Full, the oldest goes. */
+    if (g_footer_store_n == FOOTER_STORE) {
+        memmove(g_footer_store, g_footer_store + 1, sizeof g_footer_store[0] * (FOOTER_STORE - 1));
+        g_footer_store_n--;
+    }
+    g_footer_store[g_footer_store_n++] = (footer_stored){pictures, g_show_w, *place};
+    g_footer_store_dirty = 1;
+}
+
+/* The places kept for these pictures and this width of window, the latest last. */
+static void footer_places_load(void) {
+    footer_store_read();
+    g_footer_places_n = 0;
+    g_footer_places_next = 0;
+    const uint32_t pictures = footer_pictures();
+    for (int i = 0; i < g_footer_store_n; i++) {
+        const footer_stored *e = &g_footer_store[i];
+        if (e->pictures != pictures || e->w != g_show_w) continue;
+        g_footer_places[g_footer_places_next] = e->place;
+        g_footer_places_next = (g_footer_places_next + 1) % FOOTER_PLACES;
+        if (g_footer_places_n < FOOTER_PLACES) g_footer_places_n++;
+    }
+}
+
 static void footer_learn(int piece, float left, float to) {
-    footer_place *known = footer_place_of(piece, left);
+    footer_place *known = footer_place_in(piece, left, g_footer_set);
     if (!known) {
         /* The oldest makes room. */
         known = &g_footer_places[g_footer_places_next];
         g_footer_places_next = (g_footer_places_next + 1) % FOOTER_PLACES;
         if (g_footer_places_n < FOOTER_PLACES) g_footer_places_n++;
     }
-    *known = (footer_place){piece, left, to};
+    *known = (footer_place){piece, left, to, g_footer_set};
+    footer_store_put(known);
 }
 
 /* Six vertices more at the end of g_vb: the quad `q` from its edge at `from` on to `to`, the edge's
@@ -614,8 +774,19 @@ static int footer_piece_drawn(gl_vertex *q, float sheet_h, int n, int *handled) 
             if (right >= (float)PSP_W - 1.0f) n = continue_quad(at, n, right, (float)(g_canvas_w - g_canvas_x), u_right);
             return n;
         }
-        if (g_footer_bands_n < FOOTER_BANDS) g_footer_bands_now[g_footer_bands_n++] = (footer_place){found, left, left};
-        float shift = place ? place->to - left : g_footer_shift;
+        if (g_footer_bands_n < FOOTER_BANDS) g_footer_bands_now[g_footer_bands_n++] = (footer_place){found, left, left, 0};
+        /* At a place not learnt, as while the game slides the band in under hints that have stopped,
+         * it moves as it did with these hints, if that was learnt, so that it slides in to where it
+         * stays; else as the band last did. */
+        float shift = g_footer_shift;
+        if (place) {
+            shift = place->to - left;
+        } else {
+            for (int i = 0; i < g_footer_places_n; i++) {
+                const footer_place *known = &g_footer_places[i];
+                if (known->piece == found && known->set == g_footer_set) shift = known->to - known->left;
+            }
+        }
         if (place && main_band) g_footer_shift = shift;
         /* The band slides to a new place rather than jumping, over a few frames: a frame the game draws
          * out of step while its hints change becomes part of the slide. Its line art goes with it. */
@@ -638,10 +809,13 @@ static int footer_piece_drawn(gl_vertex *q, float sheet_h, int n, int *handled) 
 
     if (top < FOOTER_TOP) return n;
     *handled = 1;
-    if (g_footer_hints_n < FOOTER_HINTS) g_footer_hints_now[g_footer_hints_n++] = (footer_place){found, left, left};
+    if (g_footer_hints_n < FOOTER_HINTS) g_footer_hints_now[g_footer_hints_n++] = (footer_place){found, left, left, 0};
     const float to = place ? place->to : left;
     const float scale = (right - left) / p->w, scale_down = (bottom - top) / p->h, middle_x = (left + right) / 2.0f;
     const float middle_u = (u_low + u_high) / 2.0f;
+    g_footer_hint_scale = scale;
+    g_footer_hint_piece = found;
+    g_footer_hint_left = left;
     for (int i = 0; i < 6; i++) {
         /* One with more room under it on the sheet grows down on the screen too. */
         const int lower_row = sheet_h - q[i].v > p->v + p->h / 2.0f;
@@ -653,11 +827,63 @@ static int footer_piece_drawn(gl_vertex *q, float sheet_h, int n, int *handled) 
     return n;
 }
 
+/* With a hint of the game's just drawn as `q`, the extra hints asked for, once a frame: each counts
+ * as drawn at a place of its own before the game's, and is shown where that place was learnt to go,
+ * as tall as `q` and at its scale. Gives back how many vertices there are now. */
+static int footer_extras(const gl_vertex *q, float sheet_h, int n) {
+    const unsigned mask = (g_footer_extras_frame + 2 >= g_frame ? g_footer_extras_asked : 0u) | g_footer_extras_with;
+    if (!mask || g_footer_extras_done == g_frame + 1) return n;
+    g_footer_extras_done = g_frame + 1;
+    float left = q[0].x, right = left, top = q[0].y, bottom = top;
+    for (int i = 1; i < 6; i++) {
+        left = fminf(left, q[i].x);
+        right = fmaxf(right, q[i].x);
+        top = fminf(top, q[i].y);
+        bottom = fmaxf(bottom, q[i].y);
+    }
+    const float middle_x = (left + right) / 2.0f, middle_y = (top + bottom) / 2.0f;
+    const float scale = g_footer_hint_scale;
+    for (int i = 0; i < g_footer_piece_count; i++) {
+        const footer_piece *p = &g_footer_pieces[i];
+        if (!p->extra || p->extra > FOOTER_EXTRAS || !(mask & (1u << (p->extra - 1)))) continue;
+        const float at = FOOTER_EXTRA_LEFT - (float)p->extra;
+        if (g_footer_hints_n < FOOTER_HINTS) g_footer_hints_now[g_footer_hints_n++] = (footer_place){i, at, at, 0};
+        /* Its place is kept as a distance from the hint drawn with it, so that it goes where that
+         * goes, sliding in and out with the game's. */
+        const int e = p->extra - 1;
+        const footer_place *place = footer_place_of(i, at);
+        const footer_place *beside = footer_place_of(g_footer_hint_piece, g_footer_hint_left);
+        if (place && beside) {
+            g_footer_extra_from[e] = g_footer_hint_piece + 1;
+            g_footer_extra_dx[e] = place->to - beside->to;
+        }
+        if (g_footer_extra_from[e] != g_footer_hint_piece + 1 || n + 6 > (int)(sizeof g_vb / sizeof g_vb[0])) continue;
+        const float x = left + g_footer_extra_dx[e];
+        for (int k = 0; k < 6; k++) {
+            gl_vertex v = q[k];
+            const int on_right = q[k].x > middle_x, lower = q[k].y > middle_y;
+            v.x = on_right ? x + p->nw * scale : x;
+            v.u = on_right ? p->nu + p->nw : p->nu;
+            v.y = lower ? top + p->nh * scale : top;
+            v.v = sheet_h - (lower ? p->nv + p->nh : p->nv);
+            g_vb[n + k] = v;
+        }
+        n += 6;
+    }
+    return n;
+}
+
 /* Every quad of a draw from the footer's sheet. `handled` is set if any was the footer's, which then
  * needs nothing more done to it. */
 static int footer_draw(int n, float sheet_h, int *handled) {
     const int drawn = n;
-    for (int i = 0; i + 6 <= drawn; i += 6) n = footer_piece_drawn(g_vb + i, sheet_h, n, handled);
+    int first_hint = -1;
+    for (int i = 0; i + 6 <= drawn; i += 6) {
+        const int hints_before = g_footer_hints_n;
+        n = footer_piece_drawn(g_vb + i, sheet_h, n, handled);
+        if (first_hint < 0 && g_footer_hints_n > hints_before) first_hint = i;
+    }
+    if (first_hint >= 0) n = footer_extras(g_vb + first_hint, sheet_h, n);
     return n;
 }
 
@@ -669,8 +895,7 @@ static void plan_footer(void) {
     static int learnt_for_w;
     if (g_show_w != learnt_for_w) {
         learnt_for_w = g_show_w;
-        g_footer_places_n = 0;
-        g_footer_places_next = 0;
+        footer_places_load();
     }
     for (int i = 1; i < n; i++) {
         for (int j = i; j > 0 && h[j].left < h[j - 1].left; j--) {
@@ -700,22 +925,23 @@ static void plan_footer(void) {
     before_n = n;
     before_band = band_left;
 
-    /* Learnt once steady, and again whenever a place is missing, as after the window changed. */
-    int missing = have_band && footer_place_of(band_piece, band_left) == NULL;
-    for (int i = 0; i < n; i++) missing |= footer_place_of(h[i].piece, h[i].left) == NULL;
-    /* The game puts the band where the number of hints asks for, so fewer hints with the band where
-     * more were is a frame of the change between them, however long it lasts. */
-    static footer_place counts[FOOTER_PLACES];   /* `to` holds the number of hints */
-    static int counts_n;
-    int count_at = -1;
-    for (int i = 0; i < counts_n; i++) {
-        if (fabsf(counts[i].left - band_left) < FOOTER_SAME) count_at = i;
+    /* The extras that come with a hint of the game's, if it was drawn. */
+    g_footer_extras_with = 0;
+    for (int i = 0; i < g_footer_hints_n; i++) {
+        const footer_piece *p = &g_footer_pieces[g_footer_hints_now[i].piece];
+        for (int e = 0; e < FOOTER_EXTRAS && !p->extra; e++) {
+            if (g_footer_extra_with[e] && fabsf(p->u - g_footer_extra_with_u[e]) < FOOTER_SAME && fabsf(p->v - g_footer_extra_with_v[e]) < FOOTER_SAME)
+                g_footer_extras_with |= 1u << e;
+        }
     }
-    const int passing = have_band && count_at >= 0 && (float)n < counts[count_at].to;
+    /* The next frame finds its places among those of these hints. */
+    g_footer_set = footer_set_of(h, n);
+    /* Learnt once steady, and again whenever a place is missing, as after the window changed. Each set
+     * of hints has its own, so a frame of the change between two sets, learnt, harms neither. */
+    int missing = have_band && footer_place_in(band_piece, band_left, g_footer_set) == NULL;
+    for (int i = 0; i < n; i++) missing |= footer_place_in(h[i].piece, h[i].left, g_footer_set) == NULL;
 
-    if (n > 0 && have_band && !passing && steady >= FOOTER_STEADY && (steady == FOOTER_STEADY || missing)) {
-        if (count_at < 0 && counts_n < FOOTER_PLACES) count_at = counts_n++;
-        if (count_at >= 0) counts[count_at] = (footer_place){0, band_left, (float)n};
+    if (n > 0 && have_band && steady >= FOOTER_STEADY && (steady == FOOTER_STEADY || missing)) {
         /* The last hint ends where its place on the sheet did, or where its words do if longer, but
          * not past the window's edge. */
         const footer_piece *last = &g_footer_pieces[h[n - 1].piece];
@@ -734,6 +960,7 @@ static void plan_footer(void) {
             footer_learn(g_footer_bands_now[i].piece, g_footer_bands_now[i].left, g_footer_bands_now[i].left + shift);
         }
         fprintf(stderr, "gl: footer of %d hints laid out, band moved %.1f\n", n, shift);
+        if (g_footer_store_dirty) footer_store_write();
     }
     if (!g_footer_band_now) g_footer_shift = 0.0f;
     g_footer_hints_n = 0;
@@ -851,6 +1078,38 @@ static GLuint make_color_target(GLuint *tex, int w, int h, GLenum filter) {
     p_glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, *tex, 0);
     return fbo;
+}
+
+/* A picture drawn at several times the window's size, shrunk in one go, only reads a few of the
+ * pixels under each of the window's, and its edges come out jagged. Halved first, as often as it
+ * is still twice the width wanted, each window pixel is the average of all of those under it: a
+ * linear copy to half the size takes the middle of each two by two. */
+#define HALVINGS 3
+static GLuint g_half_fbo[HALVINGS], g_half_tex[HALVINGS];
+static int g_half_w[HALVINGS], g_half_h[HALVINGS];
+
+static GLuint halved_towards(GLuint source, int *x, int *y, int *w, int *h, int wanted_w) {
+    for (int i = 0; i < HALVINGS && wanted_w > 0 && *w >= wanted_w * 2; i++) {
+        const int hw = *w / 2, hh = *h / 2;
+        if (hw <= 0 || hh <= 0) break;
+        if (g_half_w[i] != hw || g_half_h[i] != hh) {
+            if (g_half_fbo[i]) {
+                p_glDeleteFramebuffers(1, &g_half_fbo[i]);
+                glDeleteTextures(1, &g_half_tex[i]);
+            }
+            g_half_fbo[i] = make_color_target(&g_half_tex[i], hw, hh, GL_LINEAR);
+            g_half_w[i] = hw;
+            g_half_h[i] = hh;
+        }
+        p_glBindFramebuffer(GL_READ_FRAMEBUFFER, source);
+        p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_half_fbo[i]);
+        p_glBlitFramebuffer(*x, *y, *x + hw * 2, *y + hh * 2, 0, 0, hw, hh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        source = g_half_fbo[i];
+        *x = *y = 0;
+        *w = hw;
+        *h = hh;
+    }
+    return source;
 }
 
 /* The context has to be created and used on one thread, and that is the GE's. */
@@ -2724,6 +2983,7 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
     int w = cw, h = (int)((long long)cw * source_h / source_w);
     if (h > ch) { h = ch; w = (int)((long long)ch * source_w / source_h); }
     const int x0 = (cw - w) / 2, y0 = (ch - h) / 2;
+    if (filter == GL_LINEAR) source = halved_towards(source, &source_x, &source_y, &source_w, &source_h, w);
 
     p_glBindFramebuffer(GL_READ_FRAMEBUFFER, source);
     p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);

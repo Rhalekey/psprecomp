@@ -187,6 +187,12 @@ void psp_render_gl_set_vector_dir(const char *dir);
  * to the 3D scene they are drawn over, as a title screen's do, and stay where the game puts them in a
  * window of another shape. */
 void psp_render_gl_keep_in_place(uint32_t colours);
+/* Each frame a screen wants them: the footer's extra hints ("extra" in pieces.txt), bit k for number
+ * k, put before the game's own. Any thread. */
+void psp_render_gl_footer_extras(unsigned mask);
+/* Before the first frame: a folder to keep what the renderer learns between games in (the footer's
+ * places). */
+void psp_render_gl_set_state_dir(const char *dir);
 /* Show a line of UTF-8 text over the picture for a few seconds. Any thread. */
 void psp_render_gl_show_message(const char *utf8);
 /* Textures decoded so far and the real time that took, in microseconds. */
