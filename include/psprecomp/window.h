@@ -74,4 +74,8 @@ void psp_window_reset_buttons(void);
 /* Every controller button held, one bit each, by the numbers SDL3 gives them. */
 uint32_t psp_window_pad_raw(void);
 
+/* Which of the PSP's d-pad buttons held come from a controller's stick alone, which counts as
+ * the d-pad when pushed past half way. */
+uint32_t psp_window_stick_buttons(void);
+
 #endif

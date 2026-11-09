@@ -37,7 +37,7 @@
 
 /* With the wide canvas on, everything is drawn in the middle of a larger target, so that what
  * the 3D scene has past the PSP's screen lands somewhere. These are what shapes it can reach. */
-#define WIDE_CANVAS_W 768
+#define WIDE_CANVAS_W 976     /* a little past 32:9 at the PSP's height */
 #define WIDE_CANVAS_H 512
 /* In a taller window, flat pieces wholly above the first line or below the second go with the
  * window's top or bottom. What is parked off the screen goes with them, out of sight. A piece as
@@ -54,6 +54,8 @@
 /* In a wider window, what ends at the screen's right edge and is this wide runs on to the window's. */
 #define SIDE_BAND_WIDTH 200.0f
 #define BOTTOM_LEFT_END 100.0f
+/* Only a band's thin pieces take up the room at its end themselves. */
+#define THIN_BAND_HEIGHT 40.0f
 #define DIALOG_WIDTH    150.0f
 #define DIALOG_OFF_MIDDLE 30.0f
 #define BAND_WIDTH      470.0f
@@ -62,6 +64,11 @@
 /* A flat piece's w is 1 but for rounding, and it covers the screen give or take a little. */
 #define FLAT_W_NEAR     0.01f
 #define COVERS_NEAR     2.0f
+/* The picture a song's combo is drawn from. */
+#define COMBO_W         127.0f
+/* Pieces of the combo reach a row or two past their places on the sheet's picture. */
+#define ROWS_NEAR       2.0f
+#define COMBO_H         64.0f
 /* A covering piece showing fewer texels than this across is one texel or so stretched: a veil. */
 #define PICTURE_SPAN    64.0f
 
@@ -107,6 +114,7 @@
     X(PFNGLRENDERBUFFERSTORAGEPROC, glRenderbufferStorage) \
     X(PFNGLCHECKFRAMEBUFFERSTATUSPROC, glCheckFramebufferStatus) \
     X(PFNGLBLITFRAMEBUFFERPROC, glBlitFramebuffer) \
+    X(PFNGLGENERATEMIPMAPPROC, glGenerateMipmap) \
     X(PFNGLBLENDEQUATIONSEPARATEPROC, glBlendEquationSeparate) \
     X(PFNGLBLENDFUNCSEPARATEPROC, glBlendFuncSeparate) \
     X(PFNGLBLENDCOLORPROC, glBlendColor)
@@ -154,11 +162,18 @@ static const char FRAGMENT_SHADER[] =
     "uniform int u_afunc, u_aref, u_amask;\n"
     "uniform vec3 u_env, u_sfix;\n"
     "uniform float u_blur;\n"
+    "uniform float u_blur_lod;\n"
     "out vec4 o_col;\n"
     /* Samples spread over a disc, for the copy behind a picture that does not fill the window.
      * The disc turns from pixel to pixel, which leaves fine grain where a fixed one leaves rings. */
     "vec4 look(vec2 uv) {\n"
     "    if (u_blur <= 0.0) return texture(u_tex, uv);\n"
+    "    if (u_blur_lod > 0.0) {\n"
+    "        vec2 d = vec2(u_blur * 0.5);\n"
+    "        return (textureLod(u_tex, uv, u_blur_lod) + textureLod(u_tex, uv + vec2(d.x, d.y), u_blur_lod) +\n"
+    "                textureLod(u_tex, uv + vec2(-d.x, d.y), u_blur_lod) + textureLod(u_tex, uv + vec2(d.x, -d.y), u_blur_lod) +\n"
+    "                textureLod(u_tex, uv - d, u_blur_lod)) / 5.0;\n"
+    "    }\n"
     "    float turn = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) * 6.283185;\n"
     "    vec4 sum = texture(u_tex, uv);\n"
     "    for (int i = 0; i < 48; i++) {\n"
@@ -219,12 +234,14 @@ typedef struct {
     GLuint tex;
     int min_linear, mag_linear, clamp_u, clamp_v;
     int replaced;    /* a larger file stands in for it */
+    int up_w, up_h;  /* its size on the GPU */
+    int mipped;      /* its smaller levels are made, for a soft blur */
     uint32_t colours;  /* what it is known by, or 0 if that was not worked out */
     int use_logged;
 } gl_texture;
 
 static struct {
-    GLint tex_on, func, talpha, dbl, gouraud, afunc, aref, amask, env, sfix, uvscale, uvat, canvas_at, canvas_half, zoom, blur;
+    GLint tex_on, func, talpha, dbl, gouraud, afunc, aref, amask, env, sfix, uvscale, uvat, canvas_at, canvas_half, zoom, blur, blur_lod;
 } U;
 
 static HDC    g_dc;
@@ -318,6 +335,11 @@ static void *volatile g_language_asked;
 static char g_vector_dir[1024];
 static void *volatile g_vector_asked;
 
+/* Notes and targets in another style, tried before all of those. Its targets.rgba is drawn in
+ * place of the game's targets, whose shapes come from their models (see note_target_drawn). */
+static char g_note_dir[1024];
+static void *volatile g_note_asked;
+
 void psp_render_gl_set_dump_dir(const char *dir) {
     snprintf(g_dump_dir, sizeof g_dump_dir, "%s", dir ? dir : "");
 }
@@ -337,6 +359,7 @@ static void ask_for_dir(void *volatile *asked, const char *dir) {
 
 void psp_render_gl_set_language_dir(const char *dir) { ask_for_dir(&g_language_asked, dir); }
 void psp_render_gl_set_vector_dir(const char *dir) { ask_for_dir(&g_vector_asked, dir); }
+void psp_render_gl_set_note_dir(const char *dir) { ask_for_dir(&g_note_asked, dir); }
 
 void psp_render_gl_set_overlay(int on) { g_overlay = on; }
 
@@ -395,43 +418,71 @@ static void widen_frame_piece(int kind, int n, float left, float right, float to
  *     hint <u> <v> <w> <h> <new u> <new v> <new w> <new h>
  *     band <u> <v> <w> <h>
  *
- * The hints at the bottom of the screen are then put side by side at those widths, from the right
- * end of the last one, and the band and its line art move by as much as the first hint did, so
- * that the band always just holds them. Where they go is worked out from the frame before, as the
- * band is drawn first; only screens with the band are laid out again, so the editor keeps its own. */
+ * The hints at the bottom of the screen are put side by side at those widths, ending where the last
+ * one did, and the band starts FOOTER_BAND_LEAD before the first, so that it always just holds them.
+ * Only screens with the band are laid out again, so the editor keeps its own layout.
+ *
+ * The game draws the band before the hints, and while the hints change it draws a frame or two with
+ * some of them missing, or moves the band. So nothing is worked out from the frame being drawn:
+ * each place the game draws a hint or a piece of the band at is given a place of its own, learnt
+ * once a set of hints has stayed the same for FOOTER_STEADY frames, and the same frame of the game
+ * always comes out the same. A band piece at a place not learnt yet moves as the band last did. */
 #define FOOTER_PIECES 160
 #define FOOTER_HINTS 24
-#define FOOTER_TOP 230.0f     /* hints this low on the screen are the footer's */
-#define FOOTER_GAP 10.0f      /* between one hint's words and the next one's sign */
+#define FOOTER_BANDS 4
+#define FOOTER_PLACES 48
+#define FOOTER_TOP 230.0f       /* hints this low on the screen are the footer's */
+#define FOOTER_GAP 10.0f        /* between one hint's words and the next one's sign */
+#define FOOTER_BAND_LEAD 32.0f  /* the band's slanted end starts this far before the first hint, as in the game */
+#define FOOTER_EDGE 6.0f        /* the last hint's words end at least this far from the window's edge */
 #define FOOTER_UV_NEAR 1.0f
-#define FOOTER_EDGE 6.0f       /* the last hint's words end at least this far from the screen's edge */
+#define FOOTER_SAME 0.5f
+#define FOOTER_STEADY 3
 
 typedef struct {
     float u, v, w, h, nu, nv, nw, nh;
     int band;
 } footer_piece;
 
+/* A piece drawn at `left` by the game, and where it goes. */
 typedef struct {
     int piece;
-    float left, new_left;
-} footer_hint;
+    float left, to;
+} footer_place;
 
 static footer_piece g_footer_pieces[FOOTER_PIECES];
 static int g_footer_piece_count;
 static uint32_t g_footer_sheet;
 static char g_footer_read_for[1024] = "\x01";
 static uint32_t g_tex_colours;   /* the bound texture's, set by setup_texture */
-static footer_hint g_footer_now[FOOTER_HINTS], g_footer_last[FOOTER_HINTS];
-static int g_footer_now_n, g_footer_last_n;
-static int g_footer_band_now;
-static float g_footer_shift;
+static gl_texture *g_tex_bound;  /* the same, or NULL for a target or none */
+
+#define IN_PLACE_SHEETS 8
+static uint32_t g_in_place[IN_PLACE_SHEETS];
+static int g_in_place_n;
+/* Such a sheet was drawn this frame or the last: its scene is left as the game made it. */
+static int g_in_place_now, g_in_place_last;
+void psp_render_gl_keep_in_place(uint32_t colours) {
+    if (g_in_place_n < IN_PLACE_SHEETS) g_in_place[g_in_place_n++] = colours;
+}
+
+/* What this frame drew, and what has been learnt. */
+static footer_place g_footer_hints_now[FOOTER_HINTS], g_footer_bands_now[FOOTER_BANDS];
+static int g_footer_hints_n, g_footer_bands_n, g_footer_band_now;
+static footer_place g_footer_places[FOOTER_PLACES];
+static int g_footer_places_n, g_footer_places_next;
+static float g_footer_shift;   /* the band's last move, for a place not learnt yet */
+/* Where the band is shown while it slides, how far that is behind where it goes, and the frame of each. */
+#define FOOTER_SLIDE 0.5f      /* of the way left, each frame */
+static float g_footer_shown, g_footer_lag;
+static uint64_t g_footer_shown_frame, g_footer_slide_frame;
 
 static void read_footer_pieces(void) {
     if (!strcmp(g_footer_read_for, g_vector_dir)) return;
     snprintf(g_footer_read_for, sizeof g_footer_read_for, "%s", g_vector_dir);
     g_footer_piece_count = 0;
     g_footer_sheet = 0;
-    g_footer_last_n = 0;
+    g_footer_places_n = 0;
     g_footer_shift = 0.0f;
     if (!g_vector_dir[0]) return;
     const char *second = strchr(g_vector_dir, '|');
@@ -463,12 +514,63 @@ static void read_footer_pieces(void) {
     fprintf(stderr, "gl: footer pieces from %s: %d, sheet %08X\n", path, g_footer_piece_count, g_footer_sheet);
 }
 
-/* A quad just put in g_vb from the footer's sheet. */
-/* `sheet_h` turns the list's rows, counted from the top, into the game's, counted from the bottom. */
-static void footer_piece_drawn(gl_vertex *q, float sheet_h) {
+static footer_place *footer_place_of(int piece, float left) {
+    for (int i = 0; i < g_footer_places_n; i++) {
+        if (g_footer_places[i].piece == piece && fabsf(g_footer_places[i].left - left) < FOOTER_SAME) return &g_footer_places[i];
+    }
+    return NULL;
+}
+
+static void footer_learn(int piece, float left, float to) {
+    footer_place *known = footer_place_of(piece, left);
+    if (!known) {
+        /* The oldest makes room. */
+        known = &g_footer_places[g_footer_places_next];
+        g_footer_places_next = (g_footer_places_next + 1) % FOOTER_PLACES;
+        if (g_footer_places_n < FOOTER_PLACES) g_footer_places_n++;
+    }
+    *known = (footer_place){piece, left, to};
+}
+
+/* Six vertices more at the end of g_vb: the quad `q` from its edge at `from` on to `to`, the edge's
+ * column repeated. Gives back how many vertices there are now. */
+static int continue_quad(const gl_vertex *q, int n, float from, float to, float u_at_edge) {
+    if (n + 6 > (int)(sizeof g_vb / sizeof g_vb[0])) return n;
+    /* The edge's own column, half a texel in: on the edge itself, filtering mixes in what is past it,
+     * often clear, or the other side of a texture that wraps, and the band's continuation comes out
+     * faint or of another colour. */
+    float u_inside = u_at_edge;
+    for (int i = 0; i < 6; i++) {
+        if (fabsf(q[i].x - from) >= 0.5f) u_inside = q[i].u;
+    }
+    if (u_inside != u_at_edge) u_at_edge += u_inside > u_at_edge ? 0.5f : -0.5f;
+    for (int i = 0; i < 6; i++) {
+        gl_vertex more = q[i];
+        more.x = fabsf(q[i].x - from) < 0.5f ? to : from;
+        more.u = u_at_edge;
+        g_vb[n + i] = more;
+    }
+    return n + 6;
+}
+
+/* A band piece just moved by `shift`: in a wide window its right end goes on to the window's edge.
+ * Gives back how many vertices there are now. */
+static int footer_band_on(const gl_vertex *q, float right, float shift, int n) {
+    const float edge = (float)(g_canvas_w - g_canvas_x), from = right + shift;
+    if (!g_wide || from >= edge) return n;
+    float u_edge = q[0].u;
+    for (int i = 0; i < 6; i++) {
+        if (fabsf(q[i].x - from) < FOOTER_SAME) u_edge = q[i].u;
+    }
+    return continue_quad(q, n, from, edge, u_edge);
+}
+
+/* A quad just put in g_vb from the footer's sheet. `sheet_h` turns the list's rows, counted from the
+ * top, into the game's, counted from the bottom. Gives back how many vertices there are now. */
+static int footer_piece_drawn(gl_vertex *q, float sheet_h, int n, int *handled) {
     float left = q[0].x, right = left, top = q[0].y, bottom = top;
     float u_low = q[0].u, u_high = u_low, v_low = q[0].v, v_high = v_low;
-    for (int i = 0; i < 6; i++) {
+    for (int i = 1; i < 6; i++) {
         left = fminf(left, q[i].x);
         right = fmaxf(right, q[i].x);
         top = fminf(top, q[i].y);
@@ -481,99 +583,161 @@ static void footer_piece_drawn(gl_vertex *q, float sheet_h) {
     int found = -1;
     for (int i = 0; i < g_footer_piece_count && found < 0; i++) {
         const footer_piece *p = &g_footer_pieces[i];
-        if (fabsf(u_low - p->u) <= FOOTER_UV_NEAR && fabsf(v_low - (sheet_h - p->v - p->h)) <= FOOTER_UV_NEAR &&
-            fabsf(u_high - (p->u + p->w)) <= FOOTER_UV_NEAR && fabsf(v_high - (sheet_h - p->v)) <= FOOTER_UV_NEAR)
+        if (fabsf(u_low - p->u) <= FOOTER_UV_NEAR && fabsf(u_high - (p->u + p->w)) <= FOOTER_UV_NEAR &&
+            fabsf(v_low - (sheet_h - p->v - p->h)) <= FOOTER_UV_NEAR && fabsf(v_high - (sheet_h - p->v)) <= FOOTER_UV_NEAR)
             found = i;
     }
-    if (found < 0) {
-        static int unknown;
-        if (unknown < 40) {
-            unknown++;
-            fprintf(stderr, "gl: footer sheet piece not listed: uv %.1f,%.1f %.1f,%.1f at %.1f,%.1f %.1f,%.1f w %.3f\n", u_low, v_low, u_high,
-                    v_high, left, top, right, bottom, q[0].w);
-        }
-        return;
-    }
+    if (found < 0) return n;
     const footer_piece *p = &g_footer_pieces[found];
+    const footer_place *place = footer_place_of(found, left);
+
+    /* In a taller window the footer goes to its bottom. */
+    if (g_wide && g_show_h > PSP_H && (p->band || top >= FOOTER_TOP)) {
+        const float down = (float)(g_show_h - PSP_H) / 2.0f;
+        for (int i = 0; i < 6; i++) q[i].y += down;
+    }
+
     if (p->band) {
-        /* The band and its line art, unless they run from the screen's left edge. */
-        if (p->w >= 500.0f && p->h >= 20.0f) g_footer_band_now = 1;
-        if (left > 1.0f && g_footer_shift != 0.0f)
-            for (int i = 0; i < 6; i++) q[i].x += g_footer_shift;
-        return;
+        *handled = 1;
+        const int main_band = p->w >= 500.0f && p->h >= 20.0f;
+        if (main_band) g_footer_band_now = 1;
+        /* What runs from the screen's left edge stays, and in a wide window goes on to both edges. */
+        if (left <= 1.0f) {
+            if (!g_wide) return n;
+            const gl_vertex at[6] = {q[0], q[1], q[2], q[3], q[4], q[5]};
+            float u_left = q[0].u, u_right = q[0].u;
+            for (int i = 0; i < 6; i++) {
+                if (fabsf(q[i].x - left) < FOOTER_SAME) u_left = q[i].u;
+                if (fabsf(q[i].x - right) < FOOTER_SAME) u_right = q[i].u;
+            }
+            n = continue_quad(at, n, left, (float)-g_canvas_x, u_left);
+            if (right >= (float)PSP_W - 1.0f) n = continue_quad(at, n, right, (float)(g_canvas_w - g_canvas_x), u_right);
+            return n;
+        }
+        if (g_footer_bands_n < FOOTER_BANDS) g_footer_bands_now[g_footer_bands_n++] = (footer_place){found, left, left};
+        float shift = place ? place->to - left : g_footer_shift;
+        if (place && main_band) g_footer_shift = shift;
+        /* The band slides to a new place rather than jumping, over a few frames: a frame the game draws
+         * out of step while its hints change becomes part of the slide. Its line art goes with it. */
+        if (main_band) {
+            const float target = left + shift;
+            if (g_footer_slide_frame != g_frame) {
+                g_footer_slide_frame = g_frame;
+                g_footer_shown = g_footer_shown_frame + 1 == g_frame && fabsf(target - g_footer_shown) > FOOTER_SAME
+                                     ? g_footer_shown + (target - g_footer_shown) * FOOTER_SLIDE
+                                     : target;
+                g_footer_lag = g_footer_shown - target;
+            }
+            g_footer_shown_frame = g_frame;
+        }
+        if (g_footer_shown_frame == g_frame || g_footer_shown_frame + 1 == g_frame) shift += g_footer_lag;
+        if (shift == 0.0f) return n;
+        for (int i = 0; i < 6; i++) q[i].x += shift;
+        return footer_band_on(q, right, shift, n);
     }
-    if (top < FOOTER_TOP) return;
-    if (g_footer_now_n < FOOTER_HINTS) g_footer_now[g_footer_now_n++] = (footer_hint){found, left, left};
-    float new_left = left;
-    for (int i = 0; i < g_footer_last_n; i++) {
-        if (g_footer_last[i].piece == found && fabsf(g_footer_last[i].left - left) < 0.5f) new_left = g_footer_last[i].new_left;
-    }
+
+    if (top < FOOTER_TOP) return n;
+    *handled = 1;
+    if (g_footer_hints_n < FOOTER_HINTS) g_footer_hints_now[g_footer_hints_n++] = (footer_place){found, left, left};
+    const float to = place ? place->to : left;
     const float scale = (right - left) / p->w, scale_down = (bottom - top) / p->h, middle_x = (left + right) / 2.0f;
     const float middle_u = (u_low + u_high) / 2.0f;
     for (int i = 0; i < 6; i++) {
-        /* The sheet's rows are the game's counted from the bottom. One with more room under it
-         * grows down on the screen too. */
+        /* One with more room under it on the sheet grows down on the screen too. */
         const int lower_row = sheet_h - q[i].v > p->v + p->h / 2.0f;
-        q[i].x = q[i].x < middle_x ? new_left : new_left + p->nw * scale;
+        q[i].x = q[i].x < middle_x ? to : to + p->nw * scale;
         q[i].u = q[i].u < middle_u ? p->nu : p->nu + p->nw;
         q[i].v = sheet_h - (lower_row ? p->nv + p->nh : p->nv);
         if (lower_row) q[i].y += (p->nh - p->h) * scale_down;
     }
+    return n;
 }
 
-/* Each quad of a draw from the footer's sheet. Logs each new way of drawing from it, once. */
-static void footer_draw(int prim, int n, float sheet_h) {
-    static int logged[8][4];
-    const int slot = n / 6 > 3 ? 3 : n / 6;
-    if (!logged[prim & 7][slot]) {
-        logged[prim & 7][slot] = 1;
-        fprintf(stderr, "gl: footer sheet drawn as prim %d with %d vertices\n", prim, n);
-    }
-    for (int i = 0; i + 6 <= n; i += 6) footer_piece_drawn(g_vb + i, sheet_h);
+/* Every quad of a draw from the footer's sheet. `handled` is set if any was the footer's, which then
+ * needs nothing more done to it. */
+static int footer_draw(int n, float sheet_h, int *handled) {
+    const int drawn = n;
+    for (int i = 0; i + 6 <= drawn; i += 6) n = footer_piece_drawn(g_vb + i, sheet_h, n, handled);
+    return n;
 }
 
-/* At the end of a frame: where the footer's hints go in the next one. */
+/* At the end of a frame: learns where this frame's pieces go, once its hints have stayed the same. */
 static void plan_footer(void) {
-    footer_hint *h = g_footer_now;
-    const int n = g_footer_band_now ? g_footer_now_n : 0;
-    /* In order across the screen. */
+    footer_place *h = g_footer_hints_now;
+    const int n = g_footer_band_now ? g_footer_hints_n : 0;
+    /* A window of another width has other places. */
+    static int learnt_for_w;
+    if (g_show_w != learnt_for_w) {
+        learnt_for_w = g_show_w;
+        g_footer_places_n = 0;
+        g_footer_places_next = 0;
+    }
     for (int i = 1; i < n; i++) {
         for (int j = i; j > 0 && h[j].left < h[j - 1].left; j--) {
-            const footer_hint kept = h[j];
+            const footer_place kept = h[j];
             h[j] = h[j - 1];
             h[j - 1] = kept;
         }
     }
-    float shift = 0.0f;
-    if (n > 0) {
+    static footer_place before[FOOTER_HINTS];
+    static int before_n = -1, steady;
+    float band_left = 0.0f;
+    int have_band = 0, band_piece = -1;
+    for (int i = 0; i < g_footer_bands_n; i++) {
+        if (g_footer_pieces[g_footer_bands_now[i].piece].w >= 500.0f) {
+            band_left = g_footer_bands_now[i].left;
+            band_piece = g_footer_bands_now[i].piece;
+            have_band = 1;
+        }
+    }
+    /* Steady when the hints and the band are where they were: as a screen opens, the game slides the
+     * band in after its hints have stopped. */
+    static float before_band = -1e9f;
+    int same = n == before_n && fabsf(band_left - before_band) < FOOTER_SAME;
+    for (int i = 0; same && i < n; i++) same = before[i].piece == h[i].piece && fabsf(before[i].left - h[i].left) < FOOTER_SAME;
+    steady = same ? steady + 1 : 1;
+    memcpy(before, h, sizeof(footer_place) * (size_t)n);
+    before_n = n;
+    before_band = band_left;
+
+    /* Learnt once steady, and again whenever a place is missing, as after the window changed. */
+    int missing = have_band && footer_place_of(band_piece, band_left) == NULL;
+    for (int i = 0; i < n; i++) missing |= footer_place_of(h[i].piece, h[i].left) == NULL;
+    /* The game puts the band where the number of hints asks for, so fewer hints with the band where
+     * more were is a frame of the change between them, however long it lasts. */
+    static footer_place counts[FOOTER_PLACES];   /* `to` holds the number of hints */
+    static int counts_n;
+    int count_at = -1;
+    for (int i = 0; i < counts_n; i++) {
+        if (fabsf(counts[i].left - band_left) < FOOTER_SAME) count_at = i;
+    }
+    const int passing = have_band && count_at >= 0 && (float)n < counts[count_at].to;
+
+    if (n > 0 && have_band && !passing && steady >= FOOTER_STEADY && (steady == FOOTER_STEADY || missing)) {
+        if (count_at < 0 && counts_n < FOOTER_PLACES) count_at = counts_n++;
+        if (count_at >= 0) counts[count_at] = (footer_place){0, band_left, (float)n};
         /* The last hint ends where its place on the sheet did, or where its words do if longer, but
-         * not past the screen. */
+         * not past the window's edge. */
         const footer_piece *last = &g_footer_pieces[h[n - 1].piece];
-        float cursor = fminf(h[n - 1].left + fmaxf(last->w, last->nw), (float)PSP_W - FOOTER_EDGE);
+        /* In a wider window they go with its right edge, as the rest of what is at the right does. */
+        const float extra = g_wide && g_show_w > PSP_W ? (float)(g_show_w - PSP_W) / 2.0f : 0.0f;
+        const float window_edge = (float)PSP_W + extra;
+        float cursor = fminf(h[n - 1].left + fmaxf(last->w, last->nw) + extra, window_edge - FOOTER_EDGE);
         for (int i = n - 1; i >= 0; i--) {
-            h[i].new_left = cursor - g_footer_pieces[h[i].piece].nw;
-            cursor = h[i].new_left - FOOTER_GAP;
+            h[i].to = cursor - g_footer_pieces[h[i].piece].nw;
+            cursor = h[i].to - FOOTER_GAP;
+            footer_learn(h[i].piece, h[i].left, h[i].to);
         }
-        shift = h[0].new_left - h[0].left;
-    }
-    static int logged_n = -1;
-    static float logged_shift;
-    if (n != logged_n || fabsf(shift - logged_shift) > 0.5f) {
-        if (n || logged_n > 0) {
-            fprintf(stderr, "gl: footer %d hints, band moved %.1f:", n, shift);
-            for (int i = 0; i < n; i++) {
-                const footer_piece *p = &g_footer_pieces[h[i].piece];
-                fprintf(stderr, " [%.0f,%.0f %.0f->%.0f at %.1f->%.1f]", p->u, p->v, p->w, p->nw, h[i].left, h[i].new_left);
-            }
-            fprintf(stderr, "\n");
+        /* The band and its line art keep their distances from each other. */
+        const float shift = h[0].to - FOOTER_BAND_LEAD - band_left;
+        for (int i = 0; i < g_footer_bands_n; i++) {
+            footer_learn(g_footer_bands_now[i].piece, g_footer_bands_now[i].left, g_footer_bands_now[i].left + shift);
         }
-        logged_n = n;
-        logged_shift = shift;
+        fprintf(stderr, "gl: footer of %d hints laid out, band moved %.1f\n", n, shift);
     }
-    memcpy(g_footer_last, h, sizeof(footer_hint) * (size_t)n);
-    g_footer_last_n = n;
-    g_footer_shift = shift;
-    g_footer_now_n = 0;
+    if (!g_footer_band_now) g_footer_shift = 0.0f;
+    g_footer_hints_n = 0;
+    g_footer_bands_n = 0;
     g_footer_band_now = 0;
 }
 
@@ -670,6 +834,7 @@ static int build_program(void) {
     U.canvas_half = p_glGetUniformLocation(g_program, "u_canvas_half");
     U.zoom = p_glGetUniformLocation(g_program, "u_zoom");
     U.blur = p_glGetUniformLocation(g_program, "u_blur");
+    U.blur_lod = p_glGetUniformLocation(g_program, "u_blur_lod");
     return 0;
 }
 
@@ -884,7 +1049,11 @@ static int g_replace_cached;
 static FILE *open_replacement(uint32_t hash, const char *kind, uint32_t size[2]) {
     char path[1200];
     FILE *f = NULL;
-    if (g_vector_dir[0] && !strcmp(kind, "rgba")) {
+    if (g_note_dir[0] && !strcmp(kind, "rgba")) {
+        snprintf(path, sizeof path, "%s\\%08X.%s", g_note_dir, hash, kind);
+        f = fopen(path, "rb");
+    }
+    if (!f && g_vector_dir[0] && !strcmp(kind, "rgba")) {
         const char *second = strchr(g_vector_dir, '|');
         const int first_len = second ? (int)(second - g_vector_dir) : (int)strlen(g_vector_dir);
         snprintf(path, sizeof path, "%.*s\\%08X.%s", first_len, g_vector_dir, hash, kind);
@@ -911,6 +1080,29 @@ static FILE *open_replacement(uint32_t hash, const char *kind, uint32_t size[2])
     return NULL;
 }
 
+/* The first folder's card_signs.rgba, if it has one: two signs, one above the other, drawn in
+ * place of a listed picture's two regions instead of their changing places. */
+static uint32_t *read_card_signs(const char *first, int first_len, int *w, int *h) {
+    char path[1200];
+    snprintf(path, sizeof path, "%.*s\\card_signs.rgba", first_len, first);
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    uint32_t size[2] = {0, 0};
+    uint32_t *pixels = NULL;
+    if (fread(size, 4, 2, f) == 2 && size[0] && size[0] <= 1024 && size[1] && size[1] <= 2048 && size[1] % 2 == 0) {
+        const size_t count = (size_t)size[0] * size[1];
+        pixels = (uint32_t *)malloc(count * sizeof *pixels);
+        if (pixels && fread(pixels, 4, count, f) != count) {
+            free(pixels);
+            pixels = NULL;
+        }
+    }
+    fclose(f);
+    *w = (int)size[0];
+    *h = (int)size[1];
+    return pixels;
+}
+
 /* Two regions of a picture change places, if the list says so. Files are bottom row first. */
 static void swap_regions(uint32_t hash, uint32_t *pixels, int file_w, int file_h) {
     const char *second = strchr(g_vector_dir, '|');
@@ -924,6 +1116,24 @@ static void swap_regions(uint32_t hash, uint32_t *pixels, int file_w, int file_h
     while (fscanf(f, "%x %d %d %d %d %d %d %d", &listed, &ax, &ay, &bx, &by, &w, &h, &original_w) == 8) {
         if (listed != hash || original_w <= 0) continue;
         const int scale = file_w / original_w;
+        int sw, sh;
+        uint32_t *signs = read_card_signs(g_vector_dir, (int)(second - g_vector_dir), &sw, &sh);
+        if (signs) {
+            /* Each region takes its half of the signs, scaled to it: the first the upper half. */
+            const int rw = w * scale, rh = h * scale, half = sh / 2;
+            for (int k = 0; k < 2; k++) {
+                const int rx = (k ? bx : ax) * scale, ry = (k ? by : ay) * scale;
+                for (int row = 0; row < rh; row++) {
+                    const int dest_row = file_h - 1 - (ry + row);
+                    const int from_top = k * half + row * half / rh;
+                    if (dest_row < 0 || dest_row >= file_h) continue;
+                    const uint32_t *from = signs + (size_t)(sh - 1 - from_top) * sw;
+                    for (int col = 0; col < rw && rx + col < file_w; col++) pixels[(size_t)dest_row * file_w + rx + col] = from[col * sw / rw];
+                }
+            }
+            free(signs);
+            break;
+        }
         for (int row = 0; row < h * scale; row++) {
             uint32_t *a = pixels + (file_h - 1 - (ay * scale + row)) * file_w + ax * scale;
             uint32_t *b = pixels + (file_h - 1 - (by * scale + row)) * file_w + bx * scale;
@@ -1161,6 +1371,9 @@ static void decode_texture(gl_texture *e, const psp_draw_state *st) {
     glBindTexture(GL_TEXTURE_2D, e->tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, up_w, up_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    e->up_w = up_w;
+    e->up_h = up_h;
+    e->mipped = 0;
     const uint64_t took = gl_now_us() - began;
     g_decoded++;
     g_decode_us += took;
@@ -1189,9 +1402,23 @@ static void take_up_dir(void *volatile *where, char *dir, size_t size) {
     free(asked);
 }
 
+static GLuint g_note_targets;      /* targets.rgba of the note style, once read */
+static int g_note_targets_read;
+static float g_note_targets_side;   /* its side, in the units of its texture coordinates */
+
 static void take_up_language(void) {
     take_up_dir(&g_language_asked, g_language_dir, sizeof g_language_dir);
     take_up_dir(&g_vector_asked, g_vector_dir, sizeof g_vector_dir);
+    if (g_note_asked) {
+        char before[sizeof g_note_dir];
+        snprintf(before, sizeof before, "%s", g_note_dir);
+        take_up_dir(&g_note_asked, g_note_dir, sizeof g_note_dir);
+        if (strcmp(before, g_note_dir) != 0) {
+            if (g_note_targets) glDeleteTextures(1, &g_note_targets);
+            g_note_targets = 0;
+            g_note_targets_read = 0;
+        }
+    }
     read_footer_pieces();
 }
 
@@ -1244,9 +1471,12 @@ static void bind_sampler(GLuint tex, int *min_seen, int *mag_seen, int *u_seen, 
                          const psp_draw_state *st, int smooth) {
     glBindTexture(GL_TEXTURE_2D, tex);
     const int min_linear = st->tex_min_linear || smooth, mag_linear = st->tex_mag_linear || smooth;
-    if (*min_seen != min_linear) {
-        *min_seen = min_linear;
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min_linear ? GL_LINEAR : GL_NEAREST);
+    /* A replacement drawn larger than the game's is shown smaller than it is, often by four times:
+     * read from its smaller levels, or its edges come out jagged. */
+    const int min_mode = smooth > 1 ? 2 : min_linear;
+    if (*min_seen != min_mode) {
+        *min_seen = min_mode;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min_mode == 2 ? GL_LINEAR_MIPMAP_LINEAR : min_linear ? GL_LINEAR : GL_NEAREST);
     }
     if (*mag_seen != mag_linear) {
         *mag_seen = mag_linear;
@@ -1266,6 +1496,7 @@ static void bind_sampler(GLuint tex, int *min_seen, int *mag_seen, int *u_seen, 
  * its coordinates are texels of the whole logical target. */
 static int setup_texture(const psp_draw_state *st) {
     g_tex_colours = 0;
+    g_tex_bound = NULL;
     if (!st->tex_enable || st->clear || st->tex_w <= 0 || st->tex_h <= 0) return 0;
     if (in_vram(st->tex_addr)) {
         gl_target *t = find_target(st->tex_addr);
@@ -1280,7 +1511,17 @@ static int setup_texture(const psp_draw_state *st) {
     gl_texture *e = get_texture(st);
     if (!e) return 0;
     g_tex_colours = e->colours;
-    bind_sampler(e->tex, &e->min_linear, &e->mag_linear, &e->clamp_u, &e->clamp_v, st, e->replaced);
+    g_tex_bound = e;
+    int smooth = e->replaced;
+    if (e->replaced && e->up_w > st->tex_w) {
+        if (!e->mipped) {
+            glBindTexture(GL_TEXTURE_2D, e->tex);
+            p_glGenerateMipmap(GL_TEXTURE_2D);
+            e->mipped = 1;
+        }
+        smooth = 2;
+    }
+    bind_sampler(e->tex, &e->min_linear, &e->mag_linear, &e->clamp_u, &e->clamp_v, st, smooth);
     /* How a replaced texture is used, once: its look depends on this as much as on the file. */
     if (e->replaced && !e->use_logged) {
         e->use_logged = 1;
@@ -1426,21 +1667,37 @@ static int stretch_fade(int n) {
 /* Beside a band that ends at the screen's edge, its last column repeated up to the window's edge.
  * Gives back how many vertices there are now. */
 static int continue_band(int n, float from, float to, float u_at_edge) {
-    for (int i = 0; i < 6; i++) {
-        gl_vertex more = g_vb[i];
-        const int at_edge = fabsf(more.x - from) < 0.5f;
-        more.x = at_edge ? to : from;
-        more.u = u_at_edge;
-        g_vb[n + i] = more;
-    }
-    return n + 6;
+    return continue_quad(g_vb, n, from, to, u_at_edge);
 }
 
 static int clamp_int(int v, int low, int high) { return v < low ? low : v > high ? high : v; }
 
+/* The scissor each draw uses, in target pixels. On the game's own picture it never goes past what
+ * the window shows of the canvas: in a wide window half of its rows are never seen, and drawing
+ * them would cost as much as the rest. */
+#define SHOWN_MARGIN 2
+static int g_sc_x, g_sc_y, g_sc_w, g_sc_h;
+
+static void set_scissor(int x, int y, int w, int h) {
+    if (g_wide && g_bound && g_bound->shown) {
+        const int vx = ((g_canvas_w - g_show_w) / 2 - SHOWN_MARGIN) * g_scale, vy = ((g_canvas_h - g_show_h) / 2 - SHOWN_MARGIN) * g_scale;
+        const int vw = (g_show_w + 2 * SHOWN_MARGIN) * g_scale, vh = (g_show_h + 2 * SHOWN_MARGIN) * g_scale;
+        const int x1 = x + w < vx + vw ? x + w : vx + vw, y1 = y + h < vy + vh ? y + h : vy + vh;
+        x = x > vx ? x : vx;
+        y = y > vy ? y : vy;
+        w = x1 > x ? x1 - x : 0;
+        h = y1 > y ? y1 - y : 0;
+    }
+    g_sc_x = x;
+    g_sc_y = y;
+    g_sc_w = w;
+    g_sc_h = h;
+    glScissor(x, y, w, h);
+}
+
 /* Draws the six vertices in the buffer only outside a rectangle of the screen. The blur looks at many
  * points for each pixel, so at a high resolution it must not be spent under the picture that covers
- * it. All of this runs with the scissor over the whole canvas, and leaves it so. */
+ * it. It keeps within the scissor in use, and leaves it as it was. */
 static void draw_around(float left, float top, float right, float bottom) {
     const int w = g_canvas_w * g_scale, h = g_canvas_h * g_scale;
     const int x0 = clamp_int((int)ceilf((left + (float)g_canvas_x) * (float)g_scale), 0, w);
@@ -1450,12 +1707,121 @@ static void draw_around(float left, float top, float right, float bottom) {
     const int part[4][4] = {
         {0, 0, w, y0}, {0, y1, w, h - y1}, {0, y0, x0, y1 - y0}, {x1, y0, w - x1, y1 - y0},
     };
+    const int sx0 = g_sc_x, sy0 = g_sc_y, sx1 = g_sc_x + g_sc_w, sy1 = g_sc_y + g_sc_h;
     for (int i = 0; i < 4; i++) {
-        if (part[i][2] <= 0 || part[i][3] <= 0) continue;
-        glScissor(part[i][0], part[i][1], part[i][2], part[i][3]);
+        const int px0 = part[i][0] > sx0 ? part[i][0] : sx0, py0 = part[i][1] > sy0 ? part[i][1] : sy0;
+        const int px1 = part[i][0] + part[i][2] < sx1 ? part[i][0] + part[i][2] : sx1;
+        const int py1 = part[i][1] + part[i][3] < sy1 ? part[i][1] + part[i][3] : sy1;
+        if (px1 <= px0 || py1 <= py0) continue;
+        glScissor(px0, py0, px1 - px0, py1 - py0);
         glDrawArrays(GL_TRIANGLES, 0, 6);
     }
-    glScissor(0, 0, w, h);
+    glScissor(g_sc_x, g_sc_y, g_sc_w, g_sc_h);
+}
+
+/* ---- blurred copies --------------------------------------------------------
+ *
+ * What is past a picture that does not fill the window is a blurred copy of it. The blur is made
+ * from one of the texture's smaller levels, which the GPU makes once, and five looks at it: as
+ * blurred as 49 looks at the whole picture, at a small part of the cost. A target the game drew
+ * into has no smaller levels, and gets the 49 looks. */
+#define BLUR_RADIUS 0.045f
+#define BLUR_TEXELS 22.0f   /* how many texels across the picture its blur leaves */
+
+static int g_blur_on = 1;
+void psp_render_gl_set_blur(int on) { g_blur_on = on; }
+
+static void begin_blur(void) {
+    if (!g_blur_on) return;
+    gl_texture *e = g_tex_bound;
+    float lod = 0.0f;
+    if (e && e->up_w > 0) {
+        if (!e->mipped) {
+            p_glGenerateMipmap(GL_TEXTURE_2D);
+            e->mipped = 1;
+        }
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        e->min_linear = -1;   /* set again on its next use */
+        lod = log2f((float)(e->up_w > e->up_h ? e->up_w : e->up_h) / BLUR_TEXELS);
+        if (lod < 0.0f) lod = 0.0f;
+    }
+    p_glUniform1f(U.blur, BLUR_RADIUS);
+    p_glUniform1f(U.blur_lod, lod);
+}
+
+static void end_blur(void) {
+    p_glUniform1f(U.blur, 0.0f);
+    p_glUniform1f(U.blur_lod, 0.0f);
+}
+
+/* A menu's background is a 3D plane built only a little past the PSP's screen. In a wider window the
+ * vertices at its two ends go on to the window's edges, their texture coordinates going on at the same
+ * rate as across the rest of it, so that its pattern carries on rather than stretching. A draw is
+ * taken for such a plane if it reaches past both sides of the screen and covers at least half its
+ * height. A song's stage has such planes too, as its sky: past it the window would show the flat
+ * picture the stage hides on the PSP. What already reaches past the window is left as it is. */
+#define PLANE_EDGE_NEAR 2.0f
+#define PLANE_MIN_HEIGHT (PSP_H / 2.0f)
+#define PLANE_BLUR_MARGIN 1.05f   /* the blurred copy a little larger, so that its own edges stay out of sight */
+static void widen_background_plane(int prim, int n, const psp_draw_state *st) {
+    if (!g_wide || g_show_w <= PSP_W || g_in_place_now || g_in_place_last || !st->tex_enable || st->through || n < 4) return;
+    float left = 1e9f, right = -1e9f, top = 1e9f, bottom = -1e9f;
+    for (int i = 0; i < n; i++) {
+        const float w = g_vb[i].w;
+        if (w <= 0.0f || fabsf(w - 1.0f) <= FLAT_W_NEAR) return;
+        const float x = g_vb[i].x / w, y = g_vb[i].y / w;
+        left = fminf(left, x);
+        right = fmaxf(right, x);
+        top = fminf(top, y);
+        bottom = fmaxf(bottom, y);
+    }
+    if (left > 1.0f || right < (float)PSP_W - 1.0f || bottom - top < PLANE_MIN_HEIGHT) return;
+    if (g_song_frames > 0) {
+        if (!g_blur_on) return;
+        /* In a song such a plane is a picture of the stage, as the landscapes that scroll by in some
+         * songs: beside it, a blurred copy of it, widened to the window's edges. Only widened, so that it
+         * stays in the rows of its own picture: two that scroll by one after the other meet as they do,
+         * and one waiting off the screen costs nothing. */
+        if (!((prim == PSP_PRIM_TRIANGLE_STRIP && n == 4) || (prim == PSP_PRIM_TRIANGLES && n == 6))) return;
+        static const int STRIP[6] = {0, 1, 2, 2, 1, 3};
+        const float grow = fmaxf((float)g_show_w / (right - left), 1.0f) * PLANE_BLUR_MARGIN;
+        const float middle_x = (left + right) / 2.0f;
+        gl_vertex copy[6];
+        for (int i = 0; i < 6; i++) {
+            copy[i] = g_vb[n == 4 ? STRIP[i] : i];
+            const float w = copy[i].w, x = copy[i].x / w;
+            copy[i].x = (middle_x + (x - middle_x) * grow) * w;
+        }
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        begin_blur();
+        p_glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof copy, copy, GL_STREAM_DRAW);
+        draw_around(fmaxf(left, (float)-g_canvas_x), fmaxf(top, (float)-g_canvas_y), fminf(right, (float)(g_canvas_w - g_canvas_x)),
+                    fminf(bottom, (float)(g_canvas_h - g_canvas_y)));
+        end_blur();
+        setup_depth(st);
+        return;
+    }
+    /* How fast the texture runs across the screen, from the vertices at the two ends. */
+    float u_left = 0.0f, u_right = 0.0f;
+    int at_left = 0, at_right = 0;
+    for (int i = 0; i < n; i++) {
+        const float x = g_vb[i].x / g_vb[i].w;
+        if (x <= left + PLANE_EDGE_NEAR) u_left += g_vb[i].u, at_left++;
+        if (x >= right - PLANE_EDGE_NEAR) u_right += g_vb[i].u, at_right++;
+    }
+    if (!at_left || !at_right || right - left < 1.0f) return;
+    const float rate = (u_right / (float)at_right - u_left / (float)at_left) / (right - left);
+    const float reach = (float)(g_show_w - PSP_W) / 2.0f + PLANE_EDGE_NEAR;
+    for (int i = 0; i < n; i++) {
+        const float w = g_vb[i].w, x = g_vb[i].x / w;
+        float to = x;
+        if (x <= left + PLANE_EDGE_NEAR && x > -reach) to = -reach;
+        else if (x >= right - PLANE_EDGE_NEAR && x < (float)PSP_W + reach) to = (float)PSP_W + reach;
+        if (to == x) continue;
+        g_vb[i].x = to * w;
+        g_vb[i].u += (to - x) * rate;
+    }
 }
 
 /* The game's flat pieces have a w of 1, while its models, the notes among them, have other values.
@@ -1486,7 +1852,24 @@ static int place_flat_piece(int prim, int n, const psp_draw_state *st) {
             g_vb[i].x = g_vb[i].x < (float)PSP_W / 2.0f ? (float)-g_canvas_x : (float)(g_canvas_w - g_canvas_x);
             g_vb[i].y = g_vb[i].y < (float)PSP_H / 2.0f ? (float)-g_canvas_y : (float)(g_canvas_h - g_canvas_y);
         }
-        g_veil_now = 1;
+        /* In a song a light veil is a flash, as at the end of a chance time, and the HUD under it stays
+         * where it goes; a dark one is the pause menu's. */
+        const uint32_t c = g_vb[0].rgba;
+        const int dark = (c & 0xFFu) < 0x40u && (c >> 8 & 0xFFu) < 0x40u && (c >> 16 & 0xFFu) < 0x40u;
+        if (dark || g_song_frames <= 0) g_veil_now = 1;
+        return n;
+    }
+    if (!quad && left <= COVERS_NEAR && top <= COVERS_NEAR && right >= PSP_W - COVERS_NEAR && bottom >= PSP_H - COVERS_NEAR) {
+        /* A flat shape of many vertices over the whole screen is an effect laid over all of it, as the
+         * white light over some songs' stages: it is stretched from the middle to the window's edges. */
+        const float reach_x = (float)(g_show_w - PSP_W) / 2.0f + COVERS_NEAR, reach_y = (float)(g_show_h - PSP_H) / 2.0f + COVERS_NEAR;
+        const float half_w = (float)PSP_W / 2.0f, half_h = (float)PSP_H / 2.0f;
+        const float grow_x = reach_x > 0.0f ? fmaxf(1.0f, (half_w + reach_x) / fmaxf(half_w - left, right - half_w)) : 1.0f;
+        const float grow_y = reach_y > 0.0f ? fmaxf(1.0f, (half_h + reach_y) / fmaxf(half_h - top, bottom - half_h)) : 1.0f;
+        for (int i = 0; i < n; i++) {
+            g_vb[i].x = half_w + (g_vb[i].x - half_w) * grow_x;
+            g_vb[i].y = half_h + (g_vb[i].y - half_h) * grow_y;
+        }
         return n;
     }
     if (covers) {
@@ -1518,19 +1901,34 @@ static int place_flat_piece(int prim, int n, const psp_draw_state *st) {
         }
         glDisable(GL_DEPTH_TEST);
         glDepthMask(GL_FALSE);
-        p_glUniform1f(U.blur, 0.045f);
+        begin_blur();
         p_glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof copy, copy, GL_STREAM_DRAW);
         /* The hole goes no further than the screen: a picture's quad can be wider than it, with
          * its sides clear, and those must show the blur, not nothing. */
         draw_around(fmaxf(left, 0.0f), fmaxf(top, 0.0f), fminf(right, (float)PSP_W), fminf(bottom, (float)PSP_H));
-        p_glUniform1f(U.blur, 0.0f);
+        end_blur();
         setup_depth(st);
         return n;
+    }
+    for (int i = 0; i < g_in_place_n; i++) {
+        if (g_tex_colours && g_tex_colours == g_in_place[i]) {
+            g_in_place_now = 1;
+            return n;
+        }
     }
     if (g_flat_now && st->tex_addr == g_flat_sheet) g_card_now = 1;
     /* The combo and the points beside it follow the notes. They are told from the sheet that holds
      * them, 512x256, and the rows they are on. */
-    if (st->tex_w == 512 && st->tex_h == 256 && ((v_low >= 0.0f && v_high <= 17.0f) || (v_low >= 57.0f && v_high <= 71.0f) || (v_low >= 77.0f && v_high <= 92.0f)))
+    /* Rows of the sheet as its picture has them, from the top: the game counts them from the bottom. */
+    const float row_top = (float)st->tex_h - v_high, row_bottom = (float)st->tex_h - v_low;
+    if (st->tex_w == 512 && st->tex_h == 256 &&
+        ((row_top >= -ROWS_NEAR && row_bottom <= 17.0f + ROWS_NEAR) || (row_top >= 57.0f - ROWS_NEAR && row_bottom <= 71.0f + ROWS_NEAR) ||
+         (row_top >= 77.0f - ROWS_NEAR && row_bottom <= 92.0f + ROWS_NEAR)))
+        return n;
+    /* In a song the combo is also put together in a picture of its own, 256x128, and drawn from its
+     * corner, 127x64, beside the note it counts. */
+    if (g_song_frames > 0 && st->tex_w == 256 && st->tex_h == 128 && u_low <= 1.0f && fabsf(u_high - u_low - COMBO_W) <= 2.0f &&
+        fabsf(v_high - v_low - COMBO_H) <= 2.0f)
         return n;
 
     const float extra_down = (float)(g_show_h - PSP_H) / 2.0f;
@@ -1538,11 +1936,15 @@ static int place_flat_piece(int prim, int n, const psp_draw_state *st) {
     const int flat = g_flat_now || g_flat_last;
     const int band = right - left >= BAND_WIDTH;
     const float across_middle = (left + right) / 2.0f;
-    if (!band && right - left >= DIALOG_WIDTH && fabsf(across_middle - (float)PSP_W / 2.0f) <= DIALOG_OFF_MIDDLE) g_dialog_now = 1;
+    /* In a song a wide piece in the middle is a dialog only over the pause menu's veil: the song's title
+     * card at its start is one too, and the HUD stays at the edges under it. */
+    if (!band && right - left >= DIALOG_WIDTH && fabsf(across_middle - (float)PSP_W / 2.0f) <= DIALOG_OFF_MIDDLE &&
+        (g_song_frames <= 0 || g_veil_now))
+        g_dialog_now = 1;
     const int in_dialog = (g_dialog_now || g_dialog_last) && bottom > PIN_TOP && top < PIN_BOTTOM;
     /* The score's digits, on their own rows of the sheet the combo is on. */
-    const int score_digit = st->tex_w == 512 && st->tex_h == 256 && v_low >= 20.0f && v_high <= 40.0f;
-    if (quad && band && top >= METER_TOP && top < PIN_BOTTOM && st->tex_h != 512) g_results_now = 1;
+    const int score_digit = st->tex_w == 512 && st->tex_h == 256 && row_top >= 20.0f && row_bottom <= 40.0f;
+    if (quad && band && top >= METER_TOP && top < PIN_BOTTOM && st->tex_h != 512 && g_song_frames <= 0) g_results_now = 1;
     float down = 0.0f, side = 0.0f;
     if (g_show_h > PSP_H) {
         const float middle = (top + bottom) / 2.0f;
@@ -1579,20 +1981,39 @@ static int place_flat_piece(int prim, int n, const psp_draw_state *st) {
              * is written on them, and continues to the left. */
             n = continue_band(n, left, left - 2.0f * extra_side, u_left);
             side = extra_side;
+        } else if (quad && band && bottom <= PIN_TOP && (g_results_now || g_results_last)) {
+            /* The results' top band has that screen's title plate drawn on its left. It goes to the left
+             * edge with it, and continues to the right. */
+            n = continue_band(n, right, right + 2.0f * extra_side, u_right);
+            side = -extra_side;
         } else if (quad && band) {
             /* A band runs on to the window's edges. What overruns the screen already does. */
             if (from_left_edge) n = continue_band(n, left, left - extra_side, u_left);
             if (to_right_edge) n = continue_band(n, right, right + extra_side, u_right);
-        } else if (quad && to_right_edge && right - left >= SIDE_BAND_WIDTH) {
-            /* A long piece of a band, from one thing to the screen's edge, has art up to its end
+        } else if (quad && to_right_edge && right - left >= SIDE_BAND_WIDTH && bottom - top <= THIN_BAND_HEIGHT) {
+            /* A long thin piece of a band, from one thing to the screen's edge, has art up to its end
              * that a repeated column would not continue. It takes up the room itself. */
             for (int i = 0; i < n; i++) g_vb[i].x += g_vb[i].x < across_middle ? -extra_side : extra_side;
         } else if (band) {
-            /* Too many vertices to continue, and wide enough to stay. */
+            /* Too many vertices to continue as a quad: what reaches the screen's edges is drawn on to
+             * the window's, its last stretch of art made longer. */
+            int moved = 0;
+            for (int i = 0; i < n; i++) {
+                if (from_left_edge && g_vb[i].x <= left + 0.5f) g_vb[i].x -= extra_side, moved = 1;
+                else if (to_right_edge && g_vb[i].x >= right - 0.5f) g_vb[i].x += extra_side, moved = 1;
+            }
+            static int logged;
+            if (moved && logged < 8) {
+                logged++;
+                fprintf(stderr, "gl: band of %d vertices drawn on to the edges, sheet %08X, rows %.0f-%.0f, at %.0f-%.0f\n", n, g_tex_colours, v_low,
+                        v_high, top, bottom);
+            }
         } else if (top >= PIN_BOTTOM) {
             /* Words at the bottom are lyrics, one draw to a word, and must stay together. The hints
              * belong to the panel at the right, and only the very left stays at the left. */
             if (n == 6) side = across_middle < BOTTOM_LEFT_END ? -extra_side : extra_side;
+            /* In a song the lyrics start beside the meter, and go to the left with it. */
+            else if (g_song_frames > 0) side = -extra_side;
         } else if (bottom <= PIN_TOP && across_middle >= (float)PSP_W / 2.0f && !score_digit) {
             /* The frames around what is at the top right are drawn in the band, which stays. */
         } else {
@@ -1616,6 +2037,7 @@ void psp_render_gl_trace_frame(void) { g_trace_draws = 2; }
 
 static void trace_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
     float left = 1e9f, top = 1e9f, right = -1e9f, bottom = -1e9f;
+    float u_low = 1e9f, v_low = 1e9f, u_high = -1e9f, v_high = -1e9f;
     for (int i = 0; i < count; i++) {
         const float w = v[i].pw != 0.0f ? v[i].pw : 1.0f;
         const float x = v[i].px / w, y = v[i].py / w;
@@ -1623,7 +2045,12 @@ static void trace_draw(int prim, const psp_vertex *v, int count, const psp_draw_
         if (x > right) right = x;
         if (y < top) top = y;
         if (y > bottom) bottom = y;
+        if (v[i].u < u_low) u_low = v[i].u;
+        if (v[i].u > u_high) u_high = v[i].u;
+        if (v[i].v < v_low) v_low = v[i].v;
+        if (v[i].v > v_high) v_high = v[i].v;
     }
+    fprintf(stderr, "gl: draw uv %.0f,%.0f %.0f,%.0f ", u_low, v_low, u_high, v_high);
     fprintf(stderr, "gl: draw prim %d n %d through %d w %.5f box %.0f,%.0f %.0f,%.0f scissor %d,%d %d,%d target %08X tex %d %08X %dx%d blend %d %d %d ztest %d zwrite %d func %d alpha %d shown %d colour %08X\n",
             prim, count, st->through, v[0].pw, left, top, right, bottom, st->sc_x0, st->sc_y0, st->sc_x1, st->sc_y1, g_target_addr,
             st->tex_enable, st->tex_addr, st->tex_w, st->tex_h, st->blend, st->blend_src, st->blend_dst,
@@ -1659,7 +2086,8 @@ static void draw_dim_veil(void) {
         {right, top, 0, 1, colour, 0, 0}, {right, bottom, 0, 1, colour, 0, 0}, {left, bottom, 0, 1, colour, 0, 0},
     };
     tell_canvas();
-    glDisable(GL_SCISSOR_TEST);
+    glEnable(GL_SCISSOR_TEST);
+    set_scissor(0, 0, g_canvas_w * g_scale, g_canvas_h * g_scale);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -1673,6 +2101,201 @@ static void draw_dim_veil(void) {
     p_glUniform3f(U.sfix, 1, 1, 1);
     p_glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof quad, quad, GL_STREAM_DRAW);
     glDrawArrays(GL_TRIANGLES, 0, 6);
+}
+
+/* ---- copies of the screen ------------------------------------------------ *
+ *
+ * For a change of scene, as in some songs, the game copies the screen it showed into its own memory
+ * and draws that copy over the new scene as it fades in. Here the picture is on the GPU and never
+ * reaches the PSP's video memory, so the copy would be of whatever is left there, a grey screen. A
+ * picture of exactly the screen's size, all of one colour, drawn over the whole screen from the
+ * game's memory is taken for such a copy: the frame shown last is copied on the GPU when the game's copy changes, and drawn
+ * in its place, over the whole canvas, as it covers the whole window. */
+#define COPY_NEAR 2.0f
+#define COPY_SAMPLES 16
+static uint32_t g_front_addr;     /* the frame shown last */
+static GLuint g_copy_fbo, g_copy_tex;
+static int g_copy_w, g_copy_h;
+static uint32_t g_copy_of_addr, g_copy_of_hash;
+
+static int screen_copy_drawn(int prim, int n, const psp_draw_state *st) {
+    if (prim != PSP_PRIM_TRIANGLES || n != 6 || !st->tex_enable || st->clear || in_vram(st->tex_addr) || st->tex_w != 512 ||
+        st->tex_h != 512)
+        return 0;
+    float left = g_vb[0].x, right = left, top = g_vb[0].y, bottom = top;
+    float u_low = g_vb[0].u, u_high = u_low, v_low = g_vb[0].v, v_high = v_low;
+    for (int i = 0; i < 6; i++) {
+        if (fabsf(g_vb[i].w - 1.0f) > FLAT_W_NEAR) return 0;
+        left = fminf(left, g_vb[i].x);
+        right = fmaxf(right, g_vb[i].x);
+        top = fminf(top, g_vb[i].y);
+        bottom = fmaxf(bottom, g_vb[i].y);
+        u_low = fminf(u_low, g_vb[i].u);
+        u_high = fmaxf(u_high, g_vb[i].u);
+        v_low = fminf(v_low, g_vb[i].v);
+        v_high = fmaxf(v_high, g_vb[i].v);
+    }
+    if (left > COPY_NEAR || top > COPY_NEAR || right < PSP_W - COPY_NEAR || bottom < PSP_H - COPY_NEAR) return 0;
+    if (u_low > COPY_NEAR || fabsf(u_high - u_low - (float)PSP_W) > COPY_NEAR || fabsf(v_high - v_low - (float)PSP_H) > COPY_NEAR) return 0;
+    /* A song's card is a picture of the same size, drawn the same way. What tells the copy from it is
+     * that the video memory it was copied from never gets the GPU's picture, so it is all one colour. */
+    const uint32_t first = psp_tex_fetch(st, 0, (int)v_low);
+    for (int i = 1; i < COPY_SAMPLES; i++) {
+        const int x = (int)(u_low + (u_high - u_low - 1.0f) * (float)(i % 4) / 3.0f);
+        const int y = (int)(v_low + (v_high - v_low - 1.0f) * (float)(i / 4) / 3.0f);
+        if (psp_tex_fetch(st, x, y) != first) return 0;
+    }
+    gl_target *front = find_target(g_front_addr);
+    gl_texture *e = get_texture(st);
+    if (!front || !e) return 0;
+
+    const int w = g_canvas_w * g_scale, h = g_canvas_h * g_scale;
+    if (!g_copy_fbo || g_copy_w != w || g_copy_h != h) {
+        if (g_copy_fbo) {
+            p_glDeleteFramebuffers(1, &g_copy_fbo);
+            glDeleteTextures(1, &g_copy_tex);
+        }
+        g_copy_fbo = make_color_target(&g_copy_tex, w, h, GL_LINEAR);
+        g_copy_w = w;
+        g_copy_h = h;
+        g_copy_of_addr = 0;
+    }
+    if (g_copy_of_addr != st->tex_addr || g_copy_of_hash != e->data_hash) {
+        g_copy_of_addr = st->tex_addr;
+        g_copy_of_hash = e->data_hash;
+        p_glBindFramebuffer(GL_READ_FRAMEBUFFER, front->fbo);
+        p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_copy_fbo);
+        glDisable(GL_SCISSOR_TEST);
+        p_glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        /* What a target keeps in alpha is the game's stencil, not how solid the picture is. */
+        p_glBindFramebuffer(GL_FRAMEBUFFER, g_copy_fbo);
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        g_bound = NULL;
+        bind_target();
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(g_sc_x, g_sc_y, g_sc_w, g_sc_h);
+    }
+    glBindTexture(GL_TEXTURE_2D, g_copy_tex);
+    p_glUniform2f(U.uvscale, 1.0f / (float)g_canvas_w, 1.0f / (float)g_canvas_h);
+    p_glUniform2f(U.uvat, (float)g_canvas_x / (float)g_canvas_w, (float)g_canvas_y / (float)g_canvas_h);
+    /* The game's rows count from the bottom of its picture; the canvas keeps its own from the top,
+     * and the copy covers all of it. */
+    const float middle_x = (left + right) / 2.0f, middle_y = (top + bottom) / 2.0f;
+    for (int i = 0; i < 6; i++) {
+        const int at_right = g_vb[i].x > middle_x, at_bottom = g_vb[i].y > middle_y;
+        g_vb[i].x = g_vb[i].u = at_right ? (float)(g_canvas_w - g_canvas_x) : (float)-g_canvas_x;
+        g_vb[i].y = g_vb[i].v = at_bottom ? (float)(g_canvas_h - g_canvas_y) : (float)-g_canvas_y;
+    }
+    return 1;
+}
+
+/* ---- targets in another style ---------------------------------------------
+ *
+ * The targets the notes fly to come from one 128x128 sheet: a circle, a triangle, a square and a
+ * plus in its quarters, and the clock's hand between them. Each target is a model the shape of
+ * its own, drawn with no transparency, so another shape cannot be drawn into it. In a note style
+ * of its own, a target's model is drawn as a square instead, over the same place, from the
+ * style's targets.rgba, whose quarters hold the new shapes in the same order on a clear ground.
+ * The hand is left as it is. */
+#define TARGETS_SHEET 0xF9253859u
+#define HAND_SPAN 40.0f   /* the hand is narrower than this on the sheet; the shapes are wider */
+
+static int read_note_targets(void) {
+    if (g_note_targets_read) return g_note_targets != 0;
+    g_note_targets_read = 1;
+    char path[1200];
+    snprintf(path, sizeof path, "%s\\targets.rgba", g_note_dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    uint32_t size[3] = {0, 0, 0};
+    uint32_t *pixels = NULL;
+    /* Its side in the units its coordinates are given in, then its pixels. */
+    if (fread(size, 4, 3, f) == 3 && size[0] && size[0] <= 4096 && size[1] && size[1] <= 4096 && size[2]) {
+        const size_t count = (size_t)size[0] * size[1];
+        pixels = (uint32_t *)malloc(count * 4);
+        if (pixels && fread(pixels, 4, count, f) != count) {
+            free(pixels);
+            pixels = NULL;
+        }
+    }
+    fclose(f);
+    if (!pixels) return 0;
+    glGenTextures(1, &g_note_targets);
+    glBindTexture(GL_TEXTURE_2D, g_note_targets);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)size[0], (GLsizei)size[1], 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    p_glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    g_note_targets_side = (float)size[2];
+    free(pixels);
+    fprintf(stderr, "gl: targets of the note style from %s\n", path);
+    return 1;
+}
+
+/* Takes the n vertices in g_vb; if they are a target in a style of its own, puts six in their
+ * place and readies the texture and state for them. */
+static int note_target_drawn(int n, const psp_draw_state *st) {
+    if (!g_note_dir[0] || !st->tex_enable || g_tex_colours != TARGETS_SHEET || n < 3 || st->tex_w <= 0) return 0;
+    float u_low = 1e9f, u_high = -1e9f, r_low = 1e9f, r_high = -1e9f;
+    float left = 1e9f, right = -1e9f, top = 1e9f, bottom = -1e9f, z = 0.0f, w = 0.0f;
+    for (int i = 0; i < n; i++) {
+        const gl_vertex *p = &g_vb[i];
+        if (p->w == 0.0f) return 0;
+        /* Rows of the sheet from its top: the game counts them from its bottom. */
+        const float row = (float)st->tex_h - p->v;
+        u_low = fminf(u_low, p->u);
+        u_high = fmaxf(u_high, p->u);
+        r_low = fminf(r_low, row);
+        r_high = fmaxf(r_high, row);
+        left = fminf(left, p->x / p->w);
+        right = fmaxf(right, p->x / p->w);
+        top = fminf(top, p->y / p->w);
+        bottom = fmaxf(bottom, p->y / p->w);
+        z += p->z;
+        w += p->w;
+    }
+    if (u_high - u_low < HAND_SPAN || r_high - r_low < HAND_SPAN || !read_note_targets()) return 0;
+    z /= (float)n;
+    w /= (float)n;
+    /* Its quarter of the sheet, and where that quarter's corners come on the screen. */
+    const float half = (float)st->tex_w / 2.0f;
+    const int col = (u_low + u_high) / 2.0f >= half, row = (r_low + r_high) / 2.0f >= half;
+    const float qu0 = col * half, qr0 = row * half;
+    const float per_u = (right - left) / (u_high - u_low), per_r = (bottom - top) / (r_high - r_low);
+    const float x0 = left + (qu0 - u_low) * per_u, x1 = left + (qu0 + half - u_low) * per_u;
+    const float y0 = top + (qr0 - r_low) * per_r, y1 = top + (qr0 + half - r_low) * per_r;
+    /* The same quarter of the style's sheet, whose rows also count from its bottom. */
+    const float side = g_note_targets_side, q = side / 2.0f;
+    const float tu0 = col * q, tu1 = tu0 + q, tv0 = side - row * q, tv1 = tv0 - q;
+    const float corner[4][4] = {{x0, y0, tu0, tv0}, {x1, y0, tu1, tv0}, {x0, y1, tu0, tv1}, {x1, y1, tu1, tv1}};
+    static const int ORDER[6] = {0, 1, 2, 1, 3, 2};
+    const gl_vertex like = g_vb[0];
+    for (int i = 0; i < 6; i++) {
+        const float *c = corner[ORDER[i]];
+        g_vb[i] = like;
+        g_vb[i].x = c[0] * w;
+        g_vb[i].y = c[1] * w;
+        g_vb[i].z = z;
+        g_vb[i].w = w;
+        g_vb[i].u = c[2];
+        g_vb[i].v = c[3];
+    }
+    glBindTexture(GL_TEXTURE_2D, g_note_targets);
+    p_glUniform2f(U.uvscale, 1.0f / side, 1.0f / side);
+    p_glUniform2f(U.uvat, 0.0f, 0.0f);
+    /* Clear around the shape: blended, and what is almost clear not drawn at all, nor its depth. */
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    p_glUniform1i(U.afunc, 6);
+    p_glUniform1i(U.aref, 8);
+    p_glUniform1i(U.amask, 0xFF);
+    glDisable(GL_CULL_FACE);
+    return 1;
 }
 
 static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_state *st) {
@@ -1691,10 +2314,10 @@ static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
     /* A scissor of the whole screen means the whole canvas, or nothing past it would show. */
     const int whole_screen = st->sc_x0 <= 0 && st->sc_y0 <= 0 && st->sc_x1 >= PSP_W - 1 && st->sc_y1 >= PSP_H - 1;
     if (g_wide && whole_screen)
-        glScissor(0, 0, g_canvas_w * g_scale, g_canvas_h * g_scale);
+        set_scissor(0, 0, g_canvas_w * g_scale, g_canvas_h * g_scale);
     else
-        glScissor((st->sc_x0 + g_canvas_x) * g_scale, (st->sc_y0 + g_canvas_y) * g_scale, (st->sc_x1 - st->sc_x0 + 1) * g_scale,
-                  (st->sc_y1 - st->sc_y0 + 1) * g_scale);
+        set_scissor((st->sc_x0 + g_canvas_x) * g_scale, (st->sc_y0 + g_canvas_y) * g_scale, (st->sc_x1 - st->sc_x0 + 1) * g_scale,
+                    (st->sc_y1 - st->sc_y0 + 1) * g_scale);
 
     if (st->clear)
         glColorMask(st->clear_color ? GL_TRUE : GL_FALSE, st->clear_color ? GL_TRUE : GL_FALSE,
@@ -1749,7 +2372,21 @@ static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
         }
     } else {
         for (int i = 0; i < count; i++) g_vb[n++] = to_gl(&v[i]);
-        if (g_wide && !st->clear && whole_screen && g_bound && g_bound->shown) {
+        /* The footer's pieces are placed by the footer, for any shape of window. */
+        int footer = 0;
+        if (note_target_drawn(n, st)) {
+            n = 6;
+            mode = GL_TRIANGLES;
+            footer = 1;
+        }
+        if (prim == PSP_PRIM_TRIANGLES && n % 6 == 0 && st->tex_enable && g_tex_colours && g_tex_colours == g_footer_sheet)
+            n = footer_draw(n, (float)st->tex_h, &footer);
+        /* A copy of the screen is drawn from the GPU's own, and needs nothing more. */
+        if (!footer && g_bound && g_bound->shown && screen_copy_drawn(prim, n, st)) footer = 1;
+        if (!footer && g_wide && !st->clear && whole_screen && g_bound && g_bound->shown &&
+            (prim == PSP_PRIM_TRIANGLES || prim == PSP_PRIM_TRIANGLE_STRIP))
+            widen_background_plane(prim, n, st);
+        if (!footer && g_wide && !st->clear && whole_screen && g_bound && g_bound->shown) {
             if (!st->tex_enable && n <= 8 && stretch_fade(n)) {
                 /* Done. */
             } else if (prim != PSP_PRIM_POINTS && prim != PSP_PRIM_LINES && prim != PSP_PRIM_LINE_STRIP) {
@@ -1758,10 +2395,6 @@ static void gl_draw(int prim, const psp_vertex *v, int count, const psp_draw_sta
         }
     }
     if (!n) return;
-    if ((prim == PSP_PRIM_TRIANGLES || prim == PSP_PRIM_SPRITES) && n % 6 == 0 && st->tex_enable && g_tex_colours &&
-        g_tex_colours == g_footer_sheet)
-        footer_draw(prim, n, (float)st->tex_h);
-
     p_glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)n * sizeof(gl_vertex)), g_vb, GL_STREAM_DRAW);
     glDrawArrays(mode, 0, n);
 }
@@ -1984,6 +2617,7 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
     /* The game draws nothing while the save screen is open, so the last frame stays. */
     if (psp_utility_savedata_open()) return;
     gl_target *t = find_target(addr);
+    g_front_addr = addr;
     if (g_trace_draws == 1) {
         g_trace_draws = 0;
         fprintf(stderr, "gl: end of trace %d, shown from %08X\n", g_traces, addr);
@@ -2021,6 +2655,8 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
     g_frame_bottom_now = -1e9f;
     g_results_last = g_results_now;
     g_results_now = 0;
+    g_in_place_last = g_in_place_now;
+    g_in_place_now = 0;
     plan_footer();
     g_dim_done = 0;
     if (g_song_frames > 0) g_song_frames--;

@@ -93,12 +93,25 @@ static int read_pad(XINPUT_STATE *s) {
 }
 
 /* The PSP stick is 0..255 with 128 at rest and y growing downwards. Here too y grows
- * downwards, and both run -32768..32767. */
-static void stick(int x, int y, uint8_t *ax, uint8_t *ay) {
+ * downwards, and both run -32768..32767. Pushed past half way, the stick is the d-pad as well,
+ * as the game's menus and notes read only that: its buttons are given back, by SDL's numbers. */
+#define STICK_AS_DPAD 16384
+static uint32_t g_stick_raw;                 /* the d-pad's buttons that came from a stick, this read */
+static volatile uint32_t g_stick_buttons;    /* the same as the PSP's buttons */
+uint32_t psp_window_stick_buttons(void) { return g_stick_buttons; }
+
+static uint32_t stick(int x, int y, uint8_t *ax, uint8_t *ay) {
     const long long d = XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE;
-    if ((long long)x * x + (long long)y * y <= d * d) return;
+    if ((long long)x * x + (long long)y * y <= d * d) return 0;
     *ax = (uint8_t)((x + 32768) >> 8);
     *ay = (uint8_t)((y + 32768) >> 8);
+    uint32_t dpad = 0;
+    if (y < -STICK_AS_DPAD) dpad |= PAD_BIT(11);
+    if (y > STICK_AS_DPAD) dpad |= PAD_BIT(12);
+    if (x < -STICK_AS_DPAD) dpad |= PAD_BIT(13);
+    if (x > STICK_AS_DPAD) dpad |= PAD_BIT(14);
+    g_stick_raw |= dpad;
+    return dpad;
 }
 
 /* The first XInput controller connected, if any. Its buttons get SDL's numbers. */
@@ -119,7 +132,7 @@ static uint32_t xinput_pad(uint8_t *ax, uint8_t *ay) {
         if (s.Gamepad.wButtons & P[i].x) raw |= PAD_BIT(P[i].id);
     if (s.Gamepad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) raw |= PAD_BIT(PSP_PAD_LT);
     if (s.Gamepad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) raw |= PAD_BIT(PSP_PAD_RT);
-    stick(s.Gamepad.sThumbLX, -1 - s.Gamepad.sThumbLY, ax, ay);
+    raw |= stick(s.Gamepad.sThumbLX, -1 - s.Gamepad.sThumbLY, ax, ay);
     return raw;
 }
 
@@ -220,17 +233,22 @@ static uint32_t sdl_pad(uint8_t *ax, uint8_t *ay) {
             if (sdl.GetGamepadButton(gamepad, id)) raw |= PAD_BIT(id);
         if (sdl.GetGamepadAxis(gamepad, SDL_AXIS_LEFT_TRIGGER) > SDL_TRIGGER_DOWN) raw |= PAD_BIT(PSP_PAD_LT);
         if (sdl.GetGamepadAxis(gamepad, SDL_AXIS_RIGHT_TRIGGER) > SDL_TRIGGER_DOWN) raw |= PAD_BIT(PSP_PAD_RT);
-        stick(sdl.GetGamepadAxis(gamepad, SDL_AXIS_LEFTX), sdl.GetGamepadAxis(gamepad, SDL_AXIS_LEFTY), ax, ay);
+        raw |= stick(sdl.GetGamepadAxis(gamepad, SDL_AXIS_LEFTX), sdl.GetGamepadAxis(gamepad, SDL_AXIS_LEFTY), ax, ay);
     }
     return raw;
 }
 
 static uint32_t pad(uint8_t *ax, uint8_t *ay) {
+    g_stick_raw = 0;
     const uint32_t raw = sdl_ready() ? sdl_pad(ax, ay) : xinput_pad(ax, ay);
     g_pad_raw = raw;
-    uint32_t b = 0;
-    for (int i = 0; i < PSP_BIND_COUNT; i++)
+    uint32_t b = 0, from_stick = 0;
+    for (int i = 0; i < PSP_BIND_COUNT; i++) {
         if (raw & g_pads[i]) b |= BUTTON_BIT[i];
+        /* Only if the stick alone gives it: a d-pad held the same way counts as the d-pad. */
+        if ((g_stick_raw & g_pads[i]) && !(raw & ~g_stick_raw & g_pads[i])) from_stick |= BUTTON_BIT[i];
+    }
+    g_stick_buttons = from_stick;
     return b;
 }
 
@@ -435,5 +453,6 @@ void psp_window_set_pad(int button, uint32_t mask) { (void)button; (void)mask; }
 uint32_t psp_window_get_pad(int button) { (void)button; return 0; }
 void psp_window_reset_buttons(void) {}
 uint32_t psp_window_pad_raw(void) { return 0; }
+uint32_t psp_window_stick_buttons(void) { return 0; }
 
 #endif

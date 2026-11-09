@@ -164,6 +164,11 @@ void psp_render_gl_set_replacement_dir(const char *dir);
 void psp_render_gl_set_dump_dir(const char *dir);
 /* Show frames per second and the slowest frame in a corner of the window. */
 void psp_render_gl_set_overlay(int on);
+/* In a wider window, blurred copies of pictures past their sides (on by default). Off, a picture
+ * that covers the screen is enlarged behind itself unblurred, and a song's stage pictures are not. */
+void psp_render_gl_set_blur(int on);
+/* Notes and targets in another style, from this folder, or NULL for the game's own shapes. */
+void psp_render_gl_set_note_dir(const char *dir);
 /* The width of a line a message window holds, centred, this frame: a narrower window is drawn wider. */
 void psp_render_gl_dialog_line(float width);
 /* A picture of the screen as the player sees it, at the size it is drawn: rows top first, four
@@ -178,6 +183,10 @@ void psp_render_gl_set_language_dir(const char *dir);
 
 /* Pictures drawn from vectors, tried before those of the language. NULL for none. */
 void psp_render_gl_set_vector_dir(const char *dir);
+/* Before the first frame: the flat pieces of the sheet known by these colours (see render_gl.c) belong
+ * to the 3D scene they are drawn over, as a title screen's do, and stay where the game puts them in a
+ * window of another shape. */
+void psp_render_gl_keep_in_place(uint32_t colours);
 /* Show a line of UTF-8 text over the picture for a few seconds. Any thread. */
 void psp_render_gl_show_message(const char *utf8);
 /* Textures decoded so far and the real time that took, in microseconds. */
