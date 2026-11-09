@@ -236,6 +236,7 @@ typedef struct {
     int replaced;    /* a larger file stands in for it */
     int up_w, up_h;  /* its size on the GPU */
     int mipped;      /* its smaller levels are made, for a soft blur */
+    int glyphs;      /* its file gave a shape only, as a font's letters: no smaller levels for it */
     uint32_t colours;  /* what it is known by, or 0 if that was not worked out */
     int use_logged;
 } gl_texture;
@@ -1300,7 +1301,11 @@ typedef struct {
     uint32_t colours, shape;
     int w, h;
     uint32_t *pixels;
+    int glyphs;   /* from a file of shapes only */
 } replacement;
+
+/* Whether the file read last was of shapes only. */
+static int g_read_glyphs;
 
 static replacement g_replace_cache[REPLACE_CACHE];
 static int g_replace_cached;
@@ -1413,6 +1418,7 @@ static uint32_t *read_replacement(uint32_t colours, uint32_t shape, int *w, int 
     const int whole = f != NULL;
     if (!f) f = open_replacement(shape, "alpha", size);
     if (!f) return NULL;
+    g_read_glyphs = !whole;
 
     const size_t count = (size_t)size[0] * size[1];
     uint32_t *pixels = (uint32_t *)malloc(count * sizeof *pixels);
@@ -1572,7 +1578,10 @@ static void bleed_into_clear(uint32_t *pixels, int w, int h) {
 }
 
 /* The file standing in for what is in g_decode, or NULL. */
+static int g_replacement_glyphs;   /* whether replacement_for's last answer was of shapes only */
+
 static const uint32_t *replacement_for(int w, int h, int *out_w, int *out_h, uint32_t *out_colours) {
+    g_replacement_glyphs = 0;
     if ((!g_replace_dir[0] && !g_language_dir[0] && !g_dump_dir[0]) || w < REPLACE_MIN_SIDE || h < REPLACE_MIN_SIDE) return NULL;
 
     /* A picture is known by its colours, and letters by their shape alone. */
@@ -1595,11 +1604,14 @@ static const uint32_t *replacement_for(int w, int h, int *out_w, int *out_h, uin
             if (!r->pixels) return NULL;  /* and it has been saved already, if that is wanted */
             *out_w = r->w;
             *out_h = r->h;
+            g_replacement_glyphs = r->glyphs;
             return r->pixels;
         }
     }
     int file_w = 0, file_h = 0;
+    g_read_glyphs = 0;
     uint32_t *pixels = read_replacement(colours, shape, &file_w, &file_h);
+    const int glyphs = pixels && g_read_glyphs;
     if (pixels) bleed_into_clear(pixels, file_w, file_h);
     if (g_replace_cached < REPLACE_CACHE) {
         replacement *r = &g_replace_cache[g_replace_cached++];
@@ -1608,10 +1620,12 @@ static const uint32_t *replacement_for(int w, int h, int *out_w, int *out_h, uin
         r->w = file_w;
         r->h = file_h;
         r->pixels = pixels;
+        r->glyphs = glyphs;
     }
     if (!pixels) return NULL;
     *out_w = file_w;
     *out_h = file_h;
+    g_replacement_glyphs = glyphs;
     return pixels;
 }
 
@@ -1626,6 +1640,7 @@ static void decode_texture(gl_texture *e, const psp_draw_state *st) {
     e->colours = 0;
     const uint32_t *pixels = replacement_for(w, h, &up_w, &up_h, &e->colours);
     e->replaced = pixels != NULL;
+    e->glyphs = pixels != NULL && g_replacement_glyphs;
     if (!pixels) pixels = g_decode;
     glBindTexture(GL_TEXTURE_2D, e->tex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
@@ -1772,7 +1787,8 @@ static int setup_texture(const psp_draw_state *st) {
     g_tex_colours = e->colours;
     g_tex_bound = e;
     int smooth = e->replaced;
-    if (e->replaced && e->up_w > st->tex_w) {
+    /* Not a font's letters, which sit close on their sheet: smaller levels would mix in their neighbours'. */
+    if (e->replaced && !e->glyphs && e->up_w > st->tex_w) {
         if (!e->mipped) {
             glBindTexture(GL_TEXTURE_2D, e->tex);
             p_glGenerateMipmap(GL_TEXTURE_2D);

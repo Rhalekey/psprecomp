@@ -13,6 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 /* ---- Kernel_Library ------------------------------------------------------
  * Interrupt masking. The mask belongs to the *thread* that opened the critical
@@ -131,6 +134,28 @@ static volatile int g_ctrl_forced;
  * still there for the second. */
 static volatile uint32_t g_ctrl_seen;
 
+/* When each button last went down, in microseconds, and how long before the game's last read the
+ * newest press it was given came: a press is seen once a frame, and this says when in the frame. */
+static volatile uint64_t g_ctrl_down_us[32];
+static uint32_t g_ctrl_last_raw, g_ctrl_last_read;
+static volatile uint32_t g_ctrl_press_age_us;
+
+static uint64_t ctrl_now_us(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER now;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    return (uint64_t)(now.QuadPart / freq.QuadPart) * 1000000u + (uint64_t)(now.QuadPart % freq.QuadPart) * 1000000u / (uint64_t)freq.QuadPart;
+#else
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
+#endif
+}
+
+uint32_t psp_ctrl_press_age_us(void) { return g_ctrl_press_age_us; }
+
 void psp_ctrl_force(uint32_t buttons) {
     g_ctrl_forced = 1;
     g_buttons = buttons;
@@ -138,6 +163,13 @@ void psp_ctrl_force(uint32_t buttons) {
 
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay) {
     if (g_ctrl_forced) return;
+    const uint32_t went_down = buttons & ~g_ctrl_last_raw;
+    g_ctrl_last_raw = buttons;
+    if (went_down) {
+        const uint64_t now = ctrl_now_us();
+        for (int bit = 0; bit < 32; bit++)
+            if (went_down & (1u << bit)) g_ctrl_down_us[bit] = now;
+    }
     g_buttons = buttons;
     __atomic_fetch_or(&g_ctrl_seen, buttons, __ATOMIC_RELAXED);
     g_analog_x = ax;
@@ -157,6 +189,18 @@ static void hle_ReadBufferPositive(void) {
     uint32_t buf = psp_arg(0), count = psp_arg(1);
     if (!count) count = 1;
     const uint32_t down = g_buttons | __atomic_exchange_n(&g_ctrl_seen, 0, __ATOMIC_RELAXED);
+    /* The newest press this read brings, and how long ago it came. */
+    const uint32_t fresh = down & ~g_ctrl_last_read;
+    g_ctrl_last_read = down;
+    uint64_t newest = 0;
+    for (int bit = 0; bit < 32; bit++)
+        if ((fresh & (1u << bit)) && g_ctrl_down_us[bit] > newest) newest = g_ctrl_down_us[bit];
+    if (newest) {
+        const uint64_t now = ctrl_now_us();
+        g_ctrl_press_age_us = now > newest ? (uint32_t)(now - newest) : 0u;
+    } else {
+        g_ctrl_press_age_us = 0;
+    }
     const uint32_t buttons = g_ctrl_filter ? g_ctrl_filter(down) : down;
     for (uint32_t i = 0; i < count; i++) {
         uint32_t at = buf + i * 16;

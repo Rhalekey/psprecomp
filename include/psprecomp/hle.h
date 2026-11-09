@@ -231,6 +231,9 @@ void psp_misc_register(void);
 void psp_misc_reset(void);
 int  psp_exit_requested(void);
 void psp_ctrl_set(uint32_t buttons, uint8_t ax, uint8_t ay);
+/* How long before the game's last read of the buttons the newest press it brought really came, in
+ * microseconds; 0 if it brought none. A press is seen once a frame: this says when in that frame. */
+uint32_t psp_ctrl_press_age_us(void);
 void psp_ctrl_force(uint32_t buttons);
 /* Sees the buttons as the game reads them, and can change them. NULL for none. */
 void psp_ctrl_set_filter(uint32_t (*filter)(uint32_t buttons));
