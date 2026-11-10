@@ -1821,6 +1821,23 @@ static void bind_sampler(GLuint tex, int *min_seen, int *mag_seen, int *u_seen, 
     }
 }
 
+/* DIVA_LOG_DRAWS=1 (or PSPRECOMP_LOG_DRAWS=1) logs each picture the first time it is drawn, with
+ * when, to tell which picture an effect is by when it first shows. */
+static void log_first_draw(uint32_t colours, int w, int h) {
+    static int on = -1;
+    static uint32_t seen[8192];
+    if (on < 0) on = getenv("DIVA_LOG_DRAWS") || getenv("PSPRECOMP_LOG_DRAWS");
+    if (!on || !colours) return;
+    for (uint32_t i = colours % 8192u, n = 0; n < 8192u; i = (i + 1) % 8192u, n++) {
+        if (seen[i] == colours) return;
+        if (!seen[i]) {
+            seen[i] = colours;
+            fprintf(stderr, "draw: first %08X %dx%d at %.2f s\n", colours, w, h, (double)GetTickCount64() / 1000.0);
+            return;
+        }
+    }
+}
+
 /* Returns whether a texture is bound. A buffer the game drew into is used directly;
  * its coordinates are texels of the whole logical target. */
 static int setup_texture(const psp_draw_state *st) {
@@ -1841,6 +1858,7 @@ static int setup_texture(const psp_draw_state *st) {
     if (!e) return 0;
     g_tex_colours = e->colours;
     g_tex_bound = e;
+    log_first_draw(e->colours, st->tex_w, st->tex_h);
     int smooth = e->replaced;
     /* Not a font's letters, which sit close on their sheet: smaller levels would mix in their neighbours'. */
     if (e->replaced && !e->glyphs && e->up_w > st->tex_w) {
