@@ -645,6 +645,298 @@ static void hle_FlushAllStream(void) {
     psp_ret(0);
 }
 
+/* ---- sceMp3: MP3 files the game streams from the Memory Stick ---------------------------------
+ *
+ * The game keeps the file and its buffers. It reserves a handle with where the stream starts and
+ * ends in the file, a buffer for the file's bytes and one for the samples. Then, while
+ * sceMp3CheckStreamDataNeeded says so, it asks where to put the next bytes and from where in the
+ * file (sceMp3GetInfoToAddStreamData), reads them there and says how many (sceMp3NotifyAddStreamData).
+ * Each sceMp3Decode gives one frame's samples, 16 bits, interleaved, in its sample buffer.
+ * Here the bytes are copied out as they are added, split into frames by FFmpeg's parser and decoded
+ * by its MP3 decoder, the same DLLs the movies use. */
+#define MP3_HANDLES 2
+#define MP3_FIFO (512u * 1024u)
+#define MP3_ERROR_HANDLE 0x80671001u
+#define MP3_ERROR_NOT_READY 0x80671002u
+#define MP3_ERROR_NEED_DATA 0x80671402u   /* sceMp3Decode with too little of the file added */
+#define MP3_NEED_DATA 0xFFFFFFFFu
+
+#ifdef PSPRECOMP_FFMPEG
+typedef struct {
+    int used, ready;
+    uint64_t start, end, readpos;
+    uint32_t buf, buf_size, pcm, pcm_size;
+    uint8_t *fifo;
+    uint32_t fifo_len;
+    AVCodecContext *codec;
+    AVCodecParserContext *parser;
+    AVPacket *packet;
+    AVFrame *frame;
+    int rate, channels, bitrate, loops, flushed;
+    uint64_t decoded;
+} mp3_stream;
+static mp3_stream g_mp3[MP3_HANDLES];
+
+static mp3_stream *mp3_of(uint32_t h) { return h < MP3_HANDLES && g_mp3[h].used ? &g_mp3[h] : NULL; }
+
+static void mp3_close(mp3_stream *s) {
+    if (s->codec) ff.free_context(&s->codec);
+    if (s->parser) ff.parser_close(s->parser);
+    if (s->packet) ff.packet_free(&s->packet);
+    if (s->frame) ff.frame_free(&s->frame);
+    free(s->fifo);
+    memset(s, 0, sizeof *s);
+}
+
+/* From the start of the file again, as for a loop or a reset. */
+static void mp3_rewind(mp3_stream *s) {
+    s->readpos = s->start;
+    s->fifo_len = 0;
+    s->decoded = 0;
+    s->flushed = 0;
+    if (s->codec) ff.flush_buffers(s->codec);
+    if (s->parser) {
+        ff.parser_close(s->parser);
+        s->parser = ff.parser_init(AV_CODEC_ID_MP3);
+    }
+}
+
+/* The first frame's header, past an ID3v2 tag if the stream starts with one. */
+static int mp3_header(mp3_stream *s) {
+    const uint8_t *p = s->fifo;
+    uint32_t i = 0, n = s->fifo_len;
+    if (n >= 10 && p[0] == 'I' && p[1] == 'D' && p[2] == '3')
+        i = 10 + (((uint32_t)p[6] & 0x7F) << 21 | ((uint32_t)p[7] & 0x7F) << 14 | ((uint32_t)p[8] & 0x7F) << 7 | ((uint32_t)p[9] & 0x7F));
+    static const int RATES[4][3] = {{11025, 12000, 8000}, {0, 0, 0}, {22050, 24000, 16000}, {44100, 48000, 32000}};
+    static const int KBPS_V1[16] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0};
+    static const int KBPS_V2[16] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0};
+    for (; i + 4 <= n; i++) {
+        if (p[i] != 0xFF || (p[i + 1] & 0xE0) != 0xE0) continue;
+        const int version = (p[i + 1] >> 3) & 3, layer = (p[i + 1] >> 1) & 3, rate = (p[i + 2] >> 2) & 3, kbps = p[i + 2] >> 4;
+        if (version == 1 || layer != 1 || rate == 3 || kbps == 0 || kbps == 15) continue;   /* layer III only */
+        s->rate = RATES[version][rate];
+        s->channels = ((p[i + 3] >> 6) == 3) ? 1 : 2;
+        s->bitrate = version == 3 ? KBPS_V1[kbps] : KBPS_V2[kbps];
+        return 1;
+    }
+    return 0;
+}
+
+static void hle_Mp3InitResource(void) { psp_ret(psp_mpeg_available() ? 0 : MP3_ERROR_NOT_READY); }
+static void hle_Mp3TermResource(void) {
+    for (int i = 0; i < MP3_HANDLES; i++)
+        if (g_mp3[i].used) mp3_close(&g_mp3[i]);
+    psp_ret(0);
+}
+
+/* (SceMp3InitArg *): stream start, end, the file's buffer and size, the samples' buffer and size. */
+static void hle_Mp3ReserveMp3Handle(void) {
+    const uint32_t a = psp_arg(0);
+    if (!psp_mpeg_available()) { psp_ret(MP3_ERROR_NOT_READY); return; }
+    for (uint32_t h = 0; h < MP3_HANDLES; h++) {
+        mp3_stream *s = &g_mp3[h];
+        if (s->used) continue;
+        memset(s, 0, sizeof *s);
+        s->used = 1;
+        s->start = psp_read32(a + 0) | (uint64_t)psp_read32(a + 4) << 32;
+        s->end = psp_read32(a + 8) | (uint64_t)psp_read32(a + 12) << 32;
+        s->buf = psp_read32(a + 16);
+        s->buf_size = psp_read32(a + 20);
+        s->pcm = psp_read32(a + 24);
+        s->pcm_size = psp_read32(a + 28);
+        s->readpos = s->start;
+        s->fifo = (uint8_t *)malloc(MP3_FIFO + AV_INPUT_BUFFER_PADDING_SIZE);
+        s->packet = ff.packet_alloc();
+        s->frame = ff.frame_alloc();
+        s->parser = ff.parser_init(AV_CODEC_ID_MP3);
+        fprintf(stderr, "mp3: a stream of %llu bytes reserved\n", (unsigned long long)(s->end - s->start));
+        psp_ret(h);
+        return;
+    }
+    psp_ret(MP3_ERROR_HANDLE);
+}
+
+static void hle_Mp3ReleaseMp3Handle(void) {
+    mp3_stream *s = mp3_of(psp_arg(0));
+    if (s) mp3_close(s);
+    psp_ret(0);
+}
+
+/* (handle, u8 **dst, int *towrite, int *srcpos): always the start of the file's buffer, as all
+ * that was added before has been taken out. */
+static void hle_Mp3GetInfoToAddStreamData(void) {
+    mp3_stream *s = mp3_of(psp_arg(0));
+    if (!s) { psp_ret(MP3_ERROR_HANDLE); return; }
+    uint64_t left = s->end > s->readpos ? s->end - s->readpos : 0;
+    uint32_t room = MP3_FIFO - s->fifo_len;
+    uint32_t write = s->buf_size;
+    if (write > room) write = room;
+    if (write > left) write = (uint32_t)left;
+    if (psp_arg(1)) psp_write32(psp_arg(1), s->buf);
+    if (psp_arg(2)) psp_write32(psp_arg(2), write);
+    if (psp_arg(3)) psp_write32(psp_arg(3), (uint32_t)s->readpos);
+    psp_ret(0);
+}
+
+/* (handle, size) */
+static void hle_Mp3NotifyAddStreamData(void) {
+    mp3_stream *s = mp3_of(psp_arg(0));
+    uint32_t size = psp_arg(1);
+    if (!s) { psp_ret(MP3_ERROR_HANDLE); return; }
+    if (size > MP3_FIFO - s->fifo_len) size = MP3_FIFO - s->fifo_len;
+    if (size && psp_mem_read_block(s->fifo + s->fifo_len, s->buf, size) == 0) s->fifo_len += size;
+    s->readpos += psp_arg(1);
+    psp_ret(0);
+}
+
+static void hle_Mp3CheckStreamDataNeeded(void) {
+    mp3_stream *s = mp3_of(psp_arg(0));
+    if (!s) { psp_ret(MP3_ERROR_HANDLE); return; }
+    psp_ret(s->readpos < s->end && s->fifo_len + s->buf_size <= MP3_FIFO ? 1 : 0);
+}
+
+/* (handle): the stream's header, and the decoder for it. */
+static void hle_Mp3Init(void) {
+    mp3_stream *s = mp3_of(psp_arg(0));
+    if (!s) { psp_ret(MP3_ERROR_HANDLE); return; }
+    if (!mp3_header(s)) {
+        fprintf(stderr, "mp3: no MP3 frame found in the first %u bytes\n", s->fifo_len);
+        psp_ret(0x80671100u);
+        return;
+    }
+    const AVCodec *codec = ff.find_decoder(AV_CODEC_ID_MP3);
+    s->codec = codec ? ff.alloc_context3(codec) : NULL;
+    if (!s->codec || ff.open2(s->codec, codec, NULL) < 0) {
+        fprintf(stderr, "mp3: no MP3 decoder in FFmpeg\n");
+        if (s->codec) ff.free_context(&s->codec);
+        psp_ret(MP3_ERROR_NOT_READY);
+        return;
+    }
+    s->ready = 1;
+    fprintf(stderr, "mp3: %d Hz, %d channels, %d kbit/s\n", s->rate, s->channels, s->bitrate);
+    psp_ret(0);
+}
+
+/* The next frame's samples, as 16 bits interleaved, into the samples' buffer. Gives back the bytes
+ * written, 0 once the stream has ended. */
+static uint32_t mp3_decode(mp3_stream *s) {
+    for (;;) {
+        /* What the decoder holds comes first: a frame sent before may be ready only now, and while
+         * it waits the decoder takes no more, so a frame sent then would be lost, and the next, and
+         * so on through the whole file. */
+        if (ff.receive_frame(s->codec, s->frame) < 0) {
+            uint8_t *out = NULL;
+            int out_size = 0;
+            const int eof = s->readpos >= s->end;
+            const int used = ff.parser_parse2(s->parser, s->codec, &out, &out_size, s->fifo, (int)s->fifo_len,
+                                              AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+            if (used > 0) {
+                memmove(s->fifo, s->fifo + used, s->fifo_len - (uint32_t)used);
+                s->fifo_len -= (uint32_t)used;
+            }
+            if (!out_size) {
+                if (s->fifo_len && used > 0) continue;
+                if (!eof) return MP3_NEED_DATA;   /* more of the file is to come first */
+                if (s->flushed) return 0;
+                /* The parser keeps the last frame, and the decoder its last samples, until told
+                 * there is no more. */
+                s->flushed = 1;
+                ff.parser_parse2(s->parser, s->codec, &out, &out_size, NULL, 0, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+                if (!out_size) {
+                    ff.send_packet(s->codec, NULL);
+                    continue;
+                }
+            }
+            s->packet->data = out;
+            s->packet->size = out_size;
+            ff.send_packet(s->codec, s->packet);
+            s->packet->data = NULL;
+            s->packet->size = 0;
+            continue;
+        }
+        const AVFrame *f = s->frame;
+        const int channels = f->ch_layout.nb_channels > 0 ? f->ch_layout.nb_channels : s->channels;
+        const int out_channels = s->channels;
+        uint32_t samples = (uint32_t)f->nb_samples;
+        if (samples * (uint32_t)out_channels * 2 > s->pcm_size) samples = s->pcm_size / ((uint32_t)out_channels * 2);
+        int16_t *pcm = (int16_t *)psp_mem_ptr(s->pcm, samples * (uint32_t)out_channels * 2);
+        if (!pcm) return 0;
+        for (uint32_t i = 0; i < samples; i++) {
+            for (int c = 0; c < out_channels; c++) {
+                const int from = c < channels ? c : channels - 1;
+                float v = 0.0f;
+                if (f->format == AV_SAMPLE_FMT_FLTP) v = ((const float *)f->data[from])[i];
+                else if (f->format == AV_SAMPLE_FMT_FLT) v = ((const float *)f->data[0])[i * channels + from];
+                else if (f->format == AV_SAMPLE_FMT_S16P) v = ((const int16_t *)f->data[from])[i] / 32768.0f;
+                else if (f->format == AV_SAMPLE_FMT_S16) v = ((const int16_t *)f->data[0])[i * channels + from] / 32768.0f;
+                int x = (int)(v * 32767.0f);
+                pcm[i * (uint32_t)out_channels + (uint32_t)c] = (int16_t)(x < -32768 ? -32768 : x > 32767 ? 32767 : x);
+            }
+        }
+        s->decoded += samples;
+        return samples * (uint32_t)out_channels * 2;
+    }
+}
+
+/* (handle, s16 **dst) */
+static void hle_Mp3Decode(void) {
+    mp3_stream *s = mp3_of(psp_arg(0));
+    if (!s || !s->ready) { psp_ret(MP3_ERROR_HANDLE); return; }
+    uint32_t bytes = mp3_decode(s);
+    if (bytes == MP3_NEED_DATA) {
+        /* As the console's: the game adds more of the file and asks again. */
+        psp_ret(MP3_ERROR_NEED_DATA);
+        return;
+    }
+    if (!bytes && s->readpos >= s->end && s->loops != 0) {
+        if (s->loops > 0) s->loops--;
+        mp3_rewind(s);
+    }
+    if (psp_arg(1)) psp_write32(psp_arg(1), s->pcm);
+    psp_ret(bytes);
+}
+
+static void hle_Mp3SetLoopNum(void) {
+    mp3_stream *s = mp3_of(psp_arg(0));
+    if (s) s->loops = (int)psp_arg(1);
+    psp_ret(s ? 0 : MP3_ERROR_HANDLE);
+}
+static void hle_Mp3ResetPlayPosition(void) {
+    mp3_stream *s = mp3_of(psp_arg(0));
+    if (s) mp3_rewind(s);
+    psp_ret(s ? 0 : MP3_ERROR_HANDLE);
+}
+static void hle_Mp3GetSumDecodedSample(void) {
+    mp3_stream *s = mp3_of(psp_arg(0));
+    psp_ret(s ? (uint32_t)s->decoded : MP3_ERROR_HANDLE);
+}
+static void hle_Mp3GetSamplingRate(void) { mp3_stream *s = mp3_of(psp_arg(0)); psp_ret(s ? (uint32_t)s->rate : MP3_ERROR_HANDLE); }
+static void hle_Mp3GetMp3ChannelNum(void) { mp3_stream *s = mp3_of(psp_arg(0)); psp_ret(s ? (uint32_t)s->channels : MP3_ERROR_HANDLE); }
+static void hle_Mp3GetBitRate(void) { mp3_stream *s = mp3_of(psp_arg(0)); psp_ret(s ? (uint32_t)s->bitrate : MP3_ERROR_HANDLE); }
+static void hle_Mp3GetMaxOutputSample(void) {
+    mp3_stream *s = mp3_of(psp_arg(0));
+    psp_ret(s ? (s->rate >= 32000 ? 1152u : 576u) : MP3_ERROR_HANDLE);
+}
+#else
+static void hle_Mp3Missing(void) { psp_ret(MP3_ERROR_NOT_READY); }
+#define hle_Mp3InitResource hle_Mp3Missing
+#define hle_Mp3TermResource hle_Mp3Missing
+#define hle_Mp3ReserveMp3Handle hle_Mp3Missing
+#define hle_Mp3ReleaseMp3Handle hle_Mp3Missing
+#define hle_Mp3GetInfoToAddStreamData hle_Mp3Missing
+#define hle_Mp3NotifyAddStreamData hle_Mp3Missing
+#define hle_Mp3CheckStreamDataNeeded hle_Mp3Missing
+#define hle_Mp3Init hle_Mp3Missing
+#define hle_Mp3Decode hle_Mp3Missing
+#define hle_Mp3SetLoopNum hle_Mp3Missing
+#define hle_Mp3ResetPlayPosition hle_Mp3Missing
+#define hle_Mp3GetSumDecodedSample hle_Mp3Missing
+#define hle_Mp3GetSamplingRate hle_Mp3Missing
+#define hle_Mp3GetMp3ChannelNum hle_Mp3Missing
+#define hle_Mp3GetBitRate hle_Mp3Missing
+#define hle_Mp3GetMaxOutputSample hle_Mp3Missing
+#endif
+
 void psp_mpeg_init(void) {}
 
 void psp_mpeg_register(void) {
@@ -674,4 +966,20 @@ void psp_mpeg_register(void) {
     psp_hle_register(0x4571CC64, "sceMpeg", "sceMpegAvcDecodeFlush",          hle_AvcDecodeFlush);
     psp_hle_register(0x800C44DF, "sceMpeg", "sceMpegAtracDecode",             hle_AtracDecode);
     psp_hle_register(0x707B7629, "sceMpeg", "sceMpegFlushAllStream",          hle_FlushAllStream);
+    psp_hle_register(0x35750070, "sceMp3", "sceMp3InitResource",            hle_Mp3InitResource);
+    psp_hle_register(0x3C2FA058, "sceMp3", "sceMp3TermResource",            hle_Mp3TermResource);
+    psp_hle_register(0x07EC321A, "sceMp3", "sceMp3ReserveMp3Handle",        hle_Mp3ReserveMp3Handle);
+    psp_hle_register(0xF5478233, "sceMp3", "sceMp3ReleaseMp3Handle",        hle_Mp3ReleaseMp3Handle);
+    psp_hle_register(0xA703FE0F, "sceMp3", "sceMp3GetInfoToAddStreamData",  hle_Mp3GetInfoToAddStreamData);
+    psp_hle_register(0x0DB149F4, "sceMp3", "sceMp3NotifyAddStreamData",     hle_Mp3NotifyAddStreamData);
+    psp_hle_register(0xD0A56296, "sceMp3", "sceMp3CheckStreamDataNeeded",   hle_Mp3CheckStreamDataNeeded);
+    psp_hle_register(0x44E07129, "sceMp3", "sceMp3Init",                    hle_Mp3Init);
+    psp_hle_register(0xD021C0FB, "sceMp3", "sceMp3Decode",                  hle_Mp3Decode);
+    psp_hle_register(0x3CEF484F, "sceMp3", "sceMp3SetLoopNum",              hle_Mp3SetLoopNum);
+    psp_hle_register(0x2A368661, "sceMp3", "sceMp3ResetPlayPosition",       hle_Mp3ResetPlayPosition);
+    psp_hle_register(0x354D27EA, "sceMp3", "sceMp3GetSumDecodedSample",     hle_Mp3GetSumDecodedSample);
+    psp_hle_register(0x8F450998, "sceMp3", "sceMp3GetSamplingRate",         hle_Mp3GetSamplingRate);
+    psp_hle_register(0x7F696782, "sceMp3", "sceMp3GetMp3ChannelNum",        hle_Mp3GetMp3ChannelNum);
+    psp_hle_register(0x87677E40, "sceMp3", "sceMp3GetBitRate",              hle_Mp3GetBitRate);
+    psp_hle_register(0x87C263D1, "sceMp3", "sceMp3GetMaxOutputSample",      hle_Mp3GetMaxOutputSample);
 }

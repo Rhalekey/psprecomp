@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 
 #ifdef _WIN32
@@ -412,38 +413,118 @@ static void hle_Dopen(void) {
     psp_ret(0x80010018);
 }
 
-/* Fill a SceIoDirent. Only the name is populated: games use Dread to enumerate
- * save slots and asset directories by name, and a wrong stat block would be
- * worse than an empty one. */
+/* A ScePspDateTime: year, month, day, hour, minute, second as 16 bits, then microseconds. */
+static void put_date(uint32_t at, time_t t) {
+    struct tm tm;
+#ifdef _WIN32
+    if (localtime_s(&tm, &t) != 0) return;
+#else
+    if (!localtime_r(&t, &tm)) return;
+#endif
+    psp_write16(at + 0, (uint16_t)(tm.tm_year + 1900));
+    psp_write16(at + 2, (uint16_t)(tm.tm_mon + 1));
+    psp_write16(at + 4, (uint16_t)tm.tm_mday);
+    psp_write16(at + 6, (uint16_t)tm.tm_hour);
+    psp_write16(at + 8, (uint16_t)tm.tm_min);
+    psp_write16(at + 10, (uint16_t)tm.tm_sec);
+    psp_write32(at + 12, 0);
+}
+
+/* A Memory Stick's names of an entry, when the game gives a SceIoDirent's d_private: as FAT keeps
+ * them, the short 8.3 name in capitals at 4, which a game may read the extension from, and the long
+ * name at 20, its size first saying how much room there is. The short one is made as FAT makes it:
+ * a name that does not fit 8.3 becomes its first six letters and digits, ~1, and three of its
+ * extension. */
+#define MS_PRIVATE_SHORT 4u
+#define MS_PRIVATE_LONG 20u
+static void put_ms_names(uint32_t private_at, const char *name) {
+    if (!private_at || !name[0] || name[0] == '.') return;
+    const uint32_t size = psp_read32(private_at);
+    if (size < MS_PRIVATE_LONG + 1 || size > 0x10000) return;
+    const char *dot = strrchr(name, '.');
+    const size_t base_len = dot ? (size_t)(dot - name) : strlen(name), ext_len = dot ? strlen(dot + 1) : 0;
+    char base[9] = {0}, ext[4] = {0}, shortname[13];
+    int fits = base_len <= 8 && ext_len <= 3, n = 0;
+    for (size_t i = 0; i < base_len; i++) {
+        const unsigned char c = (unsigned char)name[i];
+        const int plain = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '-';
+        if (!plain) fits = 0;
+        if (plain && n < (fits ? 8 : 6)) base[n++] = (char)(c >= 'a' && c <= 'z' ? c - 32 : c);
+    }
+    if (!fits) {
+        if (n > 6) n = 6;
+        base[n++] = '~';
+        base[n++] = '1';
+        base[n] = 0;
+    }
+    for (size_t i = 0, k = 0; i < ext_len && k < 3; i++) {
+        const unsigned char c = (unsigned char)dot[1 + i];
+        if (c != ' ') ext[k++] = (char)(c >= 'a' && c <= 'z' ? c - 32 : c);
+    }
+    snprintf(shortname, sizeof shortname, ext[0] ? "%s.%s" : "%s", base, ext);
+    for (uint32_t i = 0; i < 13; i++) psp_write8(private_at + MS_PRIVATE_SHORT + i, i < strlen(shortname) ? (uint8_t)shortname[i] : 0);
+    const uint32_t room = size - MS_PRIVATE_LONG - 1;
+    uint32_t i = 0;
+    for (; i < room && name[i]; i++) psp_write8(private_at + MS_PRIVATE_LONG + i, (uint8_t)name[i]);
+    psp_write8(private_at + MS_PRIVATE_LONG + i, 0);
+}
+
+/* Fill a SceIoDirent: its SceIoStat, 88 bytes as sceIoGetstat fills it (whether
+ * it is a folder or a file, its size, its time), then the name. A game listing a
+ * folder for files, as of music, tells them from folders by the mode. */
 static void hle_Dread(void) {
     int32_t id = (int32_t)psp_arg(0) - 1;
     uint32_t dirent = psp_arg(1);
     if (id < 0 || id >= MAX_DIRS || !g_dir[id].used) { psp_ret(0x80020323); return; }
 
     const char *name = NULL;
+    int is_dir = 0;
+    uint64_t size = 0;
+    time_t when = 0;
 #ifdef _WIN32
-    if (g_dir[id].done) { psp_ret(0); return; }
-    if (g_dir[id].first) {
-        g_dir[id].first = 0;
-        name = g_dir[id].data.name;
-    } else if (_findnext(g_dir[id].handle, &g_dir[id].data) == 0) {
-        name = g_dir[id].data.name;
-    } else {
-        g_dir[id].done = 1;
-        psp_ret(0);
-        return;
-    }
+    /* "." and ".." are left out: a game listing a folder for files shows them as folders with
+     * no name, and neither leads anywhere it wants. */
+    do {
+        if (g_dir[id].done) { psp_ret(0); return; }
+        if (g_dir[id].first) {
+            g_dir[id].first = 0;
+            name = g_dir[id].data.name;
+        } else if (_findnext(g_dir[id].handle, &g_dir[id].data) == 0) {
+            name = g_dir[id].data.name;
+        } else {
+            g_dir[id].done = 1;
+            psp_ret(0);
+            return;
+        }
+    } while (!strcmp(name, ".") || !strcmp(name, ".."));
+    is_dir = (g_dir[id].data.attrib & _A_SUBDIR) != 0;
+    size = (uint64_t)g_dir[id].data.size;
+    when = (time_t)g_dir[id].data.time_write;
 #else
-    struct dirent *de = readdir(g_dir[id].dir);
-    if (!de) { psp_ret(0); return; }
-    name = de->d_name;
+    struct dirent *de;
+    do {
+        de = readdir(g_dir[id].dir);
+        if (!de) { psp_ret(0); return; }
+        name = de->d_name;
+    } while (!strcmp(name, ".") || !strcmp(name, ".."));
+    is_dir = de->d_type == DT_DIR;
 #endif
 
-    /* SceIoDirent: a 52-byte SceIoStat, then char d_name[256]. */
-    for (int i = 0; i < 52; i++) psp_write8(dirent + (uint32_t)i, 0);
-    uint32_t at = dirent + 52;
+    /* SceIoDirent: an 88-byte SceIoStat, then char d_name[256]. */
+    for (uint32_t i = 0; i < SCE_IO_STAT_SIZE; i++) psp_write8(dirent + i, 0);
+    psp_write32(dirent, (is_dir ? 0x1000u : 0x2000u) | 0x1FFu);
+    psp_write32(dirent + 4, is_dir ? 0x10u : 0x20u);
+    psp_write32(dirent + 8, (uint32_t)size);
+    psp_write32(dirent + 12, (uint32_t)(size >> 32));
+    if (when) {
+        put_date(dirent + 16, when);
+        put_date(dirent + 32, when);
+        put_date(dirent + 48, when);
+    }
+    uint32_t at = dirent + SCE_IO_STAT_SIZE;
     for (uint32_t i = 0; i < 255 && name[i]; i++) psp_write8(at + i, (uint8_t)name[i]);
     psp_write8(at + (uint32_t)strlen(name), 0);
+    put_ms_names(psp_read32(dirent + SCE_IO_STAT_SIZE + 256), name);
 
     psp_ret(1);                       /* more entries may follow */
 }

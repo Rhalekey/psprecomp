@@ -96,11 +96,15 @@ static void run_osk(uint32_t param) {
 
 void psp_utility_init(void) { memset(g_state, 0, sizeof g_state); }
 
-int psp_utility_savedata_open(void) { return g_state[KIND_SAVEDATA] != 0; }
+/* The save's screen or the keyboard: while either is open, the host may be showing its own screen
+ * over the game's window, which the renderer must then not draw over. */
+int psp_utility_savedata_open(void) { return g_state[KIND_SAVEDATA] != 0 || g_state[KIND_OSK] != 0; }
 
 static void dialog_init(int kind, const char *name) {
     const uint32_t param = psp_arg(0);
     uint32_t result = 0;
+    /* Open before the host's screen shows, so that the renderer leaves the window to it. */
+    g_state[kind] = ST_INIT;
     if (kind == KIND_SAVEDATA) {
         result = psp_savedata_run(param);
     } else if (kind == KIND_MSGDIALOG) {

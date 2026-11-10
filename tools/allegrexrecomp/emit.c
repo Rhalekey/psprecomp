@@ -1472,6 +1472,11 @@ int a_emit(const a_analysis *an, const emit_opts *o) {
     for (i = 0; i < an->nfuncs; i++)
         fprintf(of.f, "    psp_register(0x%08Xu, psp_func_%08X);\n",
                 an->funcs[i].addr, an->funcs[i].addr);
+    /* The firmware's functions too, by their stubs: a game may keep one in a
+     * pointer, as a file reader given sceIoRead, and call it through that. */
+    for (i = 0; i < an->nimports; i++)
+        fprintf(of.f, "    psp_register(0x%08Xu, psp_import_%08X);\n",
+                an->imports[i], an->imports[i]);
     /* Interior labels last, so a real function entry always wins a collision. */
     for (i = 0; i < c.nentries; i++)
         fprintf(of.f, "    psp_register_label(0x%08Xu, psp_at_%08X);\n",
