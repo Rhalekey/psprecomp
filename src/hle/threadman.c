@@ -144,6 +144,7 @@ typedef struct {
     uint32_t attr;
     uint32_t arglen;       /* sceKernelStartThread arguments, held for the host */
     uint32_t argp;
+    uint32_t args_at;      /* where they were copied on its stack, or 0 */
     uint32_t gp;           /* the creator's $gp, which the thread starts with */
     int      state;
     uint32_t exit_status;
@@ -202,6 +203,7 @@ typedef struct {
     uint32_t uid;
     char     name[32];
     uint32_t pattern;
+    uint32_t attr, initial;
     int      used;
 } psp_evflag;
 
@@ -990,6 +992,8 @@ static void *guest_thread_main(void *arg) {
     /* Stack pointer starts at the top of the allocation, 16-byte aligned, with
      * a little headroom so a callee storing below $sp cannot run off the end. */
     set_thread_stack(t);
+    /* Its stack starts below the arguments copied to its top. */
+    if (t->args_at) psp_cpu.r[PSP_REG_SP] = t->args_at;
     psp_cpu.r[PSP_REG_RA] = 0;
 
     t->state = TH_RUNNING;
@@ -1145,6 +1149,19 @@ static void hle_StartThread(void) {
 
     t->arglen = psp_arg(1);
     t->argp   = psp_arg(2);
+    /* As the firmware does, the arguments are copied to the top of the new thread's stack, under
+     * its thread block, and it is given that copy: a caller passing something on its own stack may
+     * have returned, and that stack been used again, before the new thread runs and reads it. */
+    t->args_at = 0;
+    if (t->argp && t->arglen && t->arglen <= 0x1000 && t->stack_base) {
+        const uint32_t block = (t->stack_base + t->stack_size - THREAD_BLOCK_SIZE) & ~15u;
+        const uint32_t at = (block - t->arglen) & ~15u;
+        uint8_t copy[0x1000];
+        if (psp_mem_read_block(copy, t->argp, t->arglen) == 0 && psp_mem_write_block(at, copy, t->arglen) == 0) {
+            t->argp = at;
+            t->args_at = at;
+        }
+    }
     t->state  = TH_READY;
     /* Set before the host thread exists, so a park that happens between here and
      * the new thread's first acquisition hands the CPU over instead of racing
@@ -1499,6 +1516,8 @@ static void hle_CreateEventFlag(void) {
     memset(f, 0, sizeof *f);
     psp_str(psp_arg(0), f->name, sizeof f->name);
     f->pattern = psp_arg(2);
+    f->attr = psp_arg(1);
+    f->initial = psp_arg(2);
     f->uid = g_next_uid++;
     f->used = 1;
     psp_ret(f->uid);
@@ -1561,6 +1580,56 @@ static void hle_PollEventFlag(void) {
     if (out) psp_write32(out, f->pattern);
     if (!flag_ready(&c)) { psp_ret(SCE_KERNEL_ERROR_EVF_COND); return; }
     if (c.mode & PSP_EVENT_WAITCLEAR) f->pattern &= ~c.bits;
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* (evfid, info): the flag as SceKernelEventFlagInfo has it: its size, name, attributes, first
+ * and current bits, and how many threads wait on it. A game that polls this in a loop gets the
+ * CPU handed over now and then, so that whoever is to set the flag can run. */
+static void hle_ReferEventFlagStatus(void) {
+    psp_evflag *f = find_flag(psp_arg(0));
+    if (!f) { psp_ret(SCE_KERNEL_ERROR_UNKNOWN_UID); return; }
+    const uint32_t info = psp_arg(1);
+    if (info) {
+        psp_write32(info + 0, 52);
+        for (uint32_t i = 0; i < 32; i++) psp_write8(info + 4 + i, (uint8_t)f->name[i]);
+        psp_write32(info + 36, f->attr);
+        psp_write32(info + 40, f->initial);
+        psp_write32(info + 44, f->pattern);
+        psp_write32(info + 48, 0);
+    }
+    static unsigned polls;
+    if (++polls % 8 == 0) psp_threadman_yield();
+    psp_ret(SCE_KERNEL_ERROR_OK);
+}
+
+/* (thid, info): the thread as SceKernelThreadInfo has it, 104 bytes. 0 is the caller. Polled in a
+ * loop, as a game waiting for a thread to end does, it hands the CPU over now and then. */
+static void hle_ReferThreadStatus(void) {
+    psp_thread *t = psp_arg(0) ? find_thread(psp_arg(0)) : g_tls_me;
+    if (!t) { psp_ret(SCE_KERNEL_ERROR_ILLEGAL_THID); return; }
+    const uint32_t info = psp_arg(1);
+    if (info) {
+        /* The console's: running 1, ready 2, waiting 4, suspended 8, dormant 0x10. */
+        uint32_t status = 0x10;
+        if (t->state == TH_RUNNING) status = t->waiting ? 4 : 1;
+        else if (t->state == TH_READY) status = 2;
+        else if (t->state == TH_SUSPENDED) status = 8;
+        for (uint32_t i = 0; i < 104; i += 4) psp_write32(info + i, 0);
+        psp_write32(info + 0, 104);
+        for (uint32_t i = 0; i < 32; i++) psp_write8(info + 4 + i, (uint8_t)t->name[i]);
+        psp_write32(info + 36, t->attr);
+        psp_write32(info + 40, status);
+        psp_write32(info + 44, t->entry);
+        psp_write32(info + 48, t->stack_base);
+        psp_write32(info + 52, t->stack_size);
+        psp_write32(info + 56, t->gp);
+        psp_write32(info + 60, t->priority);
+        psp_write32(info + 64, t->priority);
+        psp_write32(info + 80, t->exit_status);
+    }
+    static unsigned polls;
+    if (++polls % 8 == 0) psp_threadman_yield();
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
@@ -1903,6 +1972,8 @@ void psp_threadman_register(void) {
     psp_hle_register(0x328C546A, "ThreadManForUser", "sceKernelWaitEventFlagCB",         hle_WaitEventFlag);
     psp_hle_register(0x402FCF22, "ThreadManForUser", "sceKernelWaitEventFlag",           hle_WaitEventFlag);
     psp_hle_register(0x30FD48F0, "ThreadManForUser", "sceKernelPollEventFlag",           hle_PollEventFlag);
+    psp_hle_register(0xA66B0120, "ThreadManForUser", "sceKernelReferEventFlagStatus",    hle_ReferEventFlagStatus);
+    psp_hle_register(0x17C1684E, "ThreadManForUser", "sceKernelReferThreadStatus",       hle_ReferThreadStatus);
 
     psp_hle_register(0x56C039B5, "ThreadManForUser", "sceKernelCreateVpl",               hle_CreateVpl);
     psp_hle_register(0x89B3D48C, "ThreadManForUser", "sceKernelDeleteVpl",               hle_DeleteVpl);

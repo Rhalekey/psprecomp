@@ -243,4 +243,6 @@ void psp_hle_init(void) {
     psp_utility_register();
     psp_power_init();
     psp_power_register();
+    psp_mpeg_init();
+    psp_mpeg_register();
 }

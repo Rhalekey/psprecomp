@@ -226,6 +226,14 @@ void psp_utility_register(void);
 void psp_sync_init(void);
 void psp_sync_register(void);
 
+/* Told of each sceDmacMemcpy, (destination, size), as a renderer must be: a buffer it drew may
+ * have been filled with a copy since. Set by the renderer. */
+extern void (*psp_on_dmac_copy)(uint32_t dst, uint32_t size);
+
+void psp_mpeg_init(void);
+void psp_mpeg_register(void);
+/* Whether movies can play: FFmpeg's decoders were found beside the executable. */
+int psp_mpeg_available(void);
 void psp_misc_init(void);
 void psp_misc_register(void);
 void psp_misc_reset(void);

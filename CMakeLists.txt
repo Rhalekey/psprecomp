@@ -56,6 +56,7 @@ add_library(psprecomp STATIC
     src/hle/sync.c
     src/hle/utility.c
     src/hle/savedata.c
+    src/hle/mpeg.c
 )
 
 target_include_directories(psprecomp PUBLIC
@@ -65,6 +66,14 @@ target_include_directories(psprecomp PUBLIC
 # Runtime VFPU helpers use libm on Unix; propagate it to static-library users.
 if(UNIX)
     target_link_libraries(psprecomp PUBLIC m)
+endif()
+
+# FFmpeg's headers, for movies: its DLLs are loaded at run time, so only the headers are needed
+# here, and without them movies are left out.
+set(PSPRECOMP_FFMPEG_INCLUDE "" CACHE PATH "FFmpeg's include folder, for sceMpeg")
+if(PSPRECOMP_FFMPEG_INCLUDE AND EXISTS "${PSPRECOMP_FFMPEG_INCLUDE}/libavcodec/avcodec.h")
+    target_include_directories(psprecomp PRIVATE "${PSPRECOMP_FFMPEG_INCLUDE}")
+    target_compile_definitions(psprecomp PRIVATE PSPRECOMP_FFMPEG)
 endif()
 
 # Real scheduling is experimental; the existing inline model stays the default.

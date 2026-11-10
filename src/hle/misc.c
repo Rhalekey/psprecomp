@@ -369,6 +369,20 @@ static void hle_VaudioReserve(void) { g_vaudio_samples = psp_arg(0); psp_ret(0);
 static void hle_VaudioRelease(void) { g_vaudio_samples = 0; psp_ret(0); }
 static void hle_VaudioBlocking(void) { pace_stream(1, g_vaudio_samples); }
 
+/* ---- sceDmac: (dst, src, size), a copy the console makes with its DMA. Done at once here. ---- */
+void (*psp_on_dmac_copy)(uint32_t dst, uint32_t size);
+
+static void hle_DmacMemcpy(void) {
+    const uint32_t dst = psp_arg(0), src = psp_arg(1), size = psp_arg(2);
+    void *to = size ? psp_mem_ptr(dst, size) : NULL;
+    const void *from = size ? psp_mem_ptr(src, size) : NULL;
+    if (!size) { psp_ret(0); return; }
+    if (!to || !from) { psp_ret(0x80000023u); return; }   /* SCE_KERNEL_ERROR_ILLEGAL_ADDR */
+    memmove(to, from, size);
+    if (psp_on_dmac_copy) psp_on_dmac_copy(dst, size);
+    psp_ret(0);
+}
+
 /* ---- sceRtc -------------------------------------------------------------- *
  * Real time. These are what a game polls in a loop while another thread does
  * something, and nothing preempts a thread here, so every so often a poll gives
@@ -534,6 +548,7 @@ void psp_misc_register(void) {
     psp_hle_register(0x01562BA3, "sceAudio", "sceAudioOutput2Reserve",        hle_Output2Reserve);
     psp_hle_register(0x43196845, "sceAudio", "sceAudioOutput2Release",        hle_Output2Release);
     psp_hle_register(0x2D53F36E, "sceAudio", "sceAudioOutput2OutputBlocking", hle_Output2Blocking);
+    psp_hle_register(0x617F3FE6, "sceDmac", "sceDmacMemcpy",              hle_DmacMemcpy);
     psp_hle_register(0x03B6807D, "sceVaudio", "sceVaudioChReserve",      hle_VaudioReserve);
     psp_hle_register(0x67585DFD, "sceVaudio", "sceVaudioChRelease",      hle_VaudioRelease);
     psp_hle_register(0x8986295E, "sceVaudio", "sceVaudioOutputBlocking", hle_VaudioBlocking);

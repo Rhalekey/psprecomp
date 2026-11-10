@@ -34,6 +34,7 @@
 #define LOGICAL 512
 #define PSP_W   480
 #define PSP_H   272
+#define PSP_FB_BYTES (512u * 272u * 4u)   /* a whole buffer at its widest: 512 pixels to a row, 32 bits */
 
 /* With the wide canvas on, everything is drawn in the middle of a larger target, so that what
  * the 3D scene has past the PSP's screen lands somewhere. These are what shapes it can reach. */
@@ -223,6 +224,7 @@ typedef struct {
     GLuint fbo, color, depth;
     uint64_t last_used;
     int shown;       /* has been on screen, so is the game's image and not a texture being made */
+    volatile int cpu_written;   /* filled by a copy since last drawn on, so shown from memory */
 } gl_target;
 
 typedef struct {
@@ -1294,6 +1296,7 @@ static gl_target *get_target(uint32_t addr) {
 static void bind_target(void) {
     gl_target *t = get_target(g_target_addr);
     t->last_used = ++g_tick;
+    t->cpu_written = 0;
     if (g_bound == t) return;
     p_glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
     glViewport(0, 0, g_canvas_w * g_scale, g_canvas_h * g_scale);
@@ -2946,7 +2949,19 @@ static void keep_snapshot(GLuint source_fbo, int source_x, int source_y, int sou
 
 /* Show the buffer at `addr`. The game may have filled it with the CPU rather than
  * by drawing, and then it is only in guest memory. */
+/* A copy into memory, as sceDmacMemcpy makes: a buffer drawn on before that it lands on is the
+ * copy's now, until it is drawn on again. Called from the game's threads. */
+static void gl_cpu_wrote(uint32_t dst, uint32_t size) {
+    if (!in_vram(dst) || !size) return;
+    const uint32_t from = vram_offset(dst), to = from + size;
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        gl_target *t = &g_targets[i];
+        if (t->used && from < t->addr + PSP_FB_BYTES && to > t->addr) t->cpu_written = 1;
+    }
+}
+
 static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
+    if (!psp_on_dmac_copy) psp_on_dmac_copy = gl_cpu_wrote;
     GLuint source;
     int source_x = 0, source_y = 0, source_w, source_h;
     GLenum filter;
@@ -3000,6 +3015,9 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
     glDisable(GL_SCISSOR_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
+    /* A buffer the game last filled with a copy, as a movie's pictures, is in memory only, whatever
+     * was drawn on it before. */
+    if (t && t->cpu_written) t = NULL;
     if (t) {
         source = t->fbo;
         t->shown = 1;
@@ -3023,7 +3041,8 @@ static void gl_flip(uint32_t addr, uint32_t stride, int fmt) {
         source = g_vram_fbo;
         source_w = PSP_W;
         source_h = PSP_H;
-        filter = GL_NEAREST;
+        /* Enlarged as a drawn picture is, smooth if the player chose smoothing: a movie is shown so. */
+        filter = g_present_linear ? GL_LINEAR : GL_NEAREST;
     }
 
     if (InterlockedExchange(&g_snapshot_asked, 0)) keep_snapshot(source, source_x, source_y, source_w, source_h);
