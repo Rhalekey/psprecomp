@@ -426,7 +426,8 @@ static void widen_frame_piece(int kind, int n, float left, float right, float to
  * before the game's first hint, as one more of them.
  * The hints at the bottom of the screen are put side by side at those widths, ending where the last
  * one did, and the band starts FOOTER_BAND_LEAD before the first, so that it always just holds them.
- * Only screens with the band are laid out again, so the editor keeps its own layout.
+ * Only screens with the band are laid out again. The editor's footer has none, and runs along like
+ * a ticker: there each hint only moves right as far as the words before it grew (footer_tick).
  *
  * The game draws the band before the hints, and while the hints change it draws a frame or two with
  * some of them missing, or moves the band. So nothing is worked out from the frame being drawn:
@@ -498,6 +499,28 @@ void psp_render_gl_keep_in_place(uint32_t colours) {
 
 /* What this frame drew, and what has been learnt. */
 static footer_place g_footer_hints_now[FOOTER_HINTS], g_footer_bands_now[FOOTER_BANDS];
+/* A footer with no band, as the editor's, whose hints run along like a ticker: each hint is moved
+ * right by as much as the words before it grew, worked out at the end of a frame for the next. A
+ * hint keeps what it was moved by while it is on the screen, so nothing jumps as hints come and go:
+ * the ticker's own wide gaps take up what they grew by. */
+#define FOOTER_TICK_NEAR 8.0f
+typedef struct {
+    int piece;
+    float left, push;
+} footer_tick;
+static footer_tick g_footer_ticks[FOOTER_HINTS];
+static int g_footer_ticks_n;
+static float footer_tick_push(int piece, float left) {
+    float push = 0.0f, nearest = FOOTER_TICK_NEAR;
+    for (int i = 0; i < g_footer_ticks_n; i++) {
+        const float d = fabsf(g_footer_ticks[i].left - left);
+        if (g_footer_ticks[i].piece == piece && d < nearest) {
+            nearest = d;
+            push = g_footer_ticks[i].push;
+        }
+    }
+    return push;
+}
 static int g_footer_hints_n, g_footer_bands_n, g_footer_band_now;
 static footer_place g_footer_places[FOOTER_PLACES];
 static int g_footer_places_n, g_footer_places_next;
@@ -811,7 +834,7 @@ static int footer_piece_drawn(gl_vertex *q, float sheet_h, int n, int *handled) 
     if (top < FOOTER_TOP) return n;
     *handled = 1;
     if (g_footer_hints_n < FOOTER_HINTS) g_footer_hints_now[g_footer_hints_n++] = (footer_place){found, left, left, 0};
-    const float to = place ? place->to : left;
+    const float to = !g_footer_band_now ? left + footer_tick_push(found, left) : place ? place->to : left;
     const float scale = (right - left) / p->w, scale_down = (bottom - top) / p->h, middle_x = (left + right) / 2.0f;
     const float middle_u = (u_low + u_high) / 2.0f;
     g_footer_hint_scale = scale;
@@ -963,7 +986,36 @@ static void plan_footer(void) {
         fprintf(stderr, "gl: footer of %d hints laid out, band moved %.1f\n", n, shift);
         if (g_footer_store_dirty) footer_store_write();
     }
-    if (!g_footer_band_now) g_footer_shift = 0.0f;
+    if (!g_footer_band_now) {
+        /* A ticker's hints, left to right: each starts no sooner than the words before it end, with
+         * the game's gap between them up to FOOTER_GAP, and never moves back while it is shown. */
+        footer_place t[FOOTER_HINTS];
+        const int tn = g_footer_hints_n;
+        memcpy(t, g_footer_hints_now, sizeof(footer_place) * (size_t)tn);
+        for (int i = 1; i < tn; i++) {
+            for (int j = i; j > 0 && t[j].left < t[j - 1].left; j--) {
+                const footer_place kept = t[j];
+                t[j] = t[j - 1];
+                t[j - 1] = kept;
+            }
+        }
+        footer_tick next[FOOTER_HINTS];
+        const float scale = g_footer_hint_scale;
+        for (int i = 0; i < tn; i++) {
+            float push = fmaxf(0.0f, footer_tick_push(t[i].piece, t[i].left));
+            if (i > 0) {
+                const footer_piece *before = &g_footer_pieces[next[i - 1].piece];
+                const float gap = fminf(fmaxf(0.0f, t[i].left - next[i - 1].left - before->w * scale), FOOTER_GAP * scale);
+                push = fmaxf(push, next[i - 1].left + next[i - 1].push + before->nw * scale + gap - t[i].left);
+            }
+            next[i] = (footer_tick){t[i].piece, t[i].left, push};
+        }
+        memcpy(g_footer_ticks, next, sizeof(footer_tick) * (size_t)tn);
+        g_footer_ticks_n = tn;
+        g_footer_shift = 0.0f;
+    } else {
+        g_footer_ticks_n = 0;
+    }
     g_footer_hints_n = 0;
     g_footer_bands_n = 0;
     g_footer_band_now = 0;
