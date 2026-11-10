@@ -237,6 +237,9 @@ enum { PSP_SAVE_CHOOSE_LOAD, PSP_SAVE_CHOOSE_SAVE, PSP_SAVE_CHOOSE_DELETE };
  * With none set, or for the default, a load takes the first slot with data and a save that slot or
  * the first. */
 #define PSP_SAVE_CHOOSE_DEFAULT (-2)
+/* Or PSP_SAVE_CHOOSE_AGAIN, when the host has changed what the slots hold: they are read again and
+ * the host asked again. */
+#define PSP_SAVE_CHOOSE_AGAIN (-3)
 typedef int (*psp_savedata_chooser_fn)(int purpose, const psp_save_slot *slots, int count, const char *new_title,
                                        const char *new_detail);
 void psp_savedata_set_chooser(psp_savedata_chooser_fn fn);

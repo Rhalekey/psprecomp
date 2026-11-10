@@ -263,7 +263,7 @@ static int read_slots(uint32_t param) {
  * backed out, -1 if there is no one to ask, when the first that will do is taken as before. */
 static int ask_slot(uint32_t param, int purpose, char *save, size_t cap, int least) {
     if (!g_chooser) return -1;
-    const int count = read_slots(param);
+    int count = read_slots(param);
     fprintf(stderr, "savedata: a list of %d to choose from, its names at %08X\n", count, psp_read32(param + P_NAMELIST));
     if (count < least) return -1;
     char title[129], detail[1025];
@@ -273,7 +273,12 @@ static int ask_slot(uint32_t param, int purpose, char *save, size_t cap, int lea
         copy_text(title, sizeof title, sfo + SFO_TITLE, SFO_DETAIL - SFO_TITLE);
         copy_text(detail, sizeof detail, sfo + SFO_DETAIL, SFO_SIZE - SFO_DETAIL);
     }
-    const int chosen = g_chooser(purpose, g_slots, count, title, detail);
+    int chosen = g_chooser(purpose, g_slots, count, title, detail);
+    /* The host may have changed what the slots hold, as by bringing saves in: read again, ask again. */
+    for (int again = 0; chosen == PSP_SAVE_CHOOSE_AGAIN && again < 8; again++) {
+        count = read_slots(param);
+        chosen = g_chooser(purpose, g_slots, count, title, detail);
+    }
     if (chosen == PSP_SAVE_CHOOSE_DEFAULT) return -1;
     if (chosen < 0 || chosen >= count) {
         fprintf(stderr, "savedata: the player backed out of the list\n");
