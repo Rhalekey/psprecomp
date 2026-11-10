@@ -4,8 +4,9 @@
  * Stick, except that nothing is encrypted: the game's data file is exactly what it
  * passed in. The description the system would show goes in SFO.BIN.
  *
- * There is no list screen yet. Where a player would choose a slot, a load takes the
- * first slot holding data and a save takes that same slot, or else the first one.
+ * Where a player would choose a slot from a list of more than one, the host's chooser is asked
+ * (psp_savedata_set_chooser). Without one, or for a list of one, a load takes the first slot
+ * holding data and a save takes that same slot, or else the first one.
  *
  * Structure offsets are from the pspsdk's psputility_savedata.h.
  */
@@ -17,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -71,10 +73,14 @@ static void report_event(int event) {
 
 static const char *const EXTRA_FILE[4] = { "ICON0.PNG", "ICON1.PMF", "PIC1.PNG", "SND0.AT3" };
 
-/* The save's folder on the host, for a name read out of guest memory. */
+static char g_game[14];   /* the game's name, as the last request that gave one had it */
+
+/* The save's folder on the host, for a name read out of guest memory. A request that names no
+ * game, as a list of all saves, is the game that asked before. */
 static void slot_dir(uint32_t param, const char *save, char *out, size_t cap) {
     char game[14], guest[128];
     psp_str(param + P_GAME, game, sizeof game);
+    if (!game[0]) snprintf(game, sizeof game, "%s", g_game);
     snprintf(guest, sizeof guest, "ms0:/PSP/SAVEDATA/%s%s", game, save);
     psp_io_host_path(guest, out, cap);
 }
@@ -127,18 +133,20 @@ static int read_file(const char *dir, const char *name, uint32_t addr, uint32_t 
     return (int)got;
 }
 
+/* Every file in the save's folder, then the folder: a save deleted from a list of all may have
+ * been made with another data file's name than the one the game passes now. */
 static void delete_slot(uint32_t param, const char *dir) {
-    char path[1200], file[14];
-    psp_str(param + P_FILE, file, sizeof file);
-    if (file[0]) {
-        snprintf(path, sizeof path, "%s/%s", dir, file);
-        remove(path);
-    }
-    snprintf(path, sizeof path, "%s/SFO.BIN", dir);
-    remove(path);
-    for (int i = 0; i < 4; i++) {
-        snprintf(path, sizeof path, "%s/%s", dir, EXTRA_FILE[i]);
-        remove(path);
+    (void)param;
+    char path[1200];
+    DIR *d = opendir(dir);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+            snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+            remove(path);
+        }
+        closedir(d);
     }
     remove_dir(dir);
 }
@@ -159,6 +167,120 @@ static int pick_slot(uint32_t param, int need_data, char *save, size_t cap) {
     }
     if (need_data || !first[0]) return 0;
     snprintf(save, cap, "%s", first);
+    return 1;
+}
+
+/* ---- the list a player chooses from ---------------------------------------- */
+#define SFO_TITLE 0x80u      /* in SceUtilitySavedataSFOParam: the game's title, then the save's */
+#define SFO_DETAIL 0x100u
+#define DIALOG_CANCEL 1u     /* a list the player backed out of */
+
+static psp_savedata_chooser_fn g_chooser;
+void psp_savedata_set_chooser(psp_savedata_chooser_fn fn) { g_chooser = fn; }
+
+static psp_save_slot g_slots[MAX_SLOTS];
+
+static void copy_text(char *out, size_t cap, const uint8_t *from, size_t size) {
+    size_t n = 0;
+    while (n + 1 < cap && n < size && from[n]) {
+        out[n] = (char)from[n];
+        n++;
+    }
+    out[n] = '\0';
+}
+
+/* A slot's title, detail and time, from the SFO.BIN in its folder. */
+static void fill_slot(uint32_t param, psp_save_slot *s) {
+    s->used = slot_exists(param, s->name);
+    if (!s->used) return;
+    char dir[1024], path[1200];
+    slot_dir(param, s->name, dir, sizeof dir);
+    snprintf(path, sizeof path, "%s/SFO.BIN", dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    uint8_t sfo[SFO_SIZE];
+    const size_t got = fread(sfo, 1, sizeof sfo, f);
+    fclose(f);
+    if (got > SFO_DETAIL) {
+        copy_text(s->title, sizeof s->title, sfo + SFO_TITLE, SFO_DETAIL - SFO_TITLE);
+        copy_text(s->detail, sizeof s->detail, sfo + SFO_DETAIL, got - SFO_DETAIL);
+    }
+    struct stat st;
+    if (stat(path, &st) == 0) s->time = (long long)st.st_mtime;
+}
+
+/* Every save of this game there is, for a list that names none, as the one to delete from among
+ * all (mode 7): the folders whose names begin with the game's. */
+static int read_all_slots(uint32_t param) {
+    char game[14], guest[64], host[1024];
+    psp_str(param + P_GAME, game, sizeof game);
+    /* A list of all saves need not name the game: it is the one that asked before. */
+    if (!game[0]) snprintf(game, sizeof game, "%s", g_game);
+    if (!game[0]) {
+        fprintf(stderr, "savedata: a list of all saves, with no game's name known\n");
+        return 0;
+    }
+    snprintf(guest, sizeof guest, "ms0:/PSP/SAVEDATA");
+    psp_io_host_path(guest, host, sizeof host);
+    DIR *d = opendir(host);
+    if (!d) return 0;
+    const size_t prefix = strlen(game);
+    int count = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && count < MAX_SLOTS) {
+        if (strncmp(e->d_name, game, prefix) != 0 || strlen(e->d_name + prefix) > NAME_SIZE) continue;
+        psp_save_slot *s = &g_slots[count];
+        memset(s, 0, sizeof *s);
+        snprintf(s->name, sizeof s->name, "%s", e->d_name + prefix);
+        fill_slot(param, s);
+        if (s->used) count++;
+    }
+    closedir(d);
+    fprintf(stderr, "savedata: %d saves of %s to choose from\n", count, game);
+    return count;
+}
+
+/* The slots the game named, with what each holds, or all of its saves if it named none. Gives
+ * back how many. */
+static int read_slots(uint32_t param) {
+    const uint32_t list = psp_read32(param + P_NAMELIST);
+    if (!list) return read_all_slots(param);
+    int count = 0;
+    for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+        psp_save_slot *s = &g_slots[count];
+        memset(s, 0, sizeof *s);
+        psp_str(list + i * NAME_SIZE, s->name, sizeof s->name);
+        if (!s->name[0]) break;
+        fill_slot(param, s);
+        count++;
+    }
+    /* A list given with no name in it is a list of all, as one to delete from may be. */
+    if (!count) return read_all_slots(param);
+    return count;
+}
+
+/* The player's choice from a list of more than one, into `save`: 1 if chosen, 0 if the player
+ * backed out, -1 if there is no one to ask, when the first that will do is taken as before. */
+static int ask_slot(uint32_t param, int purpose, char *save, size_t cap, int least) {
+    if (!g_chooser) return -1;
+    const int count = read_slots(param);
+    fprintf(stderr, "savedata: a list of %d to choose from, its names at %08X\n", count, psp_read32(param + P_NAMELIST));
+    if (count < least) return -1;
+    char title[129], detail[1025];
+    const uint8_t *sfo = (const uint8_t *)psp_mem_ptr(param + P_SFO, SFO_SIZE);
+    title[0] = detail[0] = '\0';
+    if (sfo) {
+        copy_text(title, sizeof title, sfo + SFO_TITLE, SFO_DETAIL - SFO_TITLE);
+        copy_text(detail, sizeof detail, sfo + SFO_DETAIL, SFO_SIZE - SFO_DETAIL);
+    }
+    const int chosen = g_chooser(purpose, g_slots, count, title, detail);
+    if (chosen == PSP_SAVE_CHOOSE_DEFAULT) return -1;
+    if (chosen < 0 || chosen >= count) {
+        fprintf(stderr, "savedata: the player backed out of the list\n");
+        return 0;
+    }
+    snprintf(save, cap, "%s", g_slots[chosen].name);
+    fprintf(stderr, "savedata: the player chose %s\n", save);
     return 1;
 }
 
@@ -245,8 +367,10 @@ static void fill_sizes(uint32_t param) {
 
 uint32_t psp_savedata_run(uint32_t param) {
     const uint32_t mode = psp_read32(param + P_MODE);
-    char save[NAME_SIZE + 1];
+    char save[NAME_SIZE + 1], game[14];
     psp_str(param + P_SAVE, save, sizeof save);
+    psp_str(param + P_GAME, game, sizeof game);
+    if (game[0]) snprintf(g_game, sizeof g_game, "%s", game);
     fprintf(stderr, "savedata: mode %u, save \"%s\"\n", mode, save);
 
     switch (mode) {
@@ -261,26 +385,40 @@ uint32_t psp_savedata_run(uint32_t param) {
     case MODE_AUTOLOAD: case MODE_LOAD: case MODE_READDATA: case MODE_READDATASECURE:
         return do_load(param, save);
 
-    case MODE_LISTSAVE:
-        if (!pick_slot(param, 0, save, sizeof save)) return ERROR_SAVE_FAILED;
+    case MODE_LISTSAVE: {
+        const int asked = ask_slot(param, PSP_SAVE_CHOOSE_SAVE, save, sizeof save, 2);
+        if (asked == 0) return DIALOG_CANCEL;
+        if (asked < 0 && !pick_slot(param, 0, save, sizeof save)) return ERROR_SAVE_FAILED;
         put_name(param, save);
+    }
         {
             const uint32_t result = do_save(param, save);
             if (result) report_event(PSP_SAVEDATA_FAILED);
             return result;
         }
 
-    case MODE_LISTLOAD:
-        if (!pick_slot(param, 1, save, sizeof save)) {
+    case MODE_LISTLOAD: {
+        /* With nothing saved there is nothing to choose: the game hears there is no data. */
+        char any[NAME_SIZE + 1];
+        if (!pick_slot(param, 1, any, sizeof any)) {
             report_event(PSP_SAVEDATA_NO_DATA);
             return ERROR_LOAD_NO_DATA;
         }
+        const int asked = ask_slot(param, PSP_SAVE_CHOOSE_LOAD, save, sizeof save, 2);
+        if (asked == 0) return DIALOG_CANCEL;
+        if (asked < 0) snprintf(save, sizeof save, "%s", any);
         put_name(param, save);
         return do_load(param, save);
+    }
 
-    case MODE_LISTDELETE:
-        if (!pick_slot(param, 1, save, sizeof save)) return ERROR_LOAD_NO_DATA;
+    case MODE_LISTDELETE: case MODE_LISTALLDELETE: {
+        /* What is deleted is only ever what the player chose. With nobody to ask, or nothing to
+         * choose from, the game hears there is no data. */
+        const int asked = ask_slot(param, PSP_SAVE_CHOOSE_DELETE, save, sizeof save, 1);
+        if (asked == 0) return DIALOG_CANCEL;
+        if (asked < 0) return ERROR_LOAD_NO_DATA;
         put_name(param, save);
+    }
         /* fall through */
     case MODE_AUTODELETE: case MODE_DELETE: case MODE_DELETEDATA: {
         char dir[1024];

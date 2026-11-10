@@ -4,7 +4,8 @@
  * walks through the states a game polls for and then reports having closed. That
  * is enough to get past one, not to use one, and each is logged so it is visible
  * when a game has asked for something the player never saw. A message answers yes
- * to whatever it asked.
+ * to whatever it asked. The list of saves and the keyboard ask the host (psp_savedata_set_chooser,
+ * psp_utility_set_osk_handler).
  *
  * Saves do their work for real, in savedata.c, and screenshots through the host's handler.
  */
@@ -25,6 +26,7 @@
 #define DIALOG_KINDS 5
 #define KIND_MSGDIALOG 0
 #define KIND_SAVEDATA 1
+#define KIND_OSK 2
 #define KIND_SCREENSHOT 4
 
 /* pspUtilityMsgDialogParams */
@@ -37,8 +39,60 @@
 
 static int g_state[DIALOG_KINDS];
 static void (*g_take_screenshot)(void);
+static psp_osk_fn g_osk;
 
 void psp_utility_set_screenshot_handler(void (*take)(void)) { g_take_screenshot = take; }
+void psp_utility_set_osk_handler(psp_osk_fn fn) { g_osk = fn; }
+
+/* SceUtilityOskParams: after the common block, how many fields and where they are. Each field,
+ * SceUtilityOskData, has its description, the text it starts with, and room for the result. */
+#define OSK_COUNT 0x30u
+#define OSK_DATA 0x34u
+#define OSKD_DESC 28u
+#define OSKD_INTEXT 32u
+#define OSKD_OUTLENGTH 36u
+#define OSKD_OUTTEXT 40u
+#define OSKD_RESULT 44u
+#define OSKD_OUTLIMIT 48u
+#define OSK_RESULT_UNCHANGED 0u
+#define OSK_RESULT_CANCELLED 1u
+#define OSK_RESULT_CHANGED 2u
+#define OSK_MOST 256
+
+static void read_utf16(uint32_t at, uint16_t *out, int cap) {
+    int n = 0;
+    while (at && n + 1 < cap) {
+        const uint16_t c = psp_read16(at + (uint32_t)n * 2);
+        if (!c) break;
+        out[n++] = c;
+    }
+    out[n] = 0;
+}
+
+/* The keyboard's one field (the game asks for one at a time): the host's text, or what it began with. */
+static void run_osk(uint32_t param) {
+    const uint32_t data = psp_read32(param + OSK_DATA);
+    if (!psp_read32(param + OSK_COUNT) || !data) return;
+    uint16_t description[OSK_MOST], initial[OSK_MOST], out[OSK_MOST];
+    read_utf16(psp_read32(data + OSKD_DESC), description, OSK_MOST);
+    read_utf16(psp_read32(data + OSKD_INTEXT), initial, OSK_MOST);
+    const uint32_t room = psp_read32(data + OSKD_OUTLENGTH), outtext = psp_read32(data + OSKD_OUTTEXT);
+    int limit = (int)psp_read32(data + OSKD_OUTLIMIT);
+    if (limit <= 0 || limit > (int)room - 1) limit = (int)room - 1;
+    if (limit > OSK_MOST - 1) limit = OSK_MOST - 1;
+    if (!outtext || limit <= 0) return;
+    int entered = 0;
+    if (g_osk) {
+        memset(out, 0, sizeof out);
+        entered = g_osk(description, initial, limit, out);
+    }
+    const uint16_t *text = entered ? out : initial;
+    int n = 0;
+    for (; n < limit && text[n]; n++) psp_write16(outtext + (uint32_t)n * 2, text[n]);
+    psp_write16(outtext + (uint32_t)n * 2, 0);
+    psp_write32(data + OSKD_RESULT, entered ? OSK_RESULT_CHANGED : g_osk ? OSK_RESULT_CANCELLED : OSK_RESULT_UNCHANGED);
+    fprintf(stderr, "utility: keyboard %s\n", entered ? "gave a text" : g_osk ? "backed out of" : "closed, nothing shown");
+}
 
 void psp_utility_init(void) { memset(g_state, 0, sizeof g_state); }
 
@@ -54,6 +108,8 @@ static void dialog_init(int kind, const char *name) {
         psp_str(param + MSG_TEXT, text, sizeof text);
         fprintf(stderr, "utility: message not shown, answering yes: %s\n", text);
         psp_write32(param + MSG_BUTTON, MSG_BUTTON_YES);
+    } else if (kind == KIND_OSK) {
+        run_osk(param);
     } else if (kind == KIND_SCREENSHOT && g_take_screenshot) {
         /* The picture is the host's to keep, on the player's computer; the game sees it taken. */
         fprintf(stderr, "utility: screenshot asked for\n");

@@ -220,6 +220,34 @@ int psp_utility_savedata_open(void);
  * keeps it. With none set, the dialog only walks through its states. */
 void psp_utility_set_screenshot_handler(void (*take)(void));
 
+/* A save slot as the system's list screen shows it: its name, whether it holds data, and the
+ * title, detail and time of what it holds. Texts are UTF-8, from the save's SFO. */
+typedef struct {
+    char name[21];
+    int used;
+    char title[129];
+    char detail[1025];
+    long long time;        /* seconds since 1970, 0 if empty */
+} psp_save_slot;
+enum { PSP_SAVE_CHOOSE_LOAD, PSP_SAVE_CHOOSE_SAVE, PSP_SAVE_CHOOSE_DELETE };
+/* Where a player chooses a slot from a list of more than one, for `purpose`; what is to be saved is
+ * described by new_title and new_detail. Gives back the index chosen, or -1 if the player backed
+ * out, or PSP_SAVE_CHOOSE_DEFAULT for no list, as for a list a game names but where it keeps one
+ * save. It runs on the game's thread, which waits for it, as a game waits on the system's screen.
+ * With none set, or for the default, a load takes the first slot with data and a save that slot or
+ * the first. */
+#define PSP_SAVE_CHOOSE_DEFAULT (-2)
+typedef int (*psp_savedata_chooser_fn)(int purpose, const psp_save_slot *slots, int count, const char *new_title,
+                                       const char *new_detail);
+void psp_savedata_set_chooser(psp_savedata_chooser_fn fn);
+
+/* The system's on-screen keyboard: its description and the text it starts with, UTF-16, and at
+ * most `limit` characters. Writes the text entered into `out` (limit + 1 UTF-16 units, zero
+ * ended) and gives back 1, or 0 if the player backed out. Runs as the chooser does. With none
+ * set, the keyboard closes with the text unchanged. */
+typedef int (*psp_osk_fn)(const uint16_t *description, const uint16_t *initial, int limit, uint16_t *out);
+void psp_utility_set_osk_handler(psp_osk_fn fn);
+
 void psp_utility_init(void);
 void psp_utility_register(void);
 
