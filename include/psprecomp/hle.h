@@ -251,6 +251,17 @@ void psp_savedata_set_chooser(psp_savedata_chooser_fn fn);
 typedef int (*psp_osk_fn)(const uint16_t *description, const uint16_t *initial, int limit, uint16_t *out);
 void psp_utility_set_osk_handler(psp_osk_fn fn);
 
+/* The system's message: an error by its number (`error`, with `text` empty) or a text, UTF-8, with
+ * PSP_MSG_YESNO or PSP_MSG_OK in `options` for its buttons. Gives back PSP_MSG_YES, PSP_MSG_NO or
+ * PSP_MSG_BACK. Runs as the chooser does. With none set, a message answers yes unseen. */
+#define PSP_MSG_YESNO 0x10u
+#define PSP_MSG_OK 0x20u
+#define PSP_MSG_NOCANCEL 0x80u
+#define PSP_MSG_DEFAULT_NO 0x100u
+enum { PSP_MSG_YES = 1, PSP_MSG_NO = 2, PSP_MSG_BACK = 3 };
+typedef int (*psp_message_fn)(uint32_t error, const char *text, uint32_t options);
+void psp_utility_set_message_handler(psp_message_fn fn);
+
 void psp_utility_init(void);
 void psp_utility_register(void);
 

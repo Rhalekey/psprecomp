@@ -3,9 +3,9 @@
  * On hardware these draw over the game. Here nothing is drawn yet: each dialog
  * walks through the states a game polls for and then reports having closed. That
  * is enough to get past one, not to use one, and each is logged so it is visible
- * when a game has asked for something the player never saw. A message answers yes
- * to whatever it asked. The list of saves and the keyboard ask the host (psp_savedata_set_chooser,
- * psp_utility_set_osk_handler).
+ * when a game has asked for something the player never saw. The list of saves, the keyboard and
+ * messages ask the host (psp_savedata_set_chooser, psp_utility_set_osk_handler,
+ * psp_utility_set_message_handler); with no host, a message answers yes to whatever it asked.
  *
  * Saves do their work for real, in savedata.c, and screenshots through the host's handler.
  */
@@ -29,10 +29,16 @@
 #define KIND_OSK 2
 #define KIND_SCREENSHOT 4
 
-/* pspUtilityMsgDialogParams */
+/* pspUtilityMsgDialogParams: after the common block, its result, whether it is an error (0) or a
+ * text (1), the error's number, the text, its options and the button pressed. */
+#define MSG_RESULT 0x30u
+#define MSG_TYPE 0x34u
+#define MSG_ERROR 0x38u
 #define MSG_TEXT 0x3Cu
+#define MSG_OPTIONS 0x23Cu
 #define MSG_BUTTON 0x240u
 #define MSG_BUTTON_YES 1u
+#define DIALOG_CANCEL 1u
 
 /* Every dialog's parameters begin with this block, which holds its result. */
 #define PARAM_RESULT 0x1Cu
@@ -40,9 +46,11 @@
 static int g_state[DIALOG_KINDS];
 static void (*g_take_screenshot)(void);
 static psp_osk_fn g_osk;
+static psp_message_fn g_message;
 
 void psp_utility_set_screenshot_handler(void (*take)(void)) { g_take_screenshot = take; }
 void psp_utility_set_osk_handler(psp_osk_fn fn) { g_osk = fn; }
+void psp_utility_set_message_handler(psp_message_fn fn) { g_message = fn; }
 
 /* SceUtilityOskParams: after the common block, how many fields and where they are. Each field,
  * SceUtilityOskData, has its description, the text it starts with, and room for the result. */
@@ -108,10 +116,21 @@ static void dialog_init(int kind, const char *name) {
     if (kind == KIND_SAVEDATA) {
         result = psp_savedata_run(param);
     } else if (kind == KIND_MSGDIALOG) {
-        char text[128];
-        psp_str(param + MSG_TEXT, text, sizeof text);
-        fprintf(stderr, "utility: message not shown, answering yes: %s\n", text);
-        psp_write32(param + MSG_BUTTON, MSG_BUTTON_YES);
+        char text[512];
+        const uint32_t size = psp_read32(param), type = psp_read32(param + MSG_TYPE), error = psp_read32(param + MSG_ERROR);
+        const uint32_t options = size > MSG_OPTIONS ? psp_read32(param + MSG_OPTIONS) : 0;
+        text[0] = 0;
+        if (type == 1) psp_str(param + MSG_TEXT, text, sizeof text);
+        uint32_t button = MSG_BUTTON_YES;
+        if (g_message) {
+            button = (uint32_t)g_message(type == 1 ? 0 : error, text, options);
+            fprintf(stderr, "utility: message %08X \"%s\" answered %u\n", type == 1 ? 0 : error, text, button);
+        } else {
+            fprintf(stderr, "utility: message not shown, answering yes: %08X %s\n", error, text);
+        }
+        if (size > MSG_BUTTON) psp_write32(param + MSG_BUTTON, button);
+        psp_write32(param + MSG_RESULT, 0);
+        if (button == PSP_MSG_BACK) result = DIALOG_CANCEL;
     } else if (kind == KIND_OSK) {
         run_osk(param);
     } else if (kind == KIND_SCREENSHOT && g_take_screenshot) {
