@@ -41,6 +41,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libswresample/swresample.h>
 
 /* ---- FFmpeg, as far as this needs it, found by name in its DLLs ---------- */
 static struct {
@@ -653,7 +655,12 @@ static void hle_FlushAllStream(void) {
  * file (sceMp3GetInfoToAddStreamData), reads them there and says how many (sceMp3NotifyAddStreamData).
  * Each sceMp3Decode gives one frame's samples, 16 bits, interleaved, in its sample buffer.
  * Here the bytes are copied out as they are added, split into frames by FFmpeg's parser and decoded
- * by its MP3 decoder, the same DLLs the movies use. */
+ * by its MP3 decoder, the same DLLs the movies use.
+ *
+ * A file that is named .mp3 but is not one, as the M4A (AAC) a phone records, is read whole from
+ * the Memory Stick by FFmpeg's own reader (avformat), which needs what an M4A keeps at its end, and
+ * decoded by whatever decoder it names, at 44100 Hz in stereo; the bytes the game adds are not
+ * needed then. Without avformat, such a file stays silent as before. */
 #define MP3_HANDLES 2
 #define MP3_FIFO (512u * 1024u)
 #define MP3_ERROR_HANDLE 0x80671001u
@@ -674,12 +681,66 @@ typedef struct {
     AVFrame *frame;
     int rate, channels, bitrate, loops, flushed;
     uint64_t decoded;
+    /* A file of another kind, read by avformat: its reader, its audio stream, the converter to 44100
+     * Hz stereo, and what has been converted but not yet given, in stereo samples. */
+    int other, other_sent_eof, other_done, other_stream;
+    AVFormatContext *fmt;
+    SwrContext *swr;
+    int16_t *queue;
+    uint32_t queue_len, queue_cap;
 } mp3_stream;
 static mp3_stream g_mp3[MP3_HANDLES];
 
 static mp3_stream *mp3_of(uint32_t h) { return h < MP3_HANDLES && g_mp3[h].used ? &g_mp3[h] : NULL; }
 
+/* ---- FFmpeg's reader and converter, for files of other kinds ---------------------------------- */
+static struct {
+    int (*open_input)(AVFormatContext **, const char *, const AVInputFormat *, AVDictionary **);
+    int (*find_stream_info)(AVFormatContext *, AVDictionary **);
+    int (*find_best_stream)(AVFormatContext *, enum AVMediaType, int, int, const AVCodec **, int);
+    int (*read_frame)(AVFormatContext *, AVPacket *);
+    int (*seek_frame)(AVFormatContext *, int, int64_t, int);
+    void (*close_input)(AVFormatContext **);
+    int (*parameters_to_context)(AVCodecContext *, const AVCodecParameters *);
+    void (*packet_unref)(AVPacket *);
+    int (*swr_alloc_set_opts2)(SwrContext **, const AVChannelLayout *, enum AVSampleFormat, int, const AVChannelLayout *,
+                               enum AVSampleFormat, int, int, void *);
+    int (*swr_init)(SwrContext *);
+    int (*swr_convert)(SwrContext *, uint8_t *const *, int, const uint8_t *const *, int);
+    void (*swr_free)(SwrContext **);
+} fx;
+static int g_fx_state;
+
+static int load_reader(void) {
+    if (g_fx_state) return g_fx_state > 0;
+    g_fx_state = -1;
+    HMODULE format = LoadLibraryA("avformat-62.dll"), resample = LoadLibraryA("swresample-6.dll"), codec = GetModuleHandleA("avcodec-62.dll");
+    if (!format || !resample || !codec) {
+        fprintf(stderr, "mp3: FFmpeg's reader not found, so only MP3 files play\n");
+        return 0;
+    }
+#define FIND(field, lib, name) do { *(FARPROC *)&fx.field = GetProcAddress(lib, name); if (!fx.field) { fprintf(stderr, "mp3: FFmpeg has no %s\n", name); return 0; } } while (0)
+    FIND(open_input, format, "avformat_open_input");
+    FIND(find_stream_info, format, "avformat_find_stream_info");
+    FIND(find_best_stream, format, "av_find_best_stream");
+    FIND(read_frame, format, "av_read_frame");
+    FIND(seek_frame, format, "av_seek_frame");
+    FIND(close_input, format, "avformat_close_input");
+    FIND(parameters_to_context, codec, "avcodec_parameters_to_context");
+    FIND(packet_unref, codec, "av_packet_unref");
+    FIND(swr_alloc_set_opts2, resample, "swr_alloc_set_opts2");
+    FIND(swr_init, resample, "swr_init");
+    FIND(swr_convert, resample, "swr_convert");
+    FIND(swr_free, resample, "swr_free");
+#undef FIND
+    g_fx_state = 1;
+    return 1;
+}
+
 static void mp3_close(mp3_stream *s) {
+    if (s->swr) fx.swr_free(&s->swr);
+    if (s->fmt) fx.close_input(&s->fmt);
+    free(s->queue);
     if (s->codec) ff.free_context(&s->codec);
     if (s->parser) ff.parser_close(s->parser);
     if (s->packet) ff.packet_free(&s->packet);
@@ -690,6 +751,14 @@ static void mp3_close(mp3_stream *s) {
 
 /* From the start of the file again, as for a loop or a reset. */
 static void mp3_rewind(mp3_stream *s) {
+    if (s->other) {
+        fx.seek_frame(s->fmt, s->other_stream, 0, AVSEEK_FLAG_BACKWARD);
+        ff.flush_buffers(s->codec);
+        s->queue_len = 0;
+        s->other_sent_eof = s->other_done = 0;
+        s->decoded = 0;
+        return;
+    }
     s->readpos = s->start;
     s->fifo_len = 0;
     s->decoded = 0;
@@ -710,16 +779,104 @@ static int mp3_header(mp3_stream *s) {
     static const int RATES[4][3] = {{11025, 12000, 8000}, {0, 0, 0}, {22050, 24000, 16000}, {44100, 48000, 32000}};
     static const int KBPS_V1[16] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0};
     static const int KBPS_V2[16] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0};
+    /* Another kind of file under the name, known by how it begins: MP4 or M4A, Ogg, FLAC, WAV. */
+    if (n >= 12 && i == 0 && (!memcmp(p + 4, "ftyp", 4) || !memcmp(p, "OggS", 4) || !memcmp(p, "fLaC", 4) || !memcmp(p, "RIFF", 4)))
+        return 0;
     for (; i + 4 <= n; i++) {
         if (p[i] != 0xFF || (p[i + 1] & 0xE0) != 0xE0) continue;
         const int version = (p[i + 1] >> 3) & 3, layer = (p[i + 1] >> 1) & 3, rate = (p[i + 2] >> 2) & 3, kbps = p[i + 2] >> 4;
         if (version == 1 || layer != 1 || rate == 3 || kbps == 0 || kbps == 15) continue;   /* layer III only */
-        s->rate = RATES[version][rate];
+        const int hz = RATES[version][rate], bitrate = version == 3 ? KBPS_V1[kbps] : KBPS_V2[kbps];
+        /* A frame only if another begins where it ends, as bytes of any file can look like one. */
+        const uint32_t size = (uint32_t)((version == 3 ? 144 : 72) * bitrate * 1000 / hz + ((p[i + 2] >> 1) & 1));
+        if (i + size + 2 <= n && (p[i + size] != 0xFF || (p[i + size + 1] & 0xE0) != 0xE0)) continue;
+        s->rate = hz;
         s->channels = ((p[i + 3] >> 6) == 3) ? 1 : 2;
-        s->bitrate = version == 3 ? KBPS_V1[kbps] : KBPS_V2[kbps];
+        s->bitrate = bitrate;
         return 1;
     }
     return 0;
+}
+
+/* The file the game opened last, read whole by avformat, when its bytes are not an MP3's. */
+static int other_open(mp3_stream *s) {
+    char ansi[1024], utf8[3072];
+    wchar_t wide[1024];
+    psp_io_last_ms_file(ansi, sizeof ansi);
+    if (!ansi[0] || !load_reader()) return 0;
+    if (!MultiByteToWideChar(CP_ACP, 0, ansi, -1, wide, 1024) || !WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8, sizeof utf8, NULL, NULL)) return 0;
+    const AVCodec *codec = NULL;
+    if (fx.open_input(&s->fmt, utf8, NULL, NULL) < 0) { s->fmt = NULL; return 0; }
+    if (fx.find_stream_info(s->fmt, NULL) < 0) goto fail;
+    s->other_stream = fx.find_best_stream(s->fmt, AVMEDIA_TYPE_AUDIO, -1, -1, &codec, 0);
+    if (s->other_stream < 0 || !codec) goto fail;
+    const AVCodecParameters *par = s->fmt->streams[s->other_stream]->codecpar;
+    s->codec = ff.alloc_context3(codec);
+    if (!s->codec || fx.parameters_to_context(s->codec, par) < 0 || ff.open2(s->codec, codec, NULL) < 0) goto fail;
+    AVChannelLayout stereo, in = s->codec->ch_layout;
+    ff.channel_layout_default(&stereo, 2);
+    if (in.order != AV_CHANNEL_ORDER_NATIVE || in.nb_channels <= 0) ff.channel_layout_default(&in, in.nb_channels > 0 ? in.nb_channels : 2);
+    if (fx.swr_alloc_set_opts2(&s->swr, &stereo, AV_SAMPLE_FMT_S16, 44100, &in, s->codec->sample_fmt, s->codec->sample_rate, 0, NULL) < 0 ||
+        fx.swr_init(s->swr) < 0)
+        goto fail;
+    s->other = 1;
+    s->rate = 44100;
+    s->channels = 2;
+    s->bitrate = par->bit_rate > 0 ? (int)(par->bit_rate / 1000) : s->fmt->bit_rate > 0 ? (int)(s->fmt->bit_rate / 1000) : 128;
+    s->readpos = s->end;   /* the game has nothing more to add */
+    s->fifo_len = 0;
+    fprintf(stderr, "mp3: not an MP3 but %s, read whole, %d Hz %d channels into 44100 Hz stereo\n", codec->name,
+            s->codec->sample_rate, s->codec->ch_layout.nb_channels);
+    return 1;
+fail:
+    if (s->swr) fx.swr_free(&s->swr);
+    if (s->codec) ff.free_context(&s->codec);
+    if (s->fmt) fx.close_input(&s->fmt);
+    return 0;
+}
+
+/* The next samples of a file of another kind, as many as an MP3 frame holds. */
+static uint32_t other_decode(mp3_stream *s) {
+    uint32_t want = 1152;
+    if (want > s->pcm_size / 4) want = s->pcm_size / 4;
+    while (s->queue_len < want && !s->other_done) {
+        const int r = ff.receive_frame(s->codec, s->frame);
+        if (r == 0 || r == AVERROR_EOF) {
+            const int in = r == 0 ? s->frame->nb_samples : 0;
+            const uint32_t most = (uint32_t)in * 44100u / (uint32_t)(s->codec->sample_rate > 0 ? s->codec->sample_rate : 44100) + 4096u;
+            if (s->queue_len + most > s->queue_cap) {
+                int16_t *bigger = (int16_t *)realloc(s->queue, (size_t)(s->queue_len + most) * 4);
+                if (!bigger) return 0;
+                s->queue = bigger;
+                s->queue_cap = s->queue_len + most;
+            }
+            uint8_t *dst = (uint8_t *)(s->queue + s->queue_len * 2);
+            const int got = fx.swr_convert(s->swr, &dst, (int)most, r == 0 ? (const uint8_t *const *)s->frame->extended_data : NULL, in);
+            if (got > 0) s->queue_len += (uint32_t)got;
+            if (r == AVERROR_EOF) s->other_done = 1;
+            continue;
+        }
+        if (s->other_sent_eof) {
+            s->other_done = 1;
+            break;
+        }
+        if (fx.read_frame(s->fmt, s->packet) < 0) {
+            ff.send_packet(s->codec, NULL);
+            s->other_sent_eof = 1;
+            continue;
+        }
+        if (s->packet->stream_index == s->other_stream) ff.send_packet(s->codec, s->packet);
+        fx.packet_unref(s->packet);
+    }
+    const uint32_t n = s->queue_len < want ? s->queue_len : want;
+    if (!n) return 0;
+    void *pcm = psp_mem_ptr(s->pcm, n * 4);
+    if (!pcm) return 0;
+    memcpy(pcm, s->queue, (size_t)n * 4);
+    memmove(s->queue, s->queue + n * 2, (size_t)(s->queue_len - n) * 4);
+    s->queue_len -= n;
+    s->decoded += n;
+    return n * 4;
 }
 
 static void hle_Mp3InitResource(void) { psp_ret(psp_mpeg_available() ? 0 : MP3_ERROR_NOT_READY); }
@@ -800,6 +957,11 @@ static void hle_Mp3Init(void) {
     mp3_stream *s = mp3_of(psp_arg(0));
     if (!s) { psp_ret(MP3_ERROR_HANDLE); return; }
     if (!mp3_header(s)) {
+        if (other_open(s)) {
+            s->ready = 1;
+            psp_ret(0);
+            return;
+        }
         fprintf(stderr, "mp3: no MP3 frame found in the first %u bytes\n", s->fifo_len);
         psp_ret(0x80671100u);
         return;
@@ -882,7 +1044,7 @@ static uint32_t mp3_decode(mp3_stream *s) {
 static void hle_Mp3Decode(void) {
     mp3_stream *s = mp3_of(psp_arg(0));
     if (!s || !s->ready) { psp_ret(MP3_ERROR_HANDLE); return; }
-    uint32_t bytes = mp3_decode(s);
+    uint32_t bytes = s->other ? other_decode(s) : mp3_decode(s);
     if (bytes == MP3_NEED_DATA) {
         /* As the console's: the game adds more of the file and asks again. */
         psp_ret(MP3_ERROR_NEED_DATA);

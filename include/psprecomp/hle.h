@@ -204,6 +204,8 @@ typedef int (*psp_io_open_hook)(const char *guest, const char *host, psp_io_virt
 void psp_io_set_open_hook(psp_io_open_hook hook);
 /* Where a guest path such as ms0:/PSP/... lands on the host. */
 void psp_io_host_path(const char *guest, char *out, size_t cap);
+/* The host path of the last Memory Stick file opened for reading. */
+void psp_io_last_ms_file(char *out, size_t cap);
 uint64_t psp_io_bytes_read(void);
 
 /* What a savedata request did, for a host to tell the player: the system's own

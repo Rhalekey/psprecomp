@@ -48,6 +48,7 @@ typedef struct {
 
 typedef struct {
     int used;
+    char host[1024];   /* the folder, to look for a file beside one listed */
 #ifdef _WIN32
     intptr_t handle;
     struct _finddata_t data;
@@ -129,11 +130,55 @@ static void map_path(const char *guest, char *out, size_t cap) {
 
 void psp_io_host_path(const char *guest, char *out, size_t cap) { map_path(guest, out, cap); }
 
+/* Music of other kinds on the Memory Stick, shown to the game as MP3s: a game that lists only .mp3
+ * files sees "song.mp3" for a song.m4a, and opening that opens the song.m4a, which the MP3 player
+ * (mpeg.c) reads whole when its bytes are not an MP3's. One that has an .mp3 beside it of the same
+ * name is not shown, as that .mp3 is. */
+static const char *const OTHER_AUDIO[] = {".m4a", ".aac", ".mp4", ".ogg", ".oga", ".opus", ".flac", ".wav", ".wma"};
+#define OTHER_AUDIO_KINDS (int)(sizeof OTHER_AUDIO / sizeof OTHER_AUDIO[0])
+
+static int ends_with(const char *name, const char *ext) {
+    const size_t n = strlen(name), e = strlen(ext);
+    if (n < e) return 0;
+    for (size_t i = 0; i < e; i++) {
+        const char a = name[n - e + i], b = ext[i];
+        if ((a >= 'A' && a <= 'Z' ? a + 32 : a) != b) return 0;
+    }
+    return 1;
+}
+
+static int other_audio(const char *name) {
+    for (int k = 0; k < OTHER_AUDIO_KINDS; k++)
+        if (ends_with(name, OTHER_AUDIO[k])) return (int)strlen(OTHER_AUDIO[k]);
+    return 0;
+}
+
+/* A Memory Stick path to an .mp3 that is not there, turned into the file of another kind it stands for. */
+static void real_audio(char *host, size_t cap) {
+    struct stat st;
+    if (!ends_with(host, ".mp3") || stat(host, &st) == 0) return;
+    char other[1100];
+    const size_t stem = strlen(host) - 4;
+    for (int k = 0; k < OTHER_AUDIO_KINDS; k++) {
+        snprintf(other, sizeof other, "%.*s%s", (int)stem, host, OTHER_AUDIO[k]);
+        if (stat(other, &st) == 0 && strlen(other) < cap) {
+            snprintf(host, cap, "%s", other);
+            return;
+        }
+    }
+}
+
+/* The last file of the Memory Stick opened to be read, for a decoder that is given only its bytes
+ * and needs the rest of it, as an M4A's index at its end. */
+static char g_last_ms[1024];
+void psp_io_last_ms_file(char *out, size_t cap) { snprintf(out, cap, "%s", g_last_ms); }
+
 static void hle_Open(void) {
     char guest[512], host[1024];
     psp_str(psp_arg(0), guest, sizeof guest);
     uint32_t flags = psp_arg(1);
     map_path(guest, host, sizeof host);
+    if (!strncmp(guest, "ms0:", 4) && !(flags & (PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC | PSP_O_APPEND))) real_audio(host, sizeof host);
 
     const char *mode = "rb";
     if (flags & PSP_O_TRUNC)                  mode = (flags & PSP_O_RDWR) == PSP_O_RDWR ? "w+b" : "wb";
@@ -154,6 +199,8 @@ static void hle_Open(void) {
     if (getenv("PSPRECOMP_TRACE_IO"))
         fprintf(stderr, "io: open \"%s\" -> \"%s\" flags 0x%X: %s\n",
                 guest, host, flags, is_virtual ? "provided" : f ? "ok" : "not found");
+    if (f && !strncmp(guest, "ms0:", 4) && !(flags & (PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC | PSP_O_APPEND)))
+        snprintf(g_last_ms, sizeof g_last_ms, "%s", host);
     if (!f && !is_virtual) {
         /* A failed open is normal (a game probing for a save file) and is not
          * worth a warning, but the mapped path is worth knowing when a game
@@ -327,6 +374,7 @@ static void hle_Getstat(void) {
     map_path(guest, host, sizeof host);
     size_t n = strlen(host);
     while (n > 1 && (host[n - 1] == '/' || host[n - 1] == '\\')) host[--n] = '\0';
+    if (!strncmp(guest, "ms0:", 4)) real_audio(host, sizeof host);
 
     struct stat st;
     memset(&st, 0, sizeof st);
@@ -395,6 +443,7 @@ static void hle_Dopen(void) {
 
     for (int i = 0; i < MAX_DIRS; i++) {
         if (g_dir[i].used) continue;
+        snprintf(g_dir[i].host, sizeof g_dir[i].host, "%s", !strncmp(guest, "ms0:", 4) ? host : "");
 #ifdef _WIN32
         char pattern[1088];
         snprintf(pattern, sizeof pattern, "%s/*", host);
@@ -469,6 +518,16 @@ static void put_ms_names(uint32_t private_at, const char *name) {
     psp_write8(private_at + MS_PRIVATE_LONG + i, 0);
 }
 
+/* A file of another kind of music with an .mp3 of its name beside it, which is the one shown. */
+static int shown_by_mp3(const io_dir *d, const char *name, int is_dir) {
+    const int other = d->host[0] && !is_dir ? other_audio(name) : 0;
+    if (!other) return 0;
+    char mp3[1400];
+    struct stat st;
+    snprintf(mp3, sizeof mp3, "%s/%.*s.mp3", d->host, (int)(strlen(name) - (size_t)other), name);
+    return stat(mp3, &st) == 0;
+}
+
 /* Fill a SceIoDirent: its SceIoStat, 88 bytes as sceIoGetstat fills it (whether
  * it is a folder or a file, its size, its time), then the name. A game listing a
  * folder for files, as of music, tells them from folders by the mode. */
@@ -496,7 +555,7 @@ static void hle_Dread(void) {
             psp_ret(0);
             return;
         }
-    } while (!strcmp(name, ".") || !strcmp(name, ".."));
+    } while (!strcmp(name, ".") || !strcmp(name, "..") || shown_by_mp3(&g_dir[id], name, (g_dir[id].data.attrib & _A_SUBDIR) != 0));
     is_dir = (g_dir[id].data.attrib & _A_SUBDIR) != 0;
     size = (uint64_t)g_dir[id].data.size;
     when = (time_t)g_dir[id].data.time_write;
@@ -520,6 +579,12 @@ static void hle_Dread(void) {
         put_date(dirent + 16, when);
         put_date(dirent + 32, when);
         put_date(dirent + 48, when);
+    }
+    char as_mp3[300];
+    const int other = g_dir[id].host[0] && !is_dir ? other_audio(name) : 0;
+    if (other) {
+        snprintf(as_mp3, sizeof as_mp3, "%.*s.mp3", (int)(strlen(name) - (size_t)other), name);
+        name = as_mp3;
     }
     uint32_t at = dirent + SCE_IO_STAT_SIZE;
     for (uint32_t i = 0; i < 255 && name[i]; i++) psp_write8(at + i, (uint8_t)name[i]);
