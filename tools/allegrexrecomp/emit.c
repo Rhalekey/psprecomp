@@ -4,12 +4,15 @@
 #include "decode.h"
 
 /* Functions the host wants to be told about; see a_emit_add_hook. */
-#define MAX_HOOKS 32
+#include <stdio.h>
+
+#define MAX_HOOKS 512
 static uint32_t g_hooks[MAX_HOOKS];
 static int g_nhooks;
 
 void a_emit_add_hook(uint32_t addr) {
     if (g_nhooks < MAX_HOOKS) g_hooks[g_nhooks++] = addr;
+    else fprintf(stderr, "emit: more than %d hooks, %08X left out\n", MAX_HOOKS, addr);
 }
 
 static int is_hooked(uint32_t addr) {
@@ -19,7 +22,14 @@ static int is_hooked(uint32_t addr) {
     return 0;
 }
 
-#include <stdio.h>
+/* Whether any hook falls within a function, at its entry or inside it. */
+static int has_hook(uint32_t start, uint32_t end) {
+    for (int i = 0; i < g_nhooks; i++) {
+        if (g_hooks[i] >= start && g_hooks[i] < end) return 1;
+    }
+    return 0;
+}
+
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>      /* isnan / isinf for the VFPU immediate loads */
@@ -744,7 +754,7 @@ static void emit_function(ectx *c, const a_func *fn) {
      * a thunk and a dispatch entry. The switch costs one jump on entry and
      * makes the whole class -- jump tables, indirect calls, cross-function
      * branches -- resolve by construction. */
-    if (is_hooked(fn->addr)) fprintf(f, "void psp_game_hook(uint32_t addr);\n");
+    if (is_hooked(fn->addr) || has_hook(fn->start, fn->end)) fprintf(f, "void psp_game_hook(uint32_t addr);\n");
     fprintf(f, "static void psp_body_%08X(uint32_t _entry) {\n", fn->addr);
     fprintf(f, "    PSP_ENTER(0x%08Xu);\n", fn->addr);
     if (is_hooked(fn->addr)) fprintf(f, "    if (_entry == 0x%08Xu) psp_game_hook(0x%08Xu);\n", fn->addr, fn->addr);
@@ -817,8 +827,7 @@ static void emit_function(ectx *c, const a_func *fn) {
         a_decode(fetch(an, a), a, &in);
 
         if (c->is_label[i]) fprintf(f, "L_%08X: PSP_MARK(0x%08Xu);\n", a, a);
-        /* A hook inside a function runs before the instruction it names. It needs its
-         * function to have one at the entry too, for the declaration. */
+        /* A hook inside a function runs before the instruction it names. */
         if (a != fn->addr && is_hooked(a)) fprintf(f, "    psp_game_hook(0x%08Xu);\n", a);
         last_terminal = in.is_return || in.is_indirect ||
                         (in.is_jump && !in.is_call);
