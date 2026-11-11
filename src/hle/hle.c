@@ -245,4 +245,5 @@ void psp_hle_init(void) {
     psp_power_register();
     psp_mpeg_init();
     psp_mpeg_register();
+    psp_netadhoc_register();
 }

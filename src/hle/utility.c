@@ -27,6 +27,9 @@
 #define KIND_MSGDIALOG 0
 #define KIND_SAVEDATA 1
 #define KIND_OSK 2
+#define KIND_NETCONF 3
+#define NETCONF_ACTION 0x30u
+#define NETCONF_ADHOC 0x34u
 #define KIND_SCREENSHOT 4
 
 /* pspUtilityMsgDialogParams: after the common block, its result, whether it is an error (0) or a
@@ -133,6 +136,9 @@ static void dialog_init(int kind, const char *name) {
         if (button == PSP_MSG_BACK) result = DIALOG_CANCEL;
     } else if (kind == KIND_OSK) {
         run_osk(param);
+    } else if (kind == KIND_NETCONF) {
+        /* pspUtilityNetconfData: after the common block, the action and its ad hoc parameters. */
+        result = (uint32_t)psp_netadhoc_netconf(psp_read32(param + NETCONF_ACTION), psp_read32(param + NETCONF_ADHOC));
     } else if (kind == KIND_SCREENSHOT && g_take_screenshot) {
         /* The picture is the host's to keep, on the player's computer; the game sees it taken. */
         fprintf(stderr, "utility: screenshot asked for\n");
@@ -195,11 +201,11 @@ static void hle_GetParamInt(void) {
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 
-/* (id, char *out, int len): the only string setting is the nickname. */
+/* (id, char *out, int len): the only string setting is the nickname, the one others see ad hoc. */
 static void hle_GetParamString(void) {
-    static const char NAME[] = "Player";
+    const char *name = psp_netadhoc_nickname();
     const uint32_t out = psp_arg(1), len = psp_arg(2);
-    for (uint32_t i = 0; i < sizeof NAME && i < len; i++) psp_write8(out + i, (uint8_t)NAME[i]);
+    for (uint32_t i = 0; i <= strlen(name) && i < len; i++) psp_write8(out + i, (uint8_t)name[i]);
     psp_ret(SCE_KERNEL_ERROR_OK);
 }
 

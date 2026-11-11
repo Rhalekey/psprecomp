@@ -768,6 +768,7 @@ uint32_t psp_threadman_current(void) { return g_tls_me ? g_tls_me->uid : 0xFFFFF
 
 void psp_threadman_frame_wait(void) {
     deliver_tick();
+    psp_netadhoc_deliver();
     if (!g_realtime) park_for(W_DELAY, FRAME_US);
 }
 

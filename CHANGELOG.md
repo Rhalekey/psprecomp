@@ -7,6 +7,15 @@ the time, and none were added afterwards.
 
 ### Unreleased
 
+- **Ad hoc play over the local network** (`src/hle/netadhoc.c`): `sceNet`, `sceNetAdhoc`,
+  `sceNetAdhocctl` and `sceNetAdhocMatching` over UDP. Copies announce themselves and their group to
+  a multicast group and every network's broadcast address; scans list others' groups, peer lists
+  those in one's own; matching's hellos, requests, accepts, data (resent until acknowledged) and
+  goodbyes go straight to the peer. Each process is its own console, with a made-up address, so two
+  copies on one computer play each other. Netconf's ad hoc actions join the group at once. Handlers
+  run at the frame wait of the thread that registered them. `psp_netadhoc_set_nickname` names the
+  console; by default it is the computer's name, also given by `sceUtilityGetSystemParamString`.
+
 *WTF goes from its title screen, through the Job Share menu, into a game of
 Lumberjack and its paycheck screen. A second microgame, Pendemonium, plays
 too: a lit 3D factory scene where you cap pens.*

@@ -57,6 +57,7 @@ add_library(psprecomp STATIC
     src/hle/utility.c
     src/hle/savedata.c
     src/hle/mpeg.c
+    src/hle/netadhoc.c
 )
 
 target_include_directories(psprecomp PUBLIC
@@ -83,6 +84,7 @@ target_compile_definitions(psprecomp PUBLIC
 )
 if(WIN32)
     target_link_libraries(psprecomp PUBLIC xinput9_1_0)   # the window's controller input
+    target_link_libraries(psprecomp PUBLIC ws2_32 iphlpapi)   # ad hoc play over the local network
 endif()
 if(PSPRECOMP_REAL_THREADS AND WIN32)
     target_link_libraries(psprecomp PUBLIC winmm)   # timeBeginPeriod

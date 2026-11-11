@@ -267,6 +267,15 @@ void psp_utility_set_message_handler(psp_message_fn fn);
 void psp_utility_init(void);
 void psp_utility_register(void);
 
+/* Ad hoc play over the local network (netadhoc.c). Netconf's ad hoc dialog connects through
+ * psp_netadhoc_netconf (its action and adhoc parameters), giving the dialog's result. The nickname
+ * others see is the computer's name unless the host sets one. */
+void psp_netadhoc_register(void);
+void psp_netadhoc_deliver(void);
+int psp_netadhoc_netconf(uint32_t action, uint32_t adhoc_param);
+void psp_netadhoc_set_nickname(const char *name);
+const char *psp_netadhoc_nickname(void);
+
 void psp_sync_init(void);
 void psp_sync_register(void);
 
