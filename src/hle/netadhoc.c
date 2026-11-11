@@ -309,12 +309,23 @@ static void join_beacon_group(void) {
     }
 }
 
+static void network_close(void) {
+    if (g_send != BAD_SOCKET) close_socket(g_send);
+    if (g_listen != BAD_SOCKET) close_socket(g_listen);
+    g_send = g_listen = BAD_SOCKET;
+#ifdef _WIN32
+    WSACleanup();
+#endif
+}
+
 static int network_start(void) {
     if (g_running) return 1;
 #ifdef _WIN32
+    static int locked;
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa)) return 0;
-    InitializeCriticalSection(&g_queue_lock);
+    if (!locked) InitializeCriticalSection(&g_queue_lock);
+    locked = 1;
 #endif
     make_mac();
     find_networks();
@@ -324,6 +335,7 @@ static int network_start(void) {
     g_listen = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_send == BAD_SOCKET || g_listen == BAD_SOCKET) {
         fprintf(stderr, "adhoc: no network sockets\n");
+        network_close();
         return 0;
     }
     int on = 1;
@@ -342,6 +354,7 @@ static int network_start(void) {
     a.sin_port = 0;
     if (bind(g_send, (struct sockaddr *)&a, sizeof a)) {
         fprintf(stderr, "adhoc: could not open a port\n");
+        network_close();
         return 0;
     }
 #ifdef _WIN32
