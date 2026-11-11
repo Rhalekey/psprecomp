@@ -370,7 +370,9 @@ static void test_threads(void) {
      * approximation that keeps a `while (!flag) sleep();` poll alive: the
      * faithful alternative is a thread that never returns, and a run that
      * stops with no evidence in it. */
-    call(DELAY, 1000, 0, 0, 0);
+    /* Its tick may come a little after ours, as the two threads race for the CPU: wait for it,
+     * a millisecond at a time, for at most a second. */
+    for (int waited = 0; g_sleeper_stage != 2 && waited < 1000; waited++) call(DELAY, 1000, 0, 0, 0);
     CHECK(g_sleeper_stage == 2, "a sleep nothing wakes returns after its tick");
 
     /* A wakeup is not lost when it arrives before the sleep: a producer that
@@ -1035,8 +1037,13 @@ static void test_savedata(void) {
     psp_write32(PARAM + 0x7C, 8);
     put_guest_string(PARAM + 0x80, "A title");
 
-    /* Clear what an earlier run of this test left. */
-    savedata_request(PARAM, 6);
+    /* Clear what an earlier run of this test left, by name: a list delete deletes only what a
+     * player chose, and here there is no player. */
+    put_guest_string(PARAM + 0x4C, "SLOT0");
+    savedata_request(PARAM, 10);
+    put_guest_string(PARAM + 0x4C, "SLOT1");
+    savedata_request(PARAM, 10);
+    psp_write8(PARAM + 0x4C, 0);
 
     CHECK(savedata_request(PARAM, 4) == NO_DATA, "a list load with no saves reports no data");
     CHECK(savedata_request(PARAM, 5) == 0, "a list save succeeds");
@@ -1053,7 +1060,11 @@ static void test_savedata(void) {
     CHECK(psp_read8(PARAM + 0x80) == 'A', "and its description");
     CHECK(psp_read8(PARAM + 0x4C) == 'S', "and the slot chosen is named");
 
-    CHECK(savedata_request(PARAM, 6) == 0, "a list delete removes it");
+    /* With nobody to choose, a list delete deletes nothing and the game hears there is no data. */
+    CHECK(savedata_request(PARAM, 6) == NO_DATA, "a list delete with nobody to ask deletes nothing");
+    CHECK(savedata_request(PARAM, 4) == 0, "so the save is still there");
+    CHECK(savedata_request(PARAM, 10) == 0, "a delete by name removes it");
+    psp_write8(PARAM + 0x4C, 0);
     CHECK(savedata_request(PARAM, 4) == NO_DATA, "and it is gone");
 }
 

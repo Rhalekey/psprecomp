@@ -7,6 +7,8 @@ the time, and none were added afterwards.
 
 ### Unreleased
 
+- Ad hoc: a match's data is counted afresh once it is made, on both sides, so a second transfer to the same peer is not taken for the first one again. The renderer checks that the two regions of a picture it swaps are inside it before moving them, and writes its learnt footer places beside the file and then over it. Tests: a list delete with nobody to choose deletes nothing, as the code does on purpose; the sleep test waits for the sleeper's tick instead of racing it.
+
 - **Ad hoc play over the local network** (`src/hle/netadhoc.c`): `sceNet`, `sceNetAdhoc`,
   `sceNetAdhocctl` and `sceNetAdhocMatching` over UDP. Copies announce themselves and their group to
   a multicast group and every network's broadcast address; scans list others' groups, peer lists

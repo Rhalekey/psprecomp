@@ -659,15 +659,18 @@ static void footer_store_read(void) {
 static void footer_store_write(void) {
     g_footer_store_dirty = 0;
     if (!g_state_dir[0]) return;
-    char path[1100];
+    char path[1100], writing[1110];
     footer_store_path(path, sizeof path);
-    FILE *f = fopen(path, "w");
+    /* Written beside it, then put in its place: a game closed halfway leaves the old one whole. */
+    snprintf(writing, sizeof writing, "%s.new", path);
+    FILE *f = fopen(writing, "w");
     if (!f) return;
     for (int i = 0; i < g_footer_store_n; i++) {
         const footer_stored *e = &g_footer_store[i];
         fprintf(f, "%08X %d %d %.2f %.2f %08X\n", e->pictures, e->w, e->place.piece, e->place.left, e->place.to, e->place.set);
     }
-    fclose(f);
+    const int written = !ferror(f);
+    if (fclose(f) != 0 || !written || !MoveFileExA(writing, path, MOVEFILE_REPLACE_EXISTING)) remove(writing);
 }
 
 static void footer_store_put(const footer_place *place) {
@@ -1453,7 +1456,13 @@ static void swap_regions(uint32_t hash, uint32_t *pixels, int file_w, int file_h
             free(signs);
             break;
         }
-        for (int row = 0; row < h * scale; row++) {
+        /* Both regions inside the picture, or nothing moves: a list made for another size of it
+         * would write past its end. */
+        const int rw = w * scale, rh = h * scale;
+        if (ax < 0 || ay < 0 || bx < 0 || by < 0 || rw <= 0 || rh <= 0 || (ax > bx ? ax : bx) * scale + rw > file_w ||
+            (ay > by ? ay : by) * scale + rh > file_h)
+            break;
+        for (int row = 0; row < rh; row++) {
             uint32_t *a = pixels + (file_h - 1 - (ay * scale + row)) * file_w + ax * scale;
             uint32_t *b = pixels + (file_h - 1 - (by * scale + row)) * file_w + bx * scale;
             for (int col = 0; col < w * scale; col++) {

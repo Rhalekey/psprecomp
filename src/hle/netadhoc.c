@@ -843,12 +843,16 @@ static void take_matching(const packet *pk) {
             if (!p || p->state != P_OUT_REQUEST) break;
             match_event(c, EV_ACCEPT, from, opt, len);
             p->state = P_ESTABLISHED;
+            p->in_seq = 0xFFFFFFFFu;   /* a new match counts its data afresh, on both sides */
+            p->out_seq = 0;
             match_send(c, T_COMPLETE, from, 0, NULL, 0);
             match_event(c, EV_ESTABLISHED, from, NULL, 0);
             break;
         case T_COMPLETE:
             if (!p || p->state != P_ACCEPTED) break;
             p->state = P_ESTABLISHED;
+            p->in_seq = 0xFFFFFFFFu;
+            p->out_seq = 0;
             match_event(c, EV_ESTABLISHED, from, NULL, 0);
             break;
         case T_DENY:
